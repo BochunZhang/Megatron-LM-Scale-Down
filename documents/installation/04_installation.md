@@ -18,6 +18,16 @@ Megatron-LM 虚拟机默认使用 hybrid-ep, 而非 deep-ep, 为测试不同分�
 - .venv/python3.12-torch2.13-engin2.18-hybird-ep 存放 hybrid ep 虚拟环境
 - .venv/python3.12-torch2.13-engin2.18-deep-ep 存放 deep ep 虚拟环境
 
+注意:
+1. uv 下载的 python 无法安装 package, 也就无法通过 virtualenv 创建虚拟环境, 但可以使用 python -m venv 来创建虚拟环境
+2. uv 创建的虚拟环境不会在激活时替换 pip, 这意味着 pip install 操作的是系统 python, --system-site-packages 表示使用系统的 python, 因此可以在 python 里面安装 package
+3. uv 环境激活时, 会先退出已经激活的 activate, pip 显示的是系统 python 安装的内容, uv pip 显示的是 uv 环境里面安装的 package
+  - python / uv run python 都无法找到系统安装的环境, 不知道是否因为不是使用系统 python 创建的虚拟环境
+4. 解决方案是使用
+  - virutalenv/venv 构建虚拟环境, source activate 会自动激活
+  - 不要用 uv 创建虚拟环境, 否则 pip install 和 uv pip install 操作的是不同的 site-packages
+
+
 应该按照如下流程来实现
 ```bash
 # Set environment variables for GB200
@@ -38,16 +48,34 @@ export CAUSAL_CONV1D_FORCE_BUILD=TRUE
 export FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE
 
 # 1. 安装 python
-uv python install 3.12.12 --install-dir .python/ --trusted_host https://github.com
+uv python install 3.12.12 --install-dir .python/ --trusted-host https://github.com
 
 # 2. 创建虚拟环境
-virtualenv -p .python/cpython-3.12.12-linux-aarch64-gnu .env-base/python3.12-torch2.13
-source activate .env-base/python3.12-torch2.13/bin/activate
+mkdir -p .env-base
+.python/cpython-3.12.12-linux-aarch64-gnu/bin/python -m venv -p .python/python3.12.12
+source .python/python3.12.12/bin/activate
+pip install virtualenv
+deactivate
 
-# 3. 安装 torch
-pip install -y triton==3.7.1 torch==2.13.0 torchvision==0.28.0
-pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
-pip install -y nvidia-cutlass-dsl[cu13]==4.5.0
+# 3.1 在激活的环境里面创建 hybrid-ep venv
+source .python/python3.12.12/bin/activate
+virtualenv -p .python3.12.12 .venv/python3.12-torch2.13-engin2.18-hybird-ep
+echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-hybird-ep/bin/activate"
+source activate .venv/python3.12-torch2.13-engin2.18-hybird-ep
+echo $VIRTUAL_ENV
+echo $UV_PROJECT_ENVIRONMENT
+
+# 3.2 在激活的环境里面创建 deep-ep venv
+source .python/python3.12.12/bin/activate
+virtualenv -p .python3.12.12 .venv/python3.12-torch2.13-engin2.18-deep-ep
+echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-deep-ep/bin/activate"
+source activate .venv/python3.12-torch2.13-engin2.18-deep-ep
+echo $VIRTUAL_ENV
+echo $UV_PROJECT_ENVIRONMENT
+
+# 4. 安装 torch 并安装 torch patch
+pip install triton==3.7.1 torch==2.13.0 torchvision==0.28.0
+pip install nvidia-cutlass-dsl[cu13]==4.5.0
 
 # 应用 torch patch
 bash install/torch-patch.sh
@@ -75,33 +103,13 @@ finally:
     type(namespace).__getattr__ = original_getattr
 PY
 
-# 4. 构建 hybrid-ep venv 环境
-uv venv .venv/python3.12-torch2.13-engin2.18-hybird-ep --python .env-base/python3.12-torch2.13/bin/python --system-site-packages
-echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-hybird-ep/bin/activate"
-source .venv/python3.12-torch2.13-engin2.18-hybird-ep/bin/activate
-
-echo $VIRTUAL_ENV
-echo $UV_PROJECT_ENVIRONMENT
-
-uv sync --only-group build --inextra
-uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inextra
+uv sync --only-group build --inexact
+uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
 uv sync --upgrade-package transformers
+
 
 bash install/install-hybrid-ep.sh
-
-
-# 5. 构建 deep-ep 虚拟环境
-uv venv .venv/python3.12-torch2.13-engin2.18-deep-ep --python .env-base/python3.12-torch2.13/bin/python --system-site-packages
-echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-deep-ep/bin/activate"
-source .venv/python3.12-torch2.13-engin2.18-deep-ep/bin/activate
-
-echo $VIRTUAL_ENV
-echo $UV_PROJECT_ENVIRONMENT
-
-uv sync --only-group build --inextra
-uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inextra
-uv sync --upgrade-package transformers
-
 bash install/install-deep-ep.sh
+
 
 ```
