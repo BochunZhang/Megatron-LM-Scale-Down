@@ -1,4 +1,46 @@
 {
+  "permissions": {
+    "Bash": {
+      "allow": [
+        "Bash(git fetch:*)",
+        "Bash(git checkout:*)",
+        "WebFetch(domain:github.com)",
+        "WebSearch",
+        "Bash(*)",
+        "Grep(*)",
+        "Glob(*)",
+        "Read(*)",
+        "Edit(*)",
+        "Write(*)",
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
+        "git branch",
+        "git remote",
+        "ls *",
+        "cat *",
+        "find *",
+        "grep *",
+        "head *",
+        "tail *",
+        "python *",
+        "pytest *",
+        "torchrun *",
+        "python -m *",
+        "mkdir *",
+        "cp *",
+        "mv *",
+        "rm *"
+      ]
+    },
+    "Edit": {
+      "allow": [{"pattern": "*.py"}, {"pattern": "*.json"}, {"pattern": "*.yaml"}, {"pattern": "*.yml"}, {"pattern": "*.md"}, {"pattern": "*.toml"}, {"pattern": "*.txt"}, {"pattern": "*.sh"}, {"pattern": "*.cu"}, {"pattern": "*.cpp"}, {"pattern": "*.h"}, {"pattern": "*.cuh"}]
+    },
+    "Write": {
+      "allow": [{"pattern": "*.py"}, {"pattern": "*.json"}, {"pattern": "*.yaml"}, {"pattern": "*.yml"}, {"pattern": "*.md"}, {"pattern": "*.toml"}, {"pattern": "*.txt"}, {"pattern": "*.sh"}, {"pattern": "*.cu"}, {"pattern": "*.cpp"}, {"pattern": "*.h"}, {"pattern": "*.cuh"}]
+    }
+  },
   "hooks": {
     "UserPromptSubmit": [
       {
