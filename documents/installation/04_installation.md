@@ -15,7 +15,7 @@ Megatron-LM 虚拟机默认使用 hybrid-ep, 而非 deep-ep, 为测试不同分�
 - transformers 最新版本
 - .tmp 下
 - .env-base 存放 python3.12-torch2.13, 安装 torch==2.13.0, torchvision==0.28.0, triton==3.7.1
-- .venv/python3.12-torch2.13-engin2.18-hybird-ep 存放 hybrid ep 虚拟环境
+- .venv/python3.12-torch2.13-engin2.18-hybrid-ep 存放 hybrid ep 虚拟环境
 - .venv/python3.12-torch2.13-engin2.18-deep-ep 存放 deep ep 虚拟环境
 
 注意:
@@ -52,24 +52,24 @@ uv python install 3.12.12 --install-dir .python/ --trusted-host https://github.c
 
 # 2. 创建虚拟环境
 mkdir -p .env-base
-.python/cpython-3.12.12-linux-aarch64-gnu/bin/python -m venv -p .python/python3.12.12
+.python/cpython-3.12.12-linux-aarch64-gnu/bin/python -m venv .python/python-3.12.12
 source .python/python3.12.12/bin/activate
 pip install virtualenv
 deactivate
 
 # 3.1 在激活的环境里面创建 hybrid-ep venv
 source .python/python3.12.12/bin/activate
-virtualenv -p .python3.12.12 .venv/python3.12-torch2.13-engin2.18-hybird-ep
-echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-hybird-ep/bin/activate"
-source activate .venv/python3.12-torch2.13-engin2.18-hybird-ep
+virtualenv -p .python/python3.12.12/bin/python .venv/python3.12-torch2.13-engin2.18-hybrid-ep
+echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-hybrid-ep/bin/activate"
+source .venv/python3.12-torch2.13-engin2.18-hybrid-ep/bin/activate
 echo $VIRTUAL_ENV
 echo $UV_PROJECT_ENVIRONMENT
 
 # 3.2 在激活的环境里面创建 deep-ep venv
 source .python/python3.12.12/bin/activate
-virtualenv -p .python3.12.12 .venv/python3.12-torch2.13-engin2.18-deep-ep
+virtualenv -p .python/python3.12.12/bin/python .venv/python3.12-torch2.13-engin2.18-deep-ep
 echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-deep-ep/bin/activate"
-source activate .venv/python3.12-torch2.13-engin2.18-deep-ep
+source .venv/python3.12-torch2.13-engin2.18-deep-ep/bin/activate
 echo $VIRTUAL_ENV
 echo $UV_PROJECT_ENVIRONMENT
 
@@ -105,11 +105,18 @@ PY
 
 uv sync --only-group build --inexact
 uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
-uv sync --upgrade-package transformers
+uv sync --upgrade-package transformers --inexact
 
 
 bash install/install-hybrid-ep.sh
 bash install/install-deep-ep.sh
-
-
 ```
+
+
+如何切换 nccl 版本?
+1. 安装 torch 的时候会安装 nvidia-nccl-cu13 这个 python package, torch 会静态链接到 nccl 
+2. 切换 nccl 版本需要从头编译 torch
+
+如何升级 package?
+1. echo "transformers==5.16.1" | uv pip compile - 查询 package 的依赖关系
+2. uv add "transformers>=5.8,<=5.16.1" "tokenizers>=0.22.0,<=0.23.2" --no-syn 解析升级后的需求
