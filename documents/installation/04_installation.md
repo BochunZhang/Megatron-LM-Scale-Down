@@ -103,6 +103,11 @@ finally:
     type(namespace).__getattr__ = original_getattr
 PY
 
+NCCL_DIR=$(python3 -c "import nvidia.nccl; print(nvidia.nccl.__path__[0])" 2>/dev/null)
+export NCCL_HOME="$NCCL_DIR"
+export CPLUS_INCLUDE_PATH="$NCCL_HOME/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+export LD_LIBRARY_PATH="$NCCL_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 uv sync --only-group build --inexact
 uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
 uv sync --upgrade-package transformers --inexact
@@ -120,3 +125,5 @@ bash install/install-deep-ep.sh
 如何升级 package?
 1. echo "transformers==5.16.1" | uv pip compile - 查询 package 的依赖关系
 2. uv add "transformers>=5.8,<=5.16.1" "tokenizers>=0.22.0,<=0.23.2" --no-syn 解析升级后的需求
+
+todo: DeepEPv2 安装失败, 推荐使用 nccl 2.30.7+ ...
