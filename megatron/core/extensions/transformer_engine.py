@@ -2986,6 +2986,16 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
+            # The op-fuser does not expose the FC1 output required by dense
+            # activation offload/recompute. Do not silently change execution
+            # paths when the incompatible options are enabled together.
+            if self.offload_mlp_act or self.activation_recompute:
+                raise ValueError(
+                    "TEFusedMLP cannot be used with dense mlp_act offload or recompute. "
+                    "Disable use_transformer_engine_op_fuser or remove 'mlp_act' from "
+                    "offload_modules and recompute_modules."
+                )
+
             # Construct fused impl if needed
             # Note: We initialize during the first forward pass in
             # case the params are modified after the constructor.

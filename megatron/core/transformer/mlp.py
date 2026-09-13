@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -23,6 +24,9 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -186,6 +190,7 @@ class MLP(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.is_expert = is_expert
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
@@ -255,16 +260,28 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
-    ):
-        """Perform the forward pass through the MLP block."""
-        # [s, b, 4 * h/p]
-        nvtx_range_push(suffix="linear_fc1")
-        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
-        nvtx_range_pop(suffix="linear_fc1")
+        self.offload_mlp_act = (
+            self.config.fine_grained_activation_offloading
+            and "mlp_act" in self.config.offload_modules
+            and not self.is_expert
+        )
+        self.activation_recompute = (
+            self.config.recompute_granularity == "selective"
+            and "mlp_act" in self.config.recompute_modules
+            and not self.is_expert
+        )
+        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
+            from megatron.core.extensions.transformer_engine import set_save_original_input
 
-        nvtx_range_push(suffix="activation")
+            set_save_original_input(self.linear_fc2)
+
+    def _apply_activation(
+        self,
+        intermediate_parallel: torch.Tensor,
+        bias_parallel: torch.Tensor | None,
+        per_token_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply the configured dense MLP activation and optional scaling."""
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -338,15 +355,52 @@ class MLP(MegatronModule):
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+        return intermediate_parallel
+
+    def forward(
+        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
+    ):
+        """Perform the forward pass through the MLP block."""
+        # [s, b, 4 * h/p]
+        nvtx_range_push(suffix="linear_fc1")
+        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
+        nvtx_range_pop(suffix="linear_fc1")
+
+        mlp_act_manager = off_interface(self.offload_mlp_act, intermediate_parallel, "mlp_act")
+
+        nvtx_range_push(suffix="activation")
+        # reference: megatron/core/transformer/moe/experts.py, TEGroupedMLP, forward.
+        if self.activation_recompute:
+            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            with mlp_act_manager as fc1_output:
+                activation_output = self.activation_checkpoint.checkpoint(
+                    self._apply_activation, fc1_output, bias_parallel, per_token_scale
+                )
+        else:
+            with mlp_act_manager as fc1_output:
+                activation_output = self._apply_activation(
+                    fc1_output, bias_parallel, per_token_scale
+                )
         nvtx_range_pop(suffix="activation")
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
         output, output_bias = apply_module(self.linear_fc2)(
-            cast(torch.Tensor, intermediate_parallel)
+            cast(torch.Tensor, activation_output)
         )
         nvtx_range_pop(suffix="linear_fc2")
+
+        if self.activation_recompute:
+            self.activation_checkpoint.discard_output_and_register_recompute(output)
+
+        # Commit after FC2 so the FC1 output can be reloaded before activation
+        # recomputation in backward.
+        output = mlp_act_manager.group_offload(
+            output,
+            forced_released_tensors=[fc1_output],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly

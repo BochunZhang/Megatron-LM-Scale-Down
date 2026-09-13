@@ -1436,12 +1436,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
                 self.pre_mlp_layernorm, IdentityOp
             )
+            self.offload_mlp_act = (
+                "mlp_act" in self.config.offload_modules and not self.is_moe_layer
+            )
         else:
             self.offload_attn_norm = False
             self.offload_qkv_linear = False
             self.offload_core_attn = False
             self.offload_attn_proj = False
             self.offload_mlp_norm = False
+            self.offload_mlp_act = False
         # Check the compatibility of fine-grained activation offloading and cuda graph.
         if self.config.fine_grained_activation_offloading:
             cuda_graph_modules = self.config.cuda_graph_modules or []
@@ -1486,7 +1490,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True
         if not self.is_moe_layer and CudaGraphModule.mlp in cuda_graph_modules:
-            if self.offload_mlp_norm:
+            if self.offload_mlp_norm or self.offload_mlp_act:
                 self.offload_module_in_cuda_graph = True
         if self.offload_module_in_cuda_graph:
             assert is_torch_min_version(

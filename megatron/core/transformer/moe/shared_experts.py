@@ -128,6 +128,11 @@ class SharedExpertMLP(MLP):
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
         super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)
 
+        # Shared experts use the regular MLP path but do not participate in the
+        # dense-layer mlp_act offload/recompute policy.
+        self.offload_mlp_act = False
+        self.activation_recompute = False
+
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
             # TODO: Add support for GPU initialization, which requires updating the golden values.

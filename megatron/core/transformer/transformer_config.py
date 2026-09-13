@@ -545,18 +545,21 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    choices: "core_attn", "moe_act", "mlp_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
+    "mlp_act": recompute the dense MLP activation function only. The FC1 and FC2
+    projections are not recomputed.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
+    "moe_act", "mlp_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1234,7 +1237,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp".
+             "mlp_norm", "expert_fc1", "moe_act", "mlp_act", "fused_group_mlp".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1242,6 +1245,8 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "mlp_act": offload the input of the dense MLP activation function. This is
+    the output of the dense MLP FC1 projection, before bias/activation processing.
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
@@ -1768,6 +1773,7 @@ class TransformerConfig(ModelParallelConfig):
                 allowed_modules = {
                     "core_attn",
                     "moe_act",
+                    "mlp_act",
                     "layernorm",
                     "mla_up_proj",
                     "mlp",
@@ -1784,6 +1790,12 @@ class TransformerConfig(ModelParallelConfig):
             if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
                 raise ValueError(
                     "moe_act in recompute_modules is only supported with moe_grouped_gemm."
+                )
+
+            if "mlp_act" in self.recompute_modules and "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "mlp_act and mlp cannot both be enabled in recompute_modules because "
+                    "mlp recomputation already covers the activation function."
                 )
 
             if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:
@@ -1819,15 +1831,19 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             if self.fp8:
-                if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
+                if (
+                    "moe_act" in self.recompute_modules
+                    or "mlp_act" in self.recompute_modules
+                    or "layernorm" in self.recompute_modules
+                ):
                     if self.fp8_recipe == 'delayed':
                         raise ValueError(
-                            "Delayed scaling does not support moe_act and layernorm recompute "
-                            "for fp8."
+                            "Delayed scaling does not support moe_act, mlp_act, and layernorm "
+                            "recompute for fp8."
                         )
                     if not is_te_min_version("2.6.0dev0"):
                         raise ValueError(
-                            "moe_act and layernorm recompute for fp8 needs "
+                            "moe_act, mlp_act, and layernorm recompute for fp8 needs "
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
@@ -1856,6 +1872,7 @@ class TransformerConfig(ModelParallelConfig):
                 "expert_fc1",
                 "fused_group_mlp",
                 "moe_act",
+                "mlp_act",
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
@@ -1881,6 +1898,14 @@ class TransformerConfig(ModelParallelConfig):
                     f"so offloading activations inside it is redundant and will cause errors. "
                     f"Either remove 'moe' from --recompute-modules or remove "
                     f"{offload_inside_moe} from --offload-modules."
+                )
+            if self.recompute_granularity == "selective" and "mlp" in self.recompute_modules:
+                offload_inside_mlp = {"mlp_act"} & set(self.offload_modules)
+                assert not offload_inside_mlp, (
+                    f"Cannot offload {offload_inside_mlp} while recomputing the entire dense MLP. "
+                    f"'mlp' in recompute_modules already covers the activation function. "
+                    f"Either remove 'mlp' from --recompute-modules or remove "
+                    f"{offload_inside_mlp} from --offload-modules."
                 )
             assert (
                 self.min_offloaded_tensor_size >= 0
