@@ -485,7 +485,7 @@ def forward_step(
     """
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
-    msg = "forward_step[{current_microbatch}]" if current_microbatch is not None else "forward_step"
+    msg = f"forward_step[{current_microbatch}]" if current_microbatch is not None else "forward_step"
     nvtx_range_push(msg=msg)
 
     if config.timers is not None:
@@ -549,7 +549,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # connections.
 
     current_microbatch = getattr(output_tensor, 'current_microbatch', None)
-    msg = "backward_step[{current_microbatch}]" if current_microbatch is not None else "backward_step"
+    msg = f"backward_step[{current_microbatch}]" if current_microbatch is not None else "backward_step"
     nvtx_range_push(msg=msg)
 
     if config.timers is not None:
