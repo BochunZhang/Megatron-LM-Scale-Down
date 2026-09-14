@@ -24,9 +24,11 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
+
+# delay pipeline_parallel import to avoid circular import
+# from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+#     FineGrainedActivationOffloadingInterface as off_interface,
+# )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -206,6 +208,11 @@ class MLP(MegatronModule):
             )
             ffn_hidden_size = not_none(self.config.ffn_hidden_size)
 
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+        self.off_interface = off_interface
+
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
         # For GLU/SwiGLU, use stride=2 because each TP rank stores interleaved [gate, up] portions.
@@ -366,7 +373,7 @@ class MLP(MegatronModule):
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
-        mlp_act_manager = off_interface(self.offload_mlp_act, intermediate_parallel, "mlp_act")
+        mlp_act_manager = self.off_interface(self.offload_mlp_act, intermediate_parallel, "mlp_act")
 
         nvtx_range_push(suffix="activation")
         # reference: megatron/core/transformer/moe/experts.py, TEGroupedMLP, forward.
