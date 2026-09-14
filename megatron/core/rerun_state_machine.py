@@ -17,6 +17,7 @@ import torch
 from megatron.core._rank_utils import log_single_rank, safe_get_rank
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.typed_torch import copy_signature
+from megatron.core.utils import nvtx_decorator
 
 """DISCLAIMER: THIS IS AN EXPERIMENTAL FEATURE.
 
@@ -269,6 +270,7 @@ class RerunStateMachine:
             torch.distributed.all_reduce(val_tensor)
             return val_tensor.item() > 0
 
+    @nvtx_decorator()
     def should_run_forward_backward(self, data_iterator: DataIteratorArgType) -> bool:
         """Method instructing whether to (re)run the forward-backward pass.
 

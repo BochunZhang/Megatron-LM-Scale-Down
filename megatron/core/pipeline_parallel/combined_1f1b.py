@@ -16,6 +16,7 @@ from megatron.core.pipeline_parallel.utils import (
     set_streams,
 )
 from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import nvtx_decorator, nvtx_range_pop, nvtx_range_push
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -32,6 +33,7 @@ def _release_tensor_storage(tensors):
             tensor.untyped_storage().resize_(0)
 
 
+@nvtx_decorator()
 def combined_1f1b_schedule_for_no_pipelining(
     forward_step_func,
     data_iterator,
@@ -135,6 +137,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     return forward_data_store, total_num_tokens
 
 
+@nvtx_decorator()
 def combined_1f1b_schedule_for_interleaved_pipelining(
     config,
     forward_step_func,

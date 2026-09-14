@@ -33,6 +33,7 @@ from megatron.core.utils import (
     get_model_type,
     nvtx_range_pop,
     nvtx_range_push,
+    nvtx_decorator,
 )
 
 from .combined_1f1b import (
@@ -484,6 +485,9 @@ def forward_step(
     """
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
+    msg = "forward_step[{current_microbatch}]" if current_microbatch is not None else "forward_step"
+    nvtx_range_push(msg=msg)
+
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
 
@@ -523,6 +527,9 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+    nvtx_range_pop(msg=msg)
+
+    setattr(output_tensor, 'current_microbatch', current_microbatch)
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
@@ -540,6 +547,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
+
+    current_microbatch = getattr(output_tensor, 'current_microbatch', None)
+    msg = "backward_step[{current_microbatch}]" if current_microbatch is not None else "backward_step"
+    nvtx_range_push(msg=msg)
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
@@ -589,6 +600,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     if config.timers is not None:
         config.timers('backward-compute').stop()
 
+    nvtx_range_pop(msg=msg)
     return input_tensor_grad
 
 
@@ -692,7 +704,7 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     )
     return pg_collection
 
-
+@nvtx_decorator()
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -989,6 +1001,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+@nvtx_decorator()
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -2117,6 +2130,7 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+@nvtx_decorator()
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
