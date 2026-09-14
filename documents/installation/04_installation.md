@@ -18,6 +18,14 @@ Megatron-LM 虚拟机默认使用 hybrid-ep, 而非 deep-ep, 为测试不同分�
 - .venv/python3.12-torch2.13-engin2.18-hybrid-ep 存放 hybrid ep 虚拟环境
 - .venv/python3.12-torch2.13-engin2.18-deep-ep 存放 deep ep 虚拟环境
 
+关于 torch & transformer-engine 的编译安装
+1. 官方提供的 torch 自带 nccl, 封装在 nvidia-nccl-cu13 里面, 可以通过 ldd 检查 torch 的 lib 库, 里面的 nccl 链接到了这个 package 里面
+2. transformer-engine 应该使用和 torch 相同版本的 nccl 编译安装, 最好通过 NCCL_HOME 来指向 torch 使用的 nccl 源码, 避免找不到 nccl_device.h 
+3. transformer-engine 会默认编译 NCCL-EP 扩展, 但是该功能需要新版本的 nccl, e.g. nccl 2.30.7+, 如果 torch 默认版本较低, 编译该扩展会报错, 因此要使用 NVTE_WITH_NCCL_EP 关闭 NCCL-EP 扩展编译
+
+
+
+
 注意:
 1. uv 下载的 python 无法安装 package, 也就无法通过 virtualenv 创建虚拟环境, 但可以使用 python -m venv 来创建虚拟环境
 2. uv 创建的虚拟环境不会在激活时替换 pip, 这意味着 pip install 操作的是系统 python, --system-site-packages 表示使用系统的 python, 因此可以在 python 里面安装 package
@@ -65,6 +73,13 @@ source .venv/python3.12-torch2.13-engin2.18-hybrid-ep/bin/activate
 echo $VIRTUAL_ENV
 echo $UV_PROJECT_ENVIRONMENT
 
+source .python/python3.12.12/bin/activate
+virtualenv -p .python/python3.12.12/bin/python .venv/python3.12-torch2.13-engin2.17-hybrid-ep
+echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.17-hybrid-ep/bin/activate"
+source .venv/python3.12-torch2.13-engin2.17-hybrid-ep/bin/activate
+echo $VIRTUAL_ENV
+echo $UV_PROJECT_ENVIRONMENT
+
 # 3.2 在激活的环境里面创建 deep-ep venv
 source .python/python3.12.12/bin/activate
 virtualenv -p .python/python3.12.12/bin/python .venv/python3.12-torch2.13-engin2.18-deep-ep
@@ -109,7 +124,7 @@ export CPLUS_INCLUDE_PATH="$NCCL_HOME/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLU
 export LD_LIBRARY_PATH="$NCCL_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 uv sync --only-group build --inexact
-uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
+NVTE_WITH_NCCL_EP uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
 uv sync --upgrade-package transformers --inexact
 
 
