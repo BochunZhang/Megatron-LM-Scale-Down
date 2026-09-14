@@ -124,7 +124,7 @@ export CPLUS_INCLUDE_PATH="$NCCL_HOME/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLU
 export LD_LIBRARY_PATH="$NCCL_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 uv sync --only-group build --inexact
-NVTE_WITH_NCCL_EP uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
+NVTE_WITH_NCCL_EP=0 uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
 uv sync --upgrade-package transformers --inexact
 
 
@@ -142,3 +142,32 @@ bash install/install-deep-ep.sh
 2. uv add "transformers>=5.8,<=5.16.1" "tokenizers>=0.22.0,<=0.23.2" --no-syn 解析升级后的需求
 
 todo: DeepEPv2 安装失败, 推荐使用 nccl 2.30.7+ ...
+
+
+```python
+output_layer_cls = (
+    TELMHeadColumnParallelLinear
+    if is_mxfp8_output_proj_active(config)
+    else tensor_parallel.ColumnParallelLinear
+)
+```
+
+安装 Apex
+
+```bash
+git clone https://github.com/NVIDIA/apex.git
+cd apex
+git checkout 25.09
+
+# Build with core extensions (cpp and cuda)
+APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip install -v --no-build-isolation .
+# To build with additional extensions, specify them with environment variables
+APEX_CPP_EXT=1 APEX_CUDA_EXT=1 APEX_FAST_MULTIHEAD_ATTN=1 APEX_FUSED_CONV_BIAS_RELU=1 pip install -v --no-build-isolation .
+# To build all contrib extensions at once
+APEX_CPP_EXT=1 APEX_CUDA_EXT=1 APEX_ALL_CONTRIB_EXT=1 pip install -v --no-build-isolation .
+```
+
+- GPTModel 的 output_layer 会在使用 bf16 训练时使用 ColumnParallelLinear, 这是 Megatron 基于 torch.nn.Module 构建的 Linear 类, 它基于 Apex 提供 gradient_accumulation_fusion 等 fused 功能, 因此需要安装 Apex 来获得更好的性能
+- Apex 的 setup 里面硬编码支持 compute_70, 但是最新的 cuda 13.0 已经移除对 compute_70 的支持, 导致 nvcc 报错, 即使明确只编译 sm=10.0, 硬编码仍会将 sm=7.0 作为编译目标
+- 解决方案: 修改 Apex 的 setup.py, 只保留 compute_100 作为编译目标
+- 直接使用基础 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip install -v --no-build-isolation . 编译即可
