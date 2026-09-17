@@ -488,6 +488,9 @@ def forward_step(
     msg = f"forward_step[{current_microbatch}]" if current_microbatch is not None else "forward_step"
     nvtx_range_push(msg=msg)
 
+    profiler_handle = torch.autograd.profiler.record_function(msg)
+    profiler_handle.__enter__()
+
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
 
@@ -527,6 +530,9 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+
+    profiler_handle.__exit__(None, None, None)
+
     nvtx_range_pop(msg=msg)
 
     setattr(output_tensor, 'current_microbatch', current_microbatch)
@@ -551,6 +557,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     current_microbatch = getattr(output_tensor, 'current_microbatch', None)
     msg = f"backward_step[{current_microbatch}]" if current_microbatch is not None else "backward_step"
     nvtx_range_push(msg=msg)
+
+    profiler_handle = torch.autograd.profiler.record_function(msg)
+    profiler_handle.__enter__()
+
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
@@ -599,6 +609,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
+
+    profiler_handle.__exit__(None, None, None)
 
     nvtx_range_pop(msg=msg)
     return input_tensor_grad
