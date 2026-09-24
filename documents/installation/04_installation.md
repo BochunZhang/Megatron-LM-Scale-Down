@@ -1,3 +1,7 @@
+# 安装说明
+
+## 1. 基于 uv 安装 Megatron-Bridge & Megatron-LM
+
 Megatron-Bridge & Megatron-LM 使用 uv 管理项目的 python 环境, 其环境配置最好放在 docker 虚拟机里面直接完成.
 
 流程为:
@@ -133,9 +137,14 @@ bash install/install-deep-ep.sh
 ```
 
 
+## 2. NCCL 版本选择
+
 如何切换 nccl 版本?
 1. 安装 torch 的时候会安装 nvidia-nccl-cu13 这个 python package, torch 会静态链接到 nccl 
 2. 切换 nccl 版本需要从头编译 torch
+
+
+## 3. uv 升级 package 版本
 
 如何升级 package?
 1. echo "transformers==5.16.1" | uv pip compile - 查询 package 的依赖关系
@@ -151,6 +160,8 @@ output_layer_cls = (
     else tensor_parallel.ColumnParallelLinear
 )
 ```
+
+## 4. Apex 编译安装
 
 安装 Apex
 
@@ -171,3 +182,81 @@ APEX_CPP_EXT=1 APEX_CUDA_EXT=1 APEX_ALL_CONTRIB_EXT=1 pip install -v --no-build-
 - Apex 的 setup 里面硬编码支持 compute_70, 但是最新的 cuda 13.0 已经移除对 compute_70 的支持, 导致 nvcc 报错, 即使明确只编译 sm=10.0, 硬编码仍会将 sm=7.0 作为编译目标
 - 解决方案: 修改 Apex 的 setup.py, 只保留 compute_100 作为编译目标
 - 直接使用基础 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip install -v --no-build-isolation . 编译即可
+
+
+## 5. DeepSpeed 安装
+
+DeepSpeed 可以通过 pip 直接安装, 但是 DeepSpeed-Examples 提供的测试需要安装 flash-attn 等 package
+
+```bash
+export NVTE_BUILD_NUM_PHILOX_ROUNDS=3
+export TORCH_CUDA_ARCH_LIST="10.0"  # Blackwell architecture
+export NVCC_THREADS=16
+export FLASH_MLA_DISABLE_SM90=1
+
+# Set UV environment
+export UV_HTTP_TIMEOUT=120
+export UV_LINK_MODE=copy
+
+export CFLAGS="-I/usr/local/cuda/include/cccl -DNDEBUG"
+export CXXFLAGS="-I/usr/local/cuda/include/cccl -DNDEBUG"
+
+export MAMBA_FORCE_BUILD=TRUE
+export CAUSAL_CONV1D_FORCE_BUILD=TRUE
+export FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE
+
+# 3.2 在激活的环境里面创建 deep-ep venv
+source .python/python3.12.12/bin/activate
+virtualenv -p .python/python3.12.12/bin/python .venv/python3.12-torch2.13-engin2.18-deep-ep
+echo "export UV_PROJECT_ENVIRONMENT=\"\$VIRTUAL_ENV\"" >> ".venv/python3.12-torch2.13-engin2.18-deep-ep/bin/activate"
+source .venv/python3.12-torch2.13-engin2.18-deep-ep/bin/activate
+echo $VIRTUAL_ENV
+echo $UV_PROJECT_ENVIRONMENT
+
+# 4. 安装 torch 并安装 torch patch
+pip install triton==3.7.1 torch==2.13.0 torchvision==0.28.0
+pip install nvidia-cutlass-dsl[cu13]==4.5.0
+
+# 应用 torch patch
+bash install/torch-patch.sh
+
+# 测试
+python - <<'PY'
+import torch
+from torch.library import Library, _clear_torch_ops_cache
+
+namespace_name = "_mbridge_finalizer_test"
+library = Library(namespace_name, "DEF")
+library.define("uncached_op() -> None")
+namespace = getattr(torch.ops, namespace_name)
+original_getattr = type(namespace).__getattr__
+
+
+def fail_getattr(self, name):
+    raise AssertionError(f"Torch op cache cleanup called __getattr__ for {name}")
+
+
+type(namespace).__getattr__ = fail_getattr
+try:
+    _clear_torch_ops_cache({f"{namespace_name}::uncached_op"})
+finally:
+    type(namespace).__getattr__ = original_getattr
+PY
+
+NCCL_DIR=$(python3 -c "import nvidia.nccl; print(nvidia.nccl.__path__[0])" 2>/dev/null)
+export NCCL_HOME="$NCCL_DIR"
+export CPLUS_INCLUDE_PATH="$NCCL_HOME/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+export LD_LIBRARY_PATH="$NCCL_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+uv sync --only-group build --inexact
+NVTE_WITH_NCCL_EP=0 uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
+uv sync --upgrade-package transformers --inexact
+
+MAX_JOBS=4 NVCC_THREADS=2 FLASH_ATTN_CUDA_ARCHS="100" pip install flash-attn --no-build-isolation
+
+pip install deepspeed
+```
+
+注意:
+- 限制 MAX_JOBS 和 NVCC_THREADS, 否则并行编译会占满全部 CPU, 导致设备卡死和 OOM, 但是报错与 OOM 无关, 很难 debug
+- 限制架构, 减少编译耗时
