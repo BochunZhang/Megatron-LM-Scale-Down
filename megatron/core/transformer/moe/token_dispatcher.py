@@ -44,6 +44,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import nvtx_decorator
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -615,6 +616,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ), "cuda_sync_point must be after cuda_dtoh_point."
         return num_tokens_per_local_expert
 
+    @nvtx_decorator(message="MoEAlltoAllTokenDispatcher.dispatch_preprocess")
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
@@ -672,6 +674,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         )
         return permutated_local_input_tokens, permuted_probs
 
+    @nvtx_decorator(message="MoEAlltoAllTokenDispatcher.token_dispatch")
     def token_dispatch(self, permutated_local_input_tokens, permuted_probs):
         """
         Perform all-to-all communication for dispatching tokens.
@@ -718,6 +721,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         return global_input_tokens, global_probs
 
+    @nvtx_decorator(message="MoEAlltoAllTokenDispatcher.dispatch_postprocess")
     def dispatch_postprocess(self, global_input_tokens, global_probs):
         """Post-processes tokens after All-to-All communication.
 
@@ -786,6 +790,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = None
         return global_input_tokens, tokens_per_expert, global_probs
 
+    @nvtx_decorator(message="MoEAlltoAllTokenDispatcher.combine_preprocess")
     def combine_preprocess(self, hidden_states):
         """Prepares hidden states for token combination after expert computations.
 
@@ -827,6 +832,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         return hidden_states
 
+    @nvtx_decorator(message="MoEAlltoAllTokenDispatcher.token_combine")
     def token_combine(
         self,
         hidden_states: torch.Tensor,
@@ -866,6 +872,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
         return permutated_local_input_tokens
 
+    @nvtx_decorator(message="MoEAlltoAllTokenDispatcher.combine_postprocess")
     def combine_postprocess(self, permutated_local_input_tokens):
         """Finalizes token reconstruction with un-permutation and reshaping.
 
@@ -1852,6 +1859,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         return routing_map, probs
 
+    @nvtx_decorator(message="MoEFlexTokenDispatcher.dispatch_preprocess")
     @jit_fuser
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -1879,6 +1887,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
 
+    @nvtx_decorator(message="MoEFlexTokenDispatcher.token_dispatch")
     def token_dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -1914,6 +1923,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         return dispatched_hidden_states, self._comm_manager.dispatched_probs
 
+    @nvtx_decorator(message="MoEFlexTokenDispatcher.dispatch_postprocess")
     def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Converts dispatched tokens to a per-expert format for expert processing.
 
@@ -1933,6 +1943,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
         return global_input_tokens, tokens_per_expert, permuted_probs
 
+    @nvtx_decorator(message="MoEFlexTokenDispatcher.combine_preprocess")
     def combine_preprocess(self, hidden_states: torch.Tensor):
         """Pre-processes hidden states before combining them after expert processing.
 
@@ -1942,6 +1953,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
         return hidden_states
 
+    @nvtx_decorator(message="MoEFlexTokenDispatcher.token_combine")
     def token_combine(
         self,
         hidden_states: torch.Tensor,
@@ -1966,6 +1978,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.wait_current_stream()
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
+    @nvtx_decorator(message="MoEFlexTokenDispatcher.combine_postprocess")
     def combine_postprocess(self, hidden_states: torch.Tensor):
         """
         Restores the original tensor shape and finalizes the MoE layer output.
