@@ -737,14 +737,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-            packed_seq_params=kwargs.get("packed_seq_params", None),
-        )
-        return output, context
+        nvtx_range_push(f"layer {self.layer_number}")
+        try:
+            hidden_states, context = self._forward_attention(*args, **kwargs)
+            output = self._forward_mlp(
+                hidden_states,
+                kwargs.get("inference_context", None),
+                padding_mask=kwargs.get("padding_mask", None),
+                packed_seq_params=kwargs.get("packed_seq_params", None),
+            )
+            return output, context
+        finally:
+            nvtx_range_pop(f"layer {self.layer_number}")
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
