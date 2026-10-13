@@ -131,6 +131,11 @@ uv sync --only-group build --inexact
 NVTE_WITH_NCCL_EP=0 uv sync --link-mode copy --all-extras --all-groups --no-group diffusion --inexact
 uv sync --upgrade-package transformers --inexact
 
+MAX_JOBS=4 NVCC_THREADS=2 FLASH_ATTN_CUDA_ARCHS="100" pip install "flash-attn-4[cu13]==4.0.0b11" --no-build-isolation
+
+# 注意, 安装 flash-attn-4 会自动安装 nvshmem-3.4.5, 卸载 hybrid-ep 的 3.6.5, 需要重新编译 hybrid-ep
+# 编译时不要再安装新的 nvshmem
+
 
 bash install/install-hybrid-ep.sh
 bash install/install-deep-ep.sh
