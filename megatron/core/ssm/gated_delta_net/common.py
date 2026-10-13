@@ -264,6 +264,22 @@ class _GDNBase(MegatronModule):
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
 
+        # Fine-grained activation offloading reuses the attention group names:
+        # in_proj -> "qkv_linear", conv1d through gated norm -> "core_attn",
+        # out_proj -> "attn_proj".
+        self.offload_qkv_linear = (
+            self.config.fine_grained_activation_offloading
+            and "qkv_linear" in self.config.offload_modules
+        )
+        self.offload_core_attention = (
+            self.config.fine_grained_activation_offloading
+            and "core_attn" in self.config.offload_modules
+        )
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
+        )
+
         self.out_proj = build_module(
             submodules.out_proj,
             self.v_dim,
