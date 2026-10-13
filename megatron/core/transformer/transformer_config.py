@@ -885,6 +885,13 @@ class TransformerConfig(ModelParallelConfig):
     already padded to equal token counts.
     """
 
+    moe_hybridep_sync_with_sm: bool = False
+    """When ``moe_hybridep_pad_uneven_dispatch_inputs`` is enabled, read the EP-group max
+    token count with an SM copy and a host spin-wait instead of ``.item()``, which
+    synchronizes the whole compute stream. Requires Triton and is not compatible with
+    CUDA graph capture of the dispatch preprocessing.
+    """
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -1693,6 +1700,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
+
+        if self.moe_hybridep_sync_with_sm and (
+            self.moe_token_dispatcher_type != "flex"
+            or self.moe_flex_dispatcher_backend != "hybridep"
+        ):
+            raise ValueError(
+                "moe_hybridep_sync_with_sm requires moe_token_dispatcher_type='flex' and "
+                "moe_flex_dispatcher_backend='hybridep'."
+            )
 
         if self.moe_expert_rank_capacity_factor is not None:
             if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):

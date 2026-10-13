@@ -1078,7 +1078,16 @@ class _HybridEPManager(_DispatchManager):
             torch.distributed.all_reduce(
                 max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
             )
-            padded_num_tokens = int(max_num_tokens_across_ep.item())
+            if self.config.moe_hybridep_sync_with_sm:
+                # Read the reduced max with an SM copy and a host spin-wait instead
+                # of .item(), which synchronizes the whole compute stream.
+                from megatron.core.transformer.moe.hybrid_ep_sm_sync import (
+                    read_device_counts_with_sm,
+                )
+
+                padded_num_tokens = int(read_device_counts_with_sm(max_num_tokens_across_ep)[0])
+            else:
+                padded_num_tokens = int(max_num_tokens_across_ep.item())
             padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
         self._padded_num_tokens = padded_num_tokens
 
