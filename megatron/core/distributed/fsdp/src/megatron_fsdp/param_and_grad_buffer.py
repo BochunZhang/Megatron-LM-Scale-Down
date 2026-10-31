@@ -22,6 +22,7 @@ import inspect
 import logging
 import math
 import operator
+import re
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -54,10 +55,40 @@ from .utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
     log_single_rank,
+    nvtx_range,
     using_tensor_parallel,
 )
 
 logger = logging.getLogger(__name__)
+
+# Parameter-name patterns that identify the layer a parameter belongs to, used to
+# label FSDP collectives in NVTX ranges ("L3", "mtp0", ...).
+_NVTX_LAYER_PATTERNS = (
+    (re.compile(r"(?:^|\.)mtp\.layers\.(\d+)\."), "mtp"),
+    (re.compile(r"(?:^|\.)layers\.(\d+)\."), "L"),
+)
+_NVTX_NON_LAYER_PARAMS = (
+    ("embedding", "embedding"),
+    ("output_layer", "output_layer"),
+    ("final_layernorm", "final_norm"),
+)
+
+
+def _nvtx_param_unit(name: str) -> str:
+    """Return the layer tag of a parameter name for NVTX labels."""
+    for pattern, prefix in _NVTX_LAYER_PATTERNS:
+        match = pattern.search(name)
+        if match:
+            return f"{prefix}{match.group(1)}"
+    for key, tag in _NVTX_NON_LAYER_PARAMS:
+        if key in name:
+            return tag
+    return name.removeprefix("module.").split(".")[0]
+
+
+def _nvtx_unit_sort_key(unit: str) -> list:
+    """Natural sort key so that L2 sorts before L10."""
+    return [int(token) if token.isdigit() else token for token in re.split(r"(\d+)", unit)]
 
 
 try:
@@ -2023,6 +2054,7 @@ class ParamAndGradBuffer:
         self.module = module
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
+        self._bucket_nvtx_labels: Dict[int, str] = {}
         self.mp_policy = mixed_precision_policy
         self.dist_index = dist_index
         self.params = list(module.parameters())
@@ -3406,6 +3438,29 @@ class ParamAndGradBuffer:
         """Return the number of buckets."""
         return len(self.parameter_groups)
 
+    def bucket_nvtx_label(self, bucket_id: int) -> str:
+        """Return the NVTX label ``<layers> <kind> <params>`` of a bucket.
+
+        ``<layers>`` lists the layers whose parameters the bucket holds (``L3``,
+        ``mtp0``, ``embedding``, ...), ``<kind>`` is ``expert`` for routed-expert
+        buckets, ``dense`` otherwise (``mixed`` if both), and ``<params>`` is the
+        unsharded parameter count. Labels are cached after first use.
+        """
+        if bucket_id not in self._bucket_nvtx_labels:
+            params = self.parameter_groups[bucket_id].params
+            names = [self.param_to_name.get(p, "?") for p in params]
+            units = sorted(set(map(_nvtx_param_unit, names)), key=_nvtx_unit_sort_key)
+            num_experts = sum(".experts." in name for name in names)
+            if num_experts == 0:
+                kind = "dense"
+            elif num_experts == len(names):
+                kind = "expert"
+            else:
+                kind = "mixed"
+            numel = sum(p.numel() for p in params)
+            self._bucket_nvtx_labels[bucket_id] = f"{','.join(units)} {kind} {numel / 1e6:.1f}M"
+        return self._bucket_nvtx_labels[bucket_id]
+
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
         """
@@ -4034,8 +4089,14 @@ class GradReducePipeline:
 
         # DP-Shard Gradient Reduction
         dp_group = self.get_fsdp_buffer(bucket_group[0]).data_parallel_group
+        collective = "AR" if ddp_config.data_parallel_sharding_strategy == "no_shard" else "RS"
         with torch.cuda.stream(reduce_scatter_stream):
-            with _coalescing_manager(dp_group):
+            # The coalesced collective launches when the manager exits, inside the
+            # NVTX range that names the layers of the reduced buckets.
+            with nvtx_range(
+                lambda: f"FSDP {collective} "
+                + " + ".join(self.buffer.bucket_nvtx_label(b) for b in bucket_group)
+            ), _coalescing_manager(dp_group):
                 # List of gradient accumulation closure tasks.
                 # (grad_buffer, reduced_grad)
                 grad_accum_closure = []
@@ -4377,6 +4438,25 @@ class AllGatherPipeline:
             f"bucket_can_be_released: {self.bucket_can_be_released}."
         )
 
+    def all_gather_nvtx_label(self, buckets: List[int], requested_buckets: set, bwd: bool) -> str:
+        """Return the NVTX label of one coalesced parameter all-gather.
+
+        For example ``FSDP AG fwd L1 dense 132.7M | FSDP AG fwd prefetch L2 dense
+        132.7M + L2 expert 1610.6M``: buckets of the requesting module first, then
+        buckets gathered ahead of time, each named by ``bucket_nvtx_label``.
+        """
+        phase = "bwd" if bwd else "fwd"
+        parts = []
+        for prefix, selected in (
+            (f"FSDP AG {phase}", [b for b in buckets if b in requested_buckets]),
+            (f"FSDP AG {phase} prefetch", [b for b in buckets if b not in requested_buckets]),
+        ):
+            if selected:
+                parts.append(
+                    f"{prefix} " + " + ".join(self.buffer.bucket_nvtx_label(b) for b in selected)
+                )
+        return " | ".join(parts)
+
     def all_gather_params(
         self,
         params: List[torch.Tensor],
@@ -4408,6 +4488,8 @@ class AllGatherPipeline:
 
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
+        # Buckets added below beyond these are prefetched (named in NVTX labels).
+        requested_buckets = set(ag_buckets)
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
             double_buf_units = set()
@@ -4558,7 +4640,11 @@ class AllGatherPipeline:
             all_gather_stream.wait_stream(torch.cuda.current_stream())
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
             with torch.cuda.stream(all_gather_stream):
-                with _coalescing_manager(
+                # The coalesced all-gather launches when the manager exits, inside
+                # the NVTX range that names the layers of the gathered buckets.
+                with nvtx_range(
+                    lambda: self.all_gather_nvtx_label(buckets, requested_buckets, bwd)
+                ), _coalescing_manager(
                     dp_group, async_ops=async_param_gather
                 ) as coalescing_event:
                     for bucket_id in buckets:

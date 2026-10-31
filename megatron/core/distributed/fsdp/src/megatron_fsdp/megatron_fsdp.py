@@ -40,7 +40,7 @@ from .param_and_grad_buffer import (
     override_sharded_param_methods_with_safety_checks,
     to_local_if_dtensor,
 )
-from .utils import FSDPDistributedIndex, log_single_rank
+from .utils import FSDPDistributedIndex, log_single_rank, nvtx_range
 
 logger = logging.getLogger(__name__)
 
@@ -1283,7 +1283,12 @@ class MegatronFSDP(torch.nn.Module):
         else:
             self.synchronize_param_gather()
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
-                self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
+                with nvtx_range(
+                    lambda: self.all_gather_pipeline.all_gather_nvtx_label(
+                        [bucket_id], {bucket_id}, bwd=False
+                    )
+                ):
+                    self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
                 group = self.param_and_grad_buffer.parameter_groups[bucket_id]
                 if group.model_weight_buffer is None:
                     continue

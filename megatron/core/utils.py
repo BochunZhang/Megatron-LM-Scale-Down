@@ -2686,6 +2686,15 @@ def configure_nvtx_profiling(enabled: bool) -> None:
     """
     global _nvtx_enabled
     _nvtx_enabled = enabled
+    # Megatron-FSDP is packaged standalone and keeps its own switch for the
+    # NVTX ranges that label its all-gather / reduce-scatter with layer names.
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+            configure_nvtx_profiling as configure_megatron_fsdp_nvtx_profiling,
+        )
+    except ImportError:
+        return
+    configure_megatron_fsdp_nvtx_profiling(enabled)
 
 
 def _nvtx_range_get_func_path():

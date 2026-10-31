@@ -56,6 +56,35 @@ except Exception:
 
 _MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
 
+_nvtx_enabled: bool = False  # Whether Megatron-FSDP NVTX ranges are emitted
+
+
+def configure_nvtx_profiling(enabled: bool) -> None:
+    """Enable or disable Megatron-FSDP NVTX ranges.
+
+    Megatron-FSDP is packaged standalone, so it keeps its own switch. With
+    Megatron Core, ``megatron.core.utils.configure_nvtx_profiling`` forwards to it.
+    """
+    global _nvtx_enabled
+    _nvtx_enabled = enabled
+
+
+@contextlib.contextmanager
+def nvtx_range(message: Callable[[], str]):
+    """Wrap the body in an NVTX range while Megatron-FSDP NVTX profiling is enabled.
+
+    ``message`` is only called when profiling is enabled, so building the label
+    costs nothing otherwise.
+    """
+    if not _nvtx_enabled:
+        yield
+        return
+    torch.cuda.nvtx.range_push(message())
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
 
 def get_te_version():
     """Get TE version from __version__; if not available use pip's. Use caching."""
