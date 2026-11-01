@@ -91,6 +91,29 @@ def _nvtx_unit_sort_key(unit: str) -> list:
     return [int(token) if token.isdigit() else token for token in re.split(r"(\d+)", unit)]
 
 
+def _parameter_group_nvtx_label(
+    params: List[torch.nn.Parameter], param_to_name: Dict[torch.nn.Parameter, str]
+) -> str:
+    """Return the NVTX label ``<layers> <kind> <params>`` of a parameter group.
+
+    ``<layers>`` lists the layers whose parameters the group holds (``L3``,
+    ``mtp0``, ``embedding``, ...), ``<kind>`` is ``expert`` for routed-expert
+    groups, ``dense`` otherwise (``mixed`` if both), and ``<params>`` is the
+    unsharded parameter count.
+    """
+    names = [param_to_name.get(p, "?") for p in params]
+    units = sorted(set(map(_nvtx_param_unit, names)), key=_nvtx_unit_sort_key)
+    num_experts = sum(".experts." in name for name in names)
+    if num_experts == 0:
+        kind = "dense"
+    elif num_experts == len(names):
+        kind = "expert"
+    else:
+        kind = "mixed"
+    numel = sum(p.numel() for p in params)
+    return f"{','.join(units)} {kind} {numel / 1e6:.1f}M"
+
+
 try:
     # Default to Megatron-LM FW.
     from megatron.core.distributed.distributed_data_parallel_config import (
@@ -1735,6 +1758,10 @@ class ParameterGroup:
             communication data-types when using HSDP or HFSDP only.
             Only allocates memory when `MixedPrecisionPolicy.grad_comm_dtype`
             is set to a non-`None` `torch.dtype`. Contains no local data.
+        nvtx_label (str):
+            Name of the group in the NVTX ranges of its collectives, e.g.
+            ``L2 expert 1610.6M``. Set once by ``ParamAndGradBuffer`` when the
+            groups are built.
     """
 
     params: List[torch.nn.Parameter]
@@ -1752,6 +1779,7 @@ class ParameterGroup:
     hfsdp_helper_wtbuf: Optional[DataParallelBuffer] = None
     hfsdp_helper_gbuf: Optional[DataParallelBuffer] = None
     hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
+    nvtx_label: str = ""
 
 
 def _get_parameter_groups(
@@ -2054,7 +2082,6 @@ class ParamAndGradBuffer:
         self.module = module
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
-        self._bucket_nvtx_labels: Dict[int, str] = {}
         self.mp_policy = mixed_precision_policy
         self.dist_index = dist_index
         self.params = list(module.parameters())
@@ -2179,6 +2206,10 @@ class ParamAndGradBuffer:
         self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group = (
             _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
         )
+        # Name each bucket once here, so labelling its collectives in NVTX ranges
+        # costs no name lookup or size reduction at run time.
+        for group in self.parameter_groups:
+            group.nvtx_label = _parameter_group_nvtx_label(group.params, self.param_to_name)
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
         self._init_distributed_params()
 
@@ -3438,29 +3469,6 @@ class ParamAndGradBuffer:
         """Return the number of buckets."""
         return len(self.parameter_groups)
 
-    def bucket_nvtx_label(self, bucket_id: int) -> str:
-        """Return the NVTX label ``<layers> <kind> <params>`` of a bucket.
-
-        ``<layers>`` lists the layers whose parameters the bucket holds (``L3``,
-        ``mtp0``, ``embedding``, ...), ``<kind>`` is ``expert`` for routed-expert
-        buckets, ``dense`` otherwise (``mixed`` if both), and ``<params>`` is the
-        unsharded parameter count. Labels are cached after first use.
-        """
-        if bucket_id not in self._bucket_nvtx_labels:
-            params = self.parameter_groups[bucket_id].params
-            names = [self.param_to_name.get(p, "?") for p in params]
-            units = sorted(set(map(_nvtx_param_unit, names)), key=_nvtx_unit_sort_key)
-            num_experts = sum(".experts." in name for name in names)
-            if num_experts == 0:
-                kind = "dense"
-            elif num_experts == len(names):
-                kind = "expert"
-            else:
-                kind = "mixed"
-            numel = sum(p.numel() for p in params)
-            self._bucket_nvtx_labels[bucket_id] = f"{','.join(units)} {kind} {numel / 1e6:.1f}M"
-        return self._bucket_nvtx_labels[bucket_id]
-
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
         """
@@ -3889,6 +3897,11 @@ class GradReducePipeline:
         self.bucket_grad_ready_params = [set() for _ in range(self.buffer.num_buckets)]
         self.rs_stream = rs_stream
         self.check_nans = check_nans
+        self._nvtx_collective = (
+            "AR" if self.buffer.ddp_config.data_parallel_sharding_strategy == "no_shard" else "RS"
+        )
+        # NVTX labels of the coalesced bucket groups seen so far, keyed by bucket IDs.
+        self._nvtx_labels: Dict[tuple, str] = {}
 
         # Init outer-DP group gradient reduction related attributes.
         dist_index = self.buffer.dist_index
@@ -3903,6 +3916,23 @@ class GradReducePipeline:
     def num_buckets(self):
         """Return the number of buckets."""
         return self.buffer.num_buckets
+
+    def grad_reduce_nvtx_label(self, bucket_group: List[int]) -> str:
+        """Return the NVTX label of one coalesced gradient reduction.
+
+        For example ``FSDP RS L3 dense 119.6M + L3 expert 1610.6M``. Bucket names
+        come from ``ParameterGroup.nvtx_label``; the joined label of each bucket
+        combination is built on first use and then looked up.
+        """
+        key = tuple(bucket_group)
+        label = self._nvtx_labels.get(key)
+        if label is None:
+            groups = self.buffer.parameter_groups
+            label = f"FSDP {self._nvtx_collective} " + " + ".join(
+                groups[b].nvtx_label for b in bucket_group
+            )
+            self._nvtx_labels[key] = label
+        return label
 
     def reset(self):
         """Handle the processing tasks and reset the pipeline."""
@@ -4089,13 +4119,11 @@ class GradReducePipeline:
 
         # DP-Shard Gradient Reduction
         dp_group = self.get_fsdp_buffer(bucket_group[0]).data_parallel_group
-        collective = "AR" if ddp_config.data_parallel_sharding_strategy == "no_shard" else "RS"
         with torch.cuda.stream(reduce_scatter_stream):
             # The coalesced collective launches when the manager exits, inside the
             # NVTX range that names the layers of the reduced buckets.
             with nvtx_range(
-                lambda: f"FSDP {collective} "
-                + " + ".join(self.buffer.bucket_nvtx_label(b) for b in bucket_group)
+                lambda: self.grad_reduce_nvtx_label(bucket_group)
             ), _coalescing_manager(dp_group):
                 # List of gradient accumulation closure tasks.
                 # (grad_buffer, reduced_grad)
@@ -4340,6 +4368,9 @@ class AllGatherPipeline:
     ) -> None:
         self.buffer = param_and_grad_buffer
         self.ag_stream = ag_stream
+        # NVTX labels of the coalesced all-gathers seen so far, keyed by phase,
+        # bucket IDs and which of them were requested rather than prefetched.
+        self._nvtx_labels: Dict[tuple, str] = {}
         # Track the status of all-gather operations for each bucket.
         self.param_gather_event_map = {}
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
@@ -4443,19 +4474,23 @@ class AllGatherPipeline:
 
         For example ``FSDP AG fwd L1 dense 132.7M | FSDP AG fwd prefetch L2 dense
         132.7M + L2 expert 1610.6M``: buckets of the requesting module first, then
-        buckets gathered ahead of time, each named by ``bucket_nvtx_label``.
+        buckets gathered ahead of time, each named by ``ParameterGroup.nvtx_label``.
+        The joined label of each combination is built on first use and then looked up.
         """
-        phase = "bwd" if bwd else "fwd"
-        parts = []
-        for prefix, selected in (
-            (f"FSDP AG {phase}", [b for b in buckets if b in requested_buckets]),
-            (f"FSDP AG {phase} prefetch", [b for b in buckets if b not in requested_buckets]),
-        ):
-            if selected:
-                parts.append(
-                    f"{prefix} " + " + ".join(self.buffer.bucket_nvtx_label(b) for b in selected)
-                )
-        return " | ".join(parts)
+        requested = tuple(b in requested_buckets for b in buckets)
+        key = (bwd, tuple(buckets), requested)
+        label = self._nvtx_labels.get(key)
+        if label is None:
+            groups = self.buffer.parameter_groups
+            phase = "bwd" if bwd else "fwd"
+            parts = []
+            for prefix, want in ((f"FSDP AG {phase}", True), (f"FSDP AG {phase} prefetch", False)):
+                selected = [b for b, req in zip(buckets, requested) if req == want]
+                if selected:
+                    parts.append(f"{prefix} " + " + ".join(groups[b].nvtx_label for b in selected))
+            label = " | ".join(parts)
+            self._nvtx_labels[key] = label
+        return label
 
     def all_gather_params(
         self,
