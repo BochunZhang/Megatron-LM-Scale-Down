@@ -34,6 +34,9 @@ from megatron.core.utils import (
     is_torch_min_version,
     log_single_rank,
     make_viewless_tensor,
+    nvtx_backward_range_begin_at,
+    nvtx_backward_range_enabled,
+    nvtx_backward_range_end_at,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -346,6 +349,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+        # NVTX range names, 0-based like the parameter names (decoder.layers.<i>,
+        # mtp.layers.<i>) that Megatron-FSDP uses to label its all-gather /
+        # reduce-scatter ranges. Built once so forward and backward only look them up.
+        nvtx_layer = f"{'mtp' if is_mtp_layer else 'L'}{self.layer_number - 1}"
+        self._nvtx_fwd_label = f"{nvtx_layer} fwd"
+        self._nvtx_bwd_label = f"{nvtx_layer} bwd"
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -737,7 +746,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        nvtx_range_push(f"layer {self.layer_number}")
+        nvtx_range_push(self._nvtx_fwd_label)
+        # Backward range, injected like Megatron-FSDP's backward hooks: it opens
+        # when the gradient of the layer output arrives and closes when the
+        # gradient w.r.t. the layer input has been computed.
+        hidden_states = args[0] if args else kwargs["hidden_states"]
+        nvtx_bwd = nvtx_backward_range_enabled(hidden_states)
+        if nvtx_bwd:
+            hidden_states = nvtx_backward_range_end_at(hidden_states, self._nvtx_bwd_label)
+            if args:
+                args = (hidden_states, *args[1:])
+            else:
+                kwargs["hidden_states"] = hidden_states
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -745,7 +765,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             padding_mask=kwargs.get("padding_mask", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
-        nvtx_range_pop(f"layer {self.layer_number}")
+        if nvtx_bwd:
+            nvtx_backward_range_begin_at(output, self._nvtx_bwd_label)
+        nvtx_range_pop(self._nvtx_fwd_label)
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):

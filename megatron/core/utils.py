@@ -2767,6 +2767,57 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
     torch.cuda.nvtx.range_pop()
 
 
+class _NvtxRangePopInBackward(torch.autograd.Function):
+    """Identity whose backward pops the NVTX range ``msg``.
+
+    Applied to a module input, its backward runs once the gradient w.r.t. that
+    input is computed, i.e. when the module's backward ends.
+    """
+
+    @staticmethod
+    def forward(ctx, msg, tensor):
+        ctx.msg = msg
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad):
+        nvtx_range_pop(ctx.msg)
+        return None, grad
+
+
+def nvtx_backward_range_enabled(tensor: torch.Tensor) -> bool:
+    """Whether a backward NVTX range can be attached around the autograd graph of ``tensor``."""
+    return (
+        _nvtx_enabled
+        and torch.is_grad_enabled()
+        and isinstance(tensor, torch.Tensor)
+        and tensor.requires_grad
+    )
+
+
+def nvtx_backward_range_end_at(tensor: torch.Tensor, msg: str) -> torch.Tensor:
+    """Return ``tensor`` through an identity whose backward pops the NVTX range ``msg``.
+
+    Pair with ``nvtx_backward_range_begin_at``: call this on the module input
+    before the forward, and that on the module output after it. ``msg`` should
+    be a long-lived string (see ``_nvtx_range_msg_pool``).
+    """
+    return _NvtxRangePopInBackward.apply(msg, tensor)
+
+
+def nvtx_backward_range_begin_at(tensor: torch.Tensor, msg: str) -> None:
+    """Push the NVTX range ``msg`` when the gradient w.r.t. ``tensor`` arrives.
+
+    On a module output this is the start of the module's backward. The hook is
+    a tensor hook rather than an identity function so the output stays viewless.
+    """
+    tensor.register_hook(functools.partial(_nvtx_backward_range_push_hook, msg))
+
+
+def _nvtx_backward_range_push_hook(msg: str, grad: torch.Tensor) -> None:
+    nvtx_range_push(msg)
+
+
 @lru_cache(maxsize=None)
 def _nvtx_decorator_get_func_path(func):
     """Get the path of a function.
