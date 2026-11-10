@@ -41,6 +41,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -235,6 +236,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
+
+        if config.cuda_graph_impl == "local" and config.cuda_graph_modules == [
+            CudaGraphModule.attn
+        ]:
+            from megatron.core.transformer.cuda_graphs import _configure_fsdp_attention_cuda_graphs
+
+            _configure_fsdp_attention_cuda_graphs(self.module, module, config)
 
         self.sync_rng_states_across_tp_group()
 

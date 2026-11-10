@@ -964,6 +964,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         self.bucket_alloc_index = {}  # map bucket ID to offset
         self.max_dtype_bucket_sizes = {}  # dtype -> [bucket sizes from smallest to largest]
         self.dtype_fn = dtype_fn
+        self._fixed_graph_slots = False
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
         fsdp_unit_buckets = defaultdict(list)
@@ -1020,6 +1021,14 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
         self.backup_allocator = StorageResizeBasedBucketAllocator()
+
+    def _assign_cuda_graph_slots(self):
+        """Give adjacent FSDP units alternating slots in both traversal directions."""
+        self._fixed_graph_slots = True
+        for index, unit_id in enumerate(sorted(self.fsdp_unit_buckets)):
+            for bucket_id in self.fsdp_unit_buckets[unit_id]:
+                _, offset = self.bucket_alloc_index[bucket_id]
+                self.bucket_alloc_index[bucket_id] = (index % self.size, offset)
 
     def _build_fixed_max_pool(self):
         """
@@ -1141,6 +1150,10 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 self.using_buffer[bucket_id] = (buffer_offset, dtype, bucket_offset)
                 buffer_name = self._get_gbuf_name(buffer_offset, dtype, bucket_offset)
                 self.idle_buffer.remove((buffer_offset, dtype, bucket_offset))
+            elif self._fixed_graph_slots and strict_assignments:
+                raise RuntimeError(
+                    f"FSDP CUDA graph slot {buffer_offset} is busy for weight bucket {bucket_id}."
+                )
             else:
                 # If we failed to allocate a planned buffer, then warn the user!
                 if strict_assignments and buffer_offset >= 0:
@@ -4373,6 +4386,8 @@ class AllGatherPipeline:
         self._nvtx_labels: Dict[tuple, str] = {}
         # Track the status of all-gather operations for each bucket.
         self.param_gather_event_map = {}
+        self._prefetch_graph_order = None
+        self._prefetch_graphs = {}
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
@@ -4491,6 +4506,66 @@ class AllGatherPipeline:
             label = " | ".join(parts)
             self._nvtx_labels[key] = label
         return label
+
+    def _record_prefetch_cuda_graphs(self):
+        self.buffer.weight_alloc._assign_cuda_graph_slots()
+        # Preserve the order in which the eager step launched these NCCL groups.
+        self._prefetch_graph_order = {}
+
+    def _capture_prefetch_cuda_graphs(self):
+        """Capture the all-gathers observed during eager warmup."""
+        order = self._prefetch_graph_order
+        if order is None:
+            return
+        self._prefetch_graph_order = None
+        for bwd, bucket_ids in order:
+            buffers = [self.get_fsdp_buffer(i, bwd) for i in bucket_ids]
+            outputs = []
+            try:
+                for buffer in buffers:
+                    outputs.append(buffer.fetch_bucket().data)
+                inputs = [buffer.get_shard_from_local_buffer() for buffer in buffers]
+                dp_group = buffers[0].data_parallel_group
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(
+                    graph, stream=self.ag_stream, capture_error_mode="thread_local"
+                ):
+                    with _coalescing_manager(dp_group, async_ops=True) as work:
+                        for output, shard in zip(outputs, inputs):
+                            torch.distributed.all_gather_into_tensor(
+                                output, shard, group=dp_group, async_op=True
+                            )
+                    work.wait()
+                self._prefetch_graphs[bwd, bucket_ids] = (graph, outputs, torch.cuda.Event())
+            finally:
+                for buffer in buffers[: len(outputs)]:
+                    buffer.free_bucket_storage()
+
+    @torch.no_grad()
+    def _replay_prefetch_cuda_graph(self, bucket_ids, bwd, entry):
+        graph, captured_outputs, event = entry
+        prepared = []
+        try:
+            for bucket_id in bucket_ids:
+                key = self.get_bucket_key(bucket_id, bwd)
+                self.bucket_can_be_released[key] = False
+                self.recycle_unused_buckets()
+                buffer = self.get_fsdp_buffer(bucket_id, bwd)
+                output = buffer.fetch_bucket(set_param_data=True).data
+                prepared.append((key, buffer, output))
+            if any(
+                output.data_ptr() != captured.data_ptr()
+                for (_, _, output), captured in zip(prepared, captured_outputs)
+            ):
+                raise RuntimeError("FSDP prefetch target moved after CUDA graph capture.")
+        except BaseException:
+            for _, buffer, _ in prepared:
+                buffer.free_bucket_storage()
+            raise
+        graph.replay()
+        event.record()
+        for key, _, _ in prepared:
+            self._track_bucket_gather(key, event)
 
     def all_gather_params(
         self,
@@ -4675,6 +4750,25 @@ class AllGatherPipeline:
             all_gather_stream.wait_stream(torch.cuda.current_stream())
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
             with torch.cuda.stream(all_gather_stream):
+                if (
+                    (self._prefetch_graph_order is not None or self._prefetch_graphs)
+                    and async_param_gather
+                    and requested_buckets.isdisjoint(buckets)
+                ):
+                    graph_key = (bwd, tuple(buckets))
+                    entry = self._prefetch_graphs.get(graph_key)
+                    if entry is not None:
+                        with nvtx_range(
+                            lambda: self.all_gather_nvtx_label(buckets, requested_buckets, bwd)
+                        ):
+                            self._replay_prefetch_cuda_graph(buckets, bwd, entry)
+                        continue
+                    if self._prefetch_graph_order is not None and all(
+                        parameter_groups[i].fsdp_unit_id is not None
+                        and self.get_fsdp_buffer(i, bwd).is_data_distributed
+                        for i in buckets
+                    ):
+                        self._prefetch_graph_order[graph_key] = None
                 # The coalesced all-gather launches when the manager exits, inside
                 # the NVTX range that names the layers of the gathered buckets.
                 with nvtx_range(
@@ -4832,21 +4926,15 @@ class AllGatherPipeline:
             async_op=True,
         )
 
-        def get_closure(bucket_id, bwd):
-            @torch.no_grad()
-            def mark_bucket_ready_to_use():
-                # Mark the bucket as ready to use - all NCCL operations are complete.
-                self.bucket_status[self.get_bucket_key(bucket_id, bwd)] = BucketStatus.READY_TO_USE
+        self._track_bucket_gather(bucket_key, param_gather_event)
 
-            return mark_bucket_ready_to_use
+    def _track_bucket_gather(self, bucket_key, event):
+        self.bucket_status[bucket_key] = BucketStatus.COMMUNICATING
 
-        mark_bucket_ready_to_use = get_closure(bucket_id, bwd)
+        def mark_bucket_ready():
+            self.bucket_status[bucket_key] = BucketStatus.READY_TO_USE
 
-        # Track the async all-gather operation for the bucket.
-        self.param_gather_event_map[self.get_bucket_key(bucket_id, bwd)] = (
-            param_gather_event,
-            mark_bucket_ready_to_use,
-        )
+        self.param_gather_event_map[bucket_key] = (event, mark_bucket_ready)
 
 
 @torch.no_grad()

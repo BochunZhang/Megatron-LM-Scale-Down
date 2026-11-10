@@ -127,6 +127,172 @@ class TestFullyShardedDataParallel:
         assert fsdp_model.mp_policy.main_grads_dtype is None
         assert fsdp_model.mp_policy.grad_comm_dtype is None
 
+    @pytest.mark.skipif(not HAVE_TE, reason="Requires Transformer Engine attention.")
+    @pytest.mark.parametrize(
+        ("num_experts", "warmup_steps"), [(None, 3), (4, 1)], ids=["dense", "dropless_moe"]
+    )
+    def test_native_attention_cuda_graph(self, num_experts, warmup_steps, monkeypatch):
+        """Check native replay with FSDP prefetch and compare gradients against eager."""
+        from megatron.core.enums import ModelType
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+        from megatron.core.transformer.cuda_graphs import (
+            annotate_first_last_layer,
+            delete_cuda_graphs,
+        )
+        from megatron.core.transformer.module import MegatronModule
+
+        if Utils.world_size < 2:
+            pytest.skip("Requires at least two FSDP ranks.")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+
+        class Model(MegatronModule):
+            model_type = ModelType.encoder_or_decoder
+
+            def __init__(self, config):
+                super().__init__(config)
+                spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
+                self.layers = torch.nn.ModuleList(
+                    TransformerLayer(config, spec.submodules, layer_number=i + 1)
+                    for i in range(config.num_layers)
+                )
+                annotate_first_last_layer(self.layers)
+
+            def set_input_tensor(self, _):
+                pass
+
+            def forward(self, hidden_states, mask):
+                for layer in self.layers:
+                    hidden_states, _ = layer(hidden_states=hidden_states, attention_mask=mask)
+                return hidden_states
+
+        def build(impl):
+            torch.manual_seed(42)
+            model_parallel_cuda_manual_seed(42, use_cudagraphable_rng=True, force_reset_rng=True)
+            config = TransformerConfig(
+                num_layers=3,
+                hidden_size=128,
+                num_attention_heads=4,
+                params_dtype=torch.bfloat16,
+                bf16=True,
+                attention_dropout=0.0,
+                hidden_dropout=0.0,
+                num_moe_experts=num_experts,
+                moe_token_dispatcher_type="alltoall",
+                moe_router_load_balancing_type="none",
+                moe_router_topk=1,
+                moe_router_pre_softmax=True,
+                cuda_graph_impl=impl,
+                cuda_graph_modules=["attn"] if impl == "local" else [],
+                cuda_graph_warmup_steps=warmup_steps,
+            )
+            ddp_config = DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_max_pool_double_buffer=True,
+            )
+            model = FullyShardedDataParallel(config, ddp_config, Model(config).cuda())
+            config.no_sync_func = model.no_sync
+            config.finalize_model_grads_func = lambda models, *_, **__: models[0].finish_grad_sync()
+            return model, torch.optim.SGD(model.parameters(), lr=0.125, foreach=False)
+
+        def forward_step(data_iterator, model):
+            inputs = next(data_iterator).detach().requires_grad_()
+
+            def loss_fn(output):
+                loss = output.float().square().mean()
+                return loss, loss.detach().clone()
+
+            return model(inputs, mask), loss_fn
+
+        def step(model, optimizer, inputs):
+            model.zero_grad_buffer()
+            optimizer.zero_grad()
+            losses = get_forward_backward_func()(
+                forward_step_func=forward_step,
+                data_iterator=iter(inputs),
+                model=model,
+                num_microbatches=len(inputs),
+                seq_length=seq_length,
+                micro_batch_size=1,
+            )
+            grads = [
+                group.main_grad_buffer.data.clone()
+                for group in model.param_and_grad_buffer.parameter_groups
+            ]
+            optimizer.step()
+            model.module.install_optimized_model_weights()
+            model.start_param_sync()
+            return losses, grads
+
+        delete_cuda_graphs()
+        eager, eager_optimizer = build("none")
+        graphed, graph_optimizer = build("local")
+        seq_length = 32
+        mask = ~torch.ones((1, 1, seq_length, seq_length), dtype=torch.bool, device="cuda").tril()
+        pipeline = graphed.module.all_gather_pipeline
+        gather = pipeline.all_gather_params
+        prefetched_buckets = {False: set(), True: set()}
+        graph_prefetches = {False: set(), True: set()}
+        replay_prefetch = pipeline._replay_prefetch_cuda_graph
+
+        def observe_gather(params, **kwargs):
+            before = set(pipeline.param_gather_event_map)
+            gather(params=params, **kwargs)
+            if kwargs["prefetch"]:
+                bwd = kwargs["bwd"]
+                groups = graphed.param_and_grad_buffer.param_to_param_group
+                requested = {pipeline.get_bucket_key(groups[param], bwd) for param in params}
+                prefetched_buckets[bwd].update(
+                    set(pipeline.param_gather_event_map) - before - requested
+                )
+
+        def observe_replay(bucket_ids, bwd, entry):
+            replay_prefetch(bucket_ids, bwd, entry)
+            graph_prefetches[bwd].update(pipeline.get_bucket_key(i, bwd) for i in bucket_ids)
+
+        monkeypatch.setattr(pipeline, "all_gather_params", observe_gather)
+        monkeypatch.setattr(pipeline, "_replay_prefetch_cuda_graph", observe_replay)
+        layers = graphed.module.module.layers
+        try:
+            for iteration in range(warmup_steps + 2):
+                for buckets in prefetched_buckets.values():
+                    buckets.clear()
+                for buckets in graph_prefetches.values():
+                    buckets.clear()
+                inputs = [
+                    torch.randn((seq_length, 1, 128), dtype=torch.bfloat16, device="cuda")
+                    for _ in range(2)
+                ]
+                expected = step(eager, eager_optimizer, inputs)
+                actual = step(graphed, graph_optimizer, inputs)
+                assert_close(actual, expected, rtol=0, atol=0)
+                if iteration < warmup_steps - 1:
+                    assert not pipeline._prefetch_graphs
+                    assert all(
+                        not layer._attention_cuda_graph_manager.cudagraph_runners
+                        for layer in layers
+                    )
+                elif iteration == warmup_steps - 1:
+                    assert not graph_prefetches[True]
+                    addresses = [
+                        layer._fsdp_attention_cuda_graph.param_addresses for layer in layers
+                    ]
+                    assert addresses[0] == addresses[2]
+                    assert addresses[0] != addresses[1]
+                    for layer in layers:
+                        runner = layer._attention_cuda_graph_manager.cudagraph_runners[0]
+                        assert runner.cudagraph_created and runner.bwd_graph is not None
+                else:
+                    for bwd in (False, True):
+                        assert graph_prefetches[bwd]
+                        assert graph_prefetches[bwd] <= prefetched_buckets[bwd]
+        finally:
+            delete_cuda_graphs()
+            model_parallel_cuda_manual_seed(42, force_reset_rng=True)
+
     @pytest.mark.parametrize(
         ("main_params_dtype", "main_grads_dtype", "grad_comm_dtype"),
         [

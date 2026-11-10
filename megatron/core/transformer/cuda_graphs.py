@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -16,10 +16,12 @@ from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
+from weakref import WeakSet
 
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -475,6 +477,42 @@ def _restore_grads_after_capture(backup):
         p.main_grad.copy_(saved)
 
 
+class _FSDPAttentionCudaGraph:
+    """Use the same FSDP weight slots at capture and replay."""
+
+    def __init__(self, fsdp, params):
+        self.fsdp = fsdp
+        self.params = params
+        param_to_bucket = fsdp.param_and_grad_buffer.param_to_param_group
+        params_by_bucket = {param_to_bucket[param]: param for param in params}
+        self.bucket_ids = tuple(sorted(params_by_bucket))
+        self.bucket_params = tuple(params_by_bucket[i] for i in self.bucket_ids)
+        self.param_addresses = None
+
+    def check_addresses(self):
+        if tuple(param.data_ptr() for param in self.bucket_params) != self.param_addresses:
+            raise RuntimeError("FSDP attention weight slots moved after CUDA graph capture.")
+
+    @contextmanager
+    def capture_weights(self):
+        """Gather weights into their normal pool slots before capture."""
+        was_distributed = self.fsdp.is_param_fsdp_distributed
+        self.fsdp._replace_param_with_raw_if_needed()
+        try:
+            try:
+                self.fsdp.all_gather_and_wait_parameters_ready(self.params, prefetch=False)
+                if self.param_addresses is None:
+                    self.param_addresses = tuple(param.data_ptr() for param in self.bucket_params)
+                self.check_addresses()
+                yield
+            finally:
+                for bucket_id in self.bucket_ids:
+                    self.fsdp.all_gather_pipeline.release_bucket(bucket_id, bwd=False)
+        finally:
+            if was_distributed:
+                self.fsdp._replace_param_with_distributed_if_needed()
+
+
 class _CudagraphGlobalRecord:
     """A global datastructure that records of the ordering of all _CudaGraphRunner's
     first fwd or bwd passes. 'create_cudagraphs' will use this to create
@@ -488,6 +526,7 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
+    fsdp_prefetch_pipelines = WeakSet()
     _saved_tensors_observer = None
 
     @classmethod
@@ -532,9 +571,39 @@ class _CudagraphGlobalRecord:
     @classmethod
     def create_cudagraphs(cls):
         """Create recorded CUDA graphs, then remove the saved-tensor observer."""
+        fsdp_pipelines = dict.fromkeys(
+            runner.fsdp_attention.fsdp.all_gather_pipeline
+            for runner, *_ in cls.cudagraph_record
+            if runner.fsdp_attention is not None
+        )
+        rng_states = []
         try:
-            return cls._create_cudagraphs()
+            if fsdp_pipelines:
+                generators = [
+                    torch.cuda.default_generators[torch.cuda.current_device()],
+                    *get_all_rng_states().values(),
+                ]
+                rng_states = [(gen, gen.get_state()) for gen in generators]
+                for pipeline in fsdp_pipelines:
+                    pipeline._capture_prefetch_cuda_graphs()
+            result = cls._create_cudagraphs()
+            cls.fsdp_prefetch_pipelines.update(fsdp_pipelines)
+            return result
+        except BaseException:
+            if fsdp_pipelines:
+                for pipeline in fsdp_pipelines:
+                    pipeline._prefetch_graphs.clear()
+                _set_capture_end()
+                if HAVE_TE_GRAPHS:
+                    te_set_capture_end()
+                if FREEZE_GC:
+                    gc.unfreeze()
+                torch.cuda.set_stream(torch.cuda.default_stream())
+            raise
         finally:
+            for gen, state in rng_states:
+                # Keep the Generator objects that were registered with the CUDA graphs.
+                gen.set_state(state)
             cls._disable_saved_tensors_observer()
 
     @classmethod
@@ -610,12 +679,18 @@ class _CudagraphGlobalRecord:
                     logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
 
             runner, graph_type = g[0:2]
-            if graph_type == 'fwd':
-                args, kwargs, out = g[2:]
-                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
-            else:
-                assert fwd_buffer_reuse_ref_count == 0
-                runner.create_bwd_graph()
+            weights = (
+                runner.fsdp_attention.capture_weights()
+                if runner.fsdp_attention is not None
+                else nullcontext()
+            )
+            with weights:
+                if graph_type == 'fwd':
+                    args, kwargs, out = g[2:]
+                    runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
+                else:
+                    assert fwd_buffer_reuse_ref_count == 0
+                    runner.create_bwd_graph()
 
         # Memory usage.
         time_end = time.time()
@@ -665,7 +740,7 @@ class _CudagraphGlobalRecord:
         return capture_stats
 
 
-def create_cudagraphs():
+def create_cudagraphs(training_model: torch.nn.Module | None = None):
     """Should be called at the end of each schedule function,
     (e.g. forward_backward_pipelining_with_interleaving) in
     `megatron.core.pipeline_parallel.schedules.py`. During the first step, _CudaGraphRunners
@@ -673,15 +748,29 @@ def create_cudagraphs():
     At the end for the first step, this function calls each runner's `create_fwd_graph` and
     `create_bwd_graph` in the order recorded in _CudagraphGlobalRecord, which allows cudagraphs
     to be created in execution order, which allows multiple cudagraphs to share a single
-    memory pool, minimizing cudagraph memory usage."""
+    memory pool, minimizing cudagraph memory usage. Pass the model after a training
+    schedule to count that step toward FSDP attention graph warmup."""
 
-    return _CudagraphGlobalRecord.create_cudagraphs()
+    result = _CudagraphGlobalRecord.create_cudagraphs()
+    if training_model is not None:
+        try:
+            fsdp = get_attr_wrapped_model(
+                training_model, "_attention_graph_warmup_remaining", return_model_obj=True
+            )
+        except RuntimeError:
+            return result
+        if fsdp._attention_graph_warmup_remaining > 0:
+            fsdp._attention_graph_warmup_remaining -= 1
+    return result
 
 
 def delete_cuda_graphs():
     """Delete all CUDA graphs."""
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
+    for pipeline in _CudagraphGlobalRecord.fsdp_prefetch_pipelines:
+        pipeline._prefetch_graphs.clear()
+    _CudagraphGlobalRecord.fsdp_prefetch_pipelines.clear()
 
     # Reset runners.
     for record in [
@@ -804,6 +893,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
+        if runner.fsdp_attention is not None:
+            runner.fsdp_attention.check_addresses()
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
@@ -827,6 +918,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
         assert len(grads) == len(
             runner.static_grad_outputs
         ), "Bwd cudagraph received a different number of tensors than what it was graphed with!"
+        if runner.fsdp_attention is not None:
+            # The layer's FSDP backward pre-hook has already gathered its weights.
+            runner.fsdp_attention.check_addresses()
 
         # Copy new data into bwd graph input buffer
         for user_output_grad, cudagraph_output_grad in zip(grads, runner.static_grad_outputs):
@@ -868,7 +962,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                         if hook is not None:
                             hook()
 
-        return None, None, *runner.static_grad_inputs, *(None,) * len(runner.params_to_backprop)
+        return None, None, *runner.static_grad_inputs, *runner.static_param_grads
 
 
 class _CudaGraphRunner(torch.nn.Module):
@@ -892,6 +986,10 @@ class _CudaGraphRunner(torch.nn.Module):
         super().__init__()
 
         self.base_module = base_module
+        self.fsdp_attention = getattr(base_module, "_fsdp_attention_cuda_graph", None)
+        self.capture_stream = (
+            get_shared_capture_stream() if self.fsdp_attention is not None else None
+        )
         self.mempool = mempool
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
@@ -1156,7 +1254,7 @@ class _CudaGraphRunner(torch.nn.Module):
             for buf in self.base_module.buffers():
                 buffer_backup.append(buf.clone())
 
-            grad_backup = _backup_grads_before_capture(self)
+            grad_backup = _backup_grads_before_capture(self) if self.fsdp_attention is None else {}
 
             saved_fp8_tensors = None
             if self.fp8_enabled:
@@ -1303,7 +1401,10 @@ class _CudaGraphRunner(torch.nn.Module):
                     gc.freeze()
 
                 with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    self.fwd_graph,
+                    pool=self.mempool,
+                    stream=self.capture_stream,
+                    capture_error_mode="thread_local",
                 ):
 
                     self._sync_against_side_streams(self.fwd_side_streams)
@@ -1425,7 +1526,12 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.freeze()
 
-        with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+        capture_kwargs = (
+            {"stream": self.capture_stream, "capture_error_mode": "thread_local"}
+            if self.fsdp_attention is not None
+            else {}
+        )
+        with torch.cuda.graph(self.bwd_graph, pool=self.mempool, **capture_kwargs):
 
             self._sync_against_side_streams(self.bwd_side_streams)
 
@@ -1441,9 +1547,10 @@ class _CudaGraphRunner(torch.nn.Module):
             n_act_grads = sum(
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
             )
-            for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
-                if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
-                    param.main_grad.add_(wgrad)
+            if self.fsdp_attention is None:
+                for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
+                    if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
+                        param.main_grad.add_(wgrad)
 
             # GTP cross-graph RS overlap, two phases:
             #   Phase 1 — drain AG, fence runner_stream past ag_stream's tail,
@@ -1536,6 +1643,15 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.static_grad_inputs.append(None)
 
         assert len(self.params_to_backprop) == len(grad_inputs)
+        if self.fsdp_attention is not None:
+            # FSDP copies each wgrad into its reduction bucket in the AccumulateGrad hook
+            # before the next backward replay can reuse the graph pool memory.
+            for grad in grad_inputs:
+                if grad is not None:
+                    grad.is_from_global_mempool = True
+            self.static_param_grads = tree_map(make_weakref, tuple(grad_inputs))
+        else:
+            self.static_param_grads = (None,) * len(grad_inputs)
         self.static_grad_inputs = tuple(self.static_grad_inputs)
         self.static_grad_outputs = tuple(self.static_grad_outputs)
 
@@ -1801,6 +1917,15 @@ class CudaGraphManager(torch.nn.Module):
             def wrapped_func(*args, eager=False, cache_key=None, **kwargs):
                 if eager:
                     return func(*args, **kwargs)
+                attention_graph = getattr(base_module, "_fsdp_attention_cuda_graph", None)
+                if attention_graph is not None:
+                    if (
+                        not base_module.training
+                        or not torch.is_grad_enabled()
+                        or attention_graph.fsdp._attention_graph_warmup_remaining > 1
+                    ):
+                        return func(*args, **kwargs)
+                    _CudagraphGlobalRecord._enable_saved_tensors_observer()
                 out = self(base_module, args, kwargs, cache_key=cache_key)
                 # Unwrap single-element tuple to match the original function's return type.
                 if isinstance(out, tuple) and len(out) == 1:
@@ -1957,7 +2082,11 @@ class CudaGraphManager(torch.nn.Module):
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
 
         if _CudagraphGlobalRecord.cudagraph_created:
-            if self.training and torch.is_grad_enabled():
+            if (
+                self.training
+                and torch.is_grad_enabled()
+                and not hasattr(megatron_module, "_fsdp_attention_cuda_graph")
+            ):
                 # Trigger Mcore DDP pre-forward hooks
                 self.call_ddp_preforward_hook(megatron_module)
                 for module in megatron_module.modules():
@@ -2037,6 +2166,90 @@ class CudaGraphManager(torch.nn.Module):
             runner.status = _GraphStatus.BWD_READY
 
         return out
+
+
+def _configure_fsdp_attention_cuda_graphs(fsdp, model, config):
+    """Graph only the attention method, leaving the enclosing FSDP unit hooks active."""
+    if config.cuda_graph_warmup_steps < 1:
+        raise ValueError("Local FSDP attention CUDA graphs require at least one eager warmup step.")
+
+    ddp_config = fsdp.ddp_config
+    if (
+        ddp_config.data_parallel_sharding_strategy != "optim_grads_params"
+        or ddp_config.outer_dp_sharding_strategy != "no_shard"
+        or not ddp_config.megatron_fsdp_max_pool_double_buffer
+        or ddp_config.nccl_ub
+        or ddp_config.fp8_param_gather
+        or ddp_config.fp4_param_gather
+        or fsdp.enable_fine_grained_param_gather_hook
+        or not config.bf16
+        or config.fp8
+        or config.fp4
+        or config.gradient_accumulation_fusion
+        or config.delay_wgrad_compute
+        or config.recompute_granularity
+        or config.fine_grained_activation_offloading
+        or config.gtp_weight_remat_size > 1
+        or config.pipeline_model_parallel_size != 1
+        or config.tensor_model_parallel_size != 1
+        or config.context_parallel_size != 1
+    ):
+        raise ValueError(
+            "Local attention CUDA graphs with Megatron-FSDP require BF16 FSDP3, "
+            "max-pool double buffering and TP=PP=CP=1. Disable outer DP sharding, "
+            "NCCL user buffers, fine-grained parameter gather, fused or delayed wgrad, "
+            "recompute, activation offload and GTP."
+        )
+
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    was_distributed = fsdp.is_param_fsdp_distributed
+    fsdp._replace_param_with_raw_if_needed()
+    try:
+        pg_buffer = fsdp.param_and_grad_buffer
+        params_by_layer = {}
+        for layer in model.modules():
+            if not isinstance(layer, TransformerLayer) or not hasattr(layer, "cudagraph_manager"):
+                continue
+            params = dict.fromkeys(
+                param
+                for submodule in layer._get_submodules_under_cudagraphs()
+                for param in submodule.parameters()
+            )
+            unit_ids = {
+                pg_buffer.parameter_groups[pg_buffer.param_to_param_group[param]].fsdp_unit_id
+                for param in params
+            }
+            if (
+                not isinstance(layer, tuple(fsdp.fsdp_unit_modules))
+                or None in unit_ids
+                or len(unit_ids) > 1
+            ):
+                raise ValueError(
+                    "Local FSDP attention graphs require a TransformerLayer FSDP unit."
+                )
+
+            params_by_layer[layer] = tuple(params)
+
+        if params_by_layer:
+            fsdp._attention_graph_warmup_remaining = config.cuda_graph_warmup_steps
+            fsdp.all_gather_pipeline._record_prefetch_cuda_graphs()
+        for layer, params in params_by_layer.items():
+            layer._fsdp_attention_cuda_graph = _FSDPAttentionCudaGraph(fsdp, params)
+            # Keep the manager registered so train/eval propagates to it, but put the
+            # capture inside the layer's forward and its normal PyTorch hooks.
+            del layer.cudagraph_manager
+            layer._attention_cuda_graph_manager = CudaGraphManager(
+                config,
+                layer,
+                function_name="_forward_attention",
+                pg_collection=layer.pg_collection,
+                # Keep a local warmup for operations with a distinct capture-time path.
+                num_warmup_steps=1,
+            )
+    finally:
+        if was_distributed:
+            fsdp._replace_param_with_distributed_if_needed()
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
