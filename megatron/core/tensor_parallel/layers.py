@@ -658,6 +658,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
                 if hasattr(weight, "__fsdp_param__"):
                     weight.main_grad = weight.get_main_grad()
+                    accumulate = not getattr(weight, "overwrite_main_grad", True)
                     # Import here to avoid circular import
                     from megatron.core.extensions.transformer_engine import te_general_gemm
 
@@ -672,7 +673,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                             layout="NT",
                             out=weight.main_grad,
                             grad=True,
+                            accumulate=accumulate,
                         )
+                    elif accumulate:
+                        weight.main_grad.add_(grad_output.t().matmul(total_input))
                     else:
                         torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
                 else:

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .mixed_precision import (
@@ -336,6 +337,22 @@ class MegatronFSDP(torch.nn.Module):
             # and gradients.
             assert self.ddp_config.overlap_grad_reduce
 
+        # CPU offloading of FSDP-unit model weights and / or main gradients.
+        self.cpu_offload_weight = self.ddp_config.fsdp_cpu_offload_weight
+        self.cpu_offload_grad = self.ddp_config.fsdp_cpu_offload_grad
+        self.cpu_offload_optimizer = "optimizer" in self.ddp_config.fsdp_cpu_offload
+        self._check_cpu_offload_config()
+        if self.cpu_offload_grad and self.data_parallel_sharding_strategy == "optim":
+            # A backward outside no_sync() must reduce its gradients.
+            self.is_last_microbatch = True
+        if self.cpu_offload_weight or self.cpu_offload_grad:
+            self.ddp_config.fsdp_double_buffer = True
+        # Whether FSDP-unit parameters are released after use (forward and backward),
+        # i.e. when they are sharded or offloaded to CPU.
+        self._release_unit_params_after_use = (
+            self.data_parallel_sharding_strategy == "optim_grads_params" or self.cpu_offload_weight
+        )
+
         for param in self.module.parameters():
             if not hasattr(param, "grad_added_to_main_grad"):
                 # This is to ensure that the param.grad_added_to_main_grad is set to False
@@ -351,6 +368,61 @@ class MegatronFSDP(torch.nn.Module):
         self.microbatch_count = 0
         self.is_param_fsdp_distributed = False
         self._replace_param_with_distributed_if_needed()
+
+    def _check_cpu_offload_config(self):
+        """Check that the CPU offloading configuration is supported."""
+        if not self.ddp_config.fsdp_cpu_offload:
+            return
+        if self.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "[Megatron-FSDP] CPU offloading does not support the 'no_shard' strategy."
+            )
+        if (self.cpu_offload_weight or self.cpu_offload_grad) and not self.fsdp_unit_modules:
+            raise ValueError("[Megatron-FSDP] CPU offloading requires FSDP unit modules.")
+        if self.dist_index.use_hybrid_fsdp:
+            raise NotImplementedError("[Megatron-FSDP] CPU offloading does not support HSDP.")
+        if self.ddp_config.nccl_ub or self.ddp_config.fsdp_manual_registration:
+            raise NotImplementedError(
+                "[Megatron-FSDP] CPU offloading does not support NCCL user buffer registration."
+            )
+        if self.ddp_config.megatron_fsdp_cuda_graph_mode:
+            raise NotImplementedError(
+                "[Megatron-FSDP] CPU offloading does not support CUDA graphs."
+            )
+        if self.cpu_offload_optimizer and (
+            self.mp_policy.main_params_dtype is None or self.ddp_config.megatron_fsdp_use_decoupled_grad
+        ):
+            raise ValueError(
+                "[Megatron-FSDP] Optimizer offload requires MCore-owned main weights "
+                "and a standard GPU optimizer."
+            )
+        if self.cpu_offload_weight and (
+            self.ddp_config.fp8_param_gather or self.mp_policy.main_params_dtype is None
+        ):
+            raise NotImplementedError(
+                "[Megatron-FSDP] CPU offloading of model weights requires a main weight "
+                "buffer (main_params_dtype) and does not support FP8 parameters."
+            )
+        if (
+            self.cpu_offload_grad
+            and self.data_parallel_sharding_strategy == "optim"
+            and not self.ddp_config.overlap_grad_reduce
+        ):
+            raise NotImplementedError(
+                "[Megatron-FSDP] CPU offloading of 'optim' gradients requires "
+                "overlap_grad_reduce=True."
+            )
+        # C-BLOCKER-2: FSDP-1 grad offload + custom grad_comm_dtype guard.
+        if (
+            self.cpu_offload_grad
+            and self.data_parallel_sharding_strategy == "optim"
+            and self.mp_policy.grad_comm_dtype is not None
+            and self.mp_policy.grad_comm_dtype != self.mp_policy.main_grads_dtype
+        ):
+            raise NotImplementedError(
+                "[Megatron-FSDP] CPU offloading of 'optim' gradients with custom "
+                "grad_comm_dtype is not supported in v1."
+            )
 
     def _check_module_parameter_types(self):
         """
@@ -383,6 +455,13 @@ class MegatronFSDP(torch.nn.Module):
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
+        # Initialize the copy streams for CPU offloading, split by copy direction.
+        self.side_stream_for_cpu_offload_h2d = None
+        self.side_stream_for_cpu_offload_d2h = None
+        if self.cpu_offload_weight or self.cpu_offload_grad:
+            self.side_stream_for_cpu_offload_h2d = torch.cuda.Stream()
+            self.side_stream_for_cpu_offload_d2h = torch.cuda.Stream()
+
         # Initialize the param and grad buffer.
         self.param_and_grad_buffer = ParamAndGradBuffer(
             self.ddp_config,
@@ -398,6 +477,8 @@ class MegatronFSDP(torch.nn.Module):
             expert_gradient_scaling_factor=expert_gradient_scaling_factor,
             device=self.device,
             reset_parameters_for_meta_device_init_module=self.init_model_with_meta_device,
+            cpu_offload_h2d_stream=self.side_stream_for_cpu_offload_h2d,
+            cpu_offload_d2h_stream=self.side_stream_for_cpu_offload_d2h,
         )
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
         self.raw_param = dict(self.module.named_parameters())
@@ -504,11 +585,10 @@ class MegatronFSDP(torch.nn.Module):
             # This setting is needed to have this attribute present after every
             # un-shard of the FSDP params.
             param.__fsdp_param__ = True
-            # Transformer Engine accumulates gradient on top of the `main_grad`
-            # buffer when gradient accumulation fusion in enabled. But with FSDP,
-            # we want to overwrite the `main_grad` which is enabled by this
-            # attribute.
-            param.overwrite_main_grad = True
+            # Unsharded gradients already contain the previous microbatch sum.
+            # Sharded gradients produce a fresh contribution before reduce-scatter.
+            gbuf = getattr(param, "_gbuf", None)
+            param.overwrite_main_grad = gbuf is None or gbuf.is_data_distributed
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
@@ -686,12 +766,13 @@ class MegatronFSDP(torch.nn.Module):
 
             This hook:
             - Validates that the module is an FSDP unit and that the data-parallel
-            sharding strategy is ``"optim_grads_params"``.
+            sharding strategy is ``"optim_grads_params"`` or model weights are
+            offloaded to CPU.
             - Releases the module's parameters for the backward phase to free memory.
             - Marks the module as IDLE in the training state machine.
             """
             assert isinstance(module, tuple(fsdp_unit_modules))
-            assert self.data_parallel_sharding_strategy == "optim_grads_params"
+            assert self._release_unit_params_after_use
 
             # Release parameters for this module after backward.
             release_module_parameters(module, bwd=True)
@@ -770,6 +851,11 @@ class MegatronFSDP(torch.nn.Module):
                         self.dist_index.use_hybrid_fsdp
                         and (is_last_microbatch or self.model_auto_sync)
                     ),
+                )
+            elif self.cpu_offload_grad:
+                # Offload the un-reduced, locally accumulated gradients to CPU.
+                self.grad_reduce_pipeline.offload_gradients(
+                    param_list, suggested_queue_capacity=self.suggested_RS_queue_capacity
                 )
 
             # Mark parameters as processed.
@@ -878,6 +964,13 @@ class MegatronFSDP(torch.nn.Module):
                     ),
                 )
                 self.grad_reduce_pipeline.reset()
+            elif self.cpu_offload_grad:
+                # Offload the remaining un-reduced gradients to CPU, and release
+                # all temporary gradient buckets after their offload completes.
+                self.grad_reduce_pipeline.offload_gradients(
+                    ordered_params, suggested_queue_capacity=self.suggested_RS_queue_capacity
+                )
+                self.grad_reduce_pipeline.reset()
 
             # Reset root_pre_backward_hook_issued flag.
             self._root_pre_backward_hook_issued = False
@@ -925,7 +1018,7 @@ class MegatronFSDP(torch.nn.Module):
                 return
             self._root_pre_backward_hook_issued = True
 
-            if self.data_parallel_sharding_strategy == "optim_grads_params":
+            if self._release_unit_params_after_use:
                 for sub_module in root_module.modules():
                     # Set PRE_BACKWARD state to skip resharding and forward pre-fetching
                     # when performing activation recomputation / gradient checkpointing.
@@ -1088,7 +1181,7 @@ class MegatronFSDP(torch.nn.Module):
             # Register the post-backward hook to deallocate model parameters
             # and reduce-scatter gradients after the backward pass.
             if isinstance(module, tuple(fsdp_unit_modules)):
-                if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                if self._release_unit_params_after_use:
                     self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
                         module.register_forward_pre_hook(
                             functools.partial(
@@ -1239,6 +1332,13 @@ class MegatronFSDP(torch.nn.Module):
         """
         Re-configure MixedPrecisionPolicy for MegatronFSDP / ParamAndGradBuffer.
         """
+        if (
+            (self.cpu_offload_weight or self.cpu_offload_grad)
+            and mixed_precision_policy.grad_comm_dtype != self.mp_policy.grad_comm_dtype
+        ):
+            raise NotImplementedError(
+                "Megatron-FSDP CPU offload requires a fixed gradient communication dtype."
+            )
         mp_policy_reset = MixedPrecisionPolicy(
             # Preserve the original main parameter + gradient data-type.
             main_params_dtype=self.mp_policy.main_params_dtype,
@@ -1262,6 +1362,7 @@ class MegatronFSDP(torch.nn.Module):
         By default, when overlap_param_gather is set to True, dispatches asynchronous communication
         calls; when overlap_param_gather is set to False, calls synchronous communication
         ops. Can override this default behavior using flags below.
+        With CPU offload, temporary double-buffered unit weights are gathered by their hooks.
 
         Args:
             force_sync (bool, optional): force synchronous collective regardless of
@@ -1282,23 +1383,34 @@ class MegatronFSDP(torch.nn.Module):
                 )
         else:
             self.synchronize_param_gather()
+            gathered_buckets = []
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
+                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                wbuf = group.model_weight_buffer
+                if wbuf is None or wbuf.cpu_offload:
+                    continue
+                if (
+                    self.ddp_config.fsdp_cpu_offload
+                    and self.ddp_config.fsdp_double_buffer
+                    and wbuf.is_data_distributed
+                    and group.fsdp_unit_id in self.param_and_grad_buffer.double_buf_units
+                ):
+                    # The unit hooks materialize these buckets as slots become available.
+                    continue
+
                 with nvtx_range(
                     lambda: self.all_gather_pipeline.all_gather_nvtx_label(
                         [bucket_id], {bucket_id}, bwd=False
                     )
                 ):
                     self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-                if group.model_weight_buffer is None:
-                    continue
 
-                if group.model_weight_buffer.is_data_distributed:
-                    # If model weight is sharded, we wait for the all-gather to complete and
-                    # then release the bucket immediately to save memory usage.
+                if wbuf.is_data_distributed:
                     self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
+                else:
+                    gathered_buckets.append(bucket_id)
 
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
+            for bucket_id in gathered_buckets:
                 self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
 
     def start_grad_sync(self, *unused):
@@ -1360,6 +1472,10 @@ class MegatronFSDP(torch.nn.Module):
         """
         # Synchronize gradient reduce-scatter operations for all model gradients.
         self.synchronize_gradient_reduce()
+
+        if self.cpu_offload_grad:
+            # Each reload waits for the D2H event of its latest accumulated shard.
+            self.param_and_grad_buffer.reload_offloaded_main_grads()
 
         # Once the gradients have been reduced and scattered into main_grad_buffer,
         # update the gradients for all buffered weights in optimizer_named_parameters.
@@ -1467,23 +1583,45 @@ class MegatronFSDP(torch.nn.Module):
         Copies optimized parameter values into the model training parameters
         managed by Megatron-FSDP. Should be called after the optimizer.step().
         """
-        self.param_and_grad_buffer.copy_main_weights_to_model_weights()
+        with self.param_and_grad_buffer.optimizer_weights_on_gpu():
+            self.param_and_grad_buffer.copy_main_weights_to_model_weights()
+
+    def state_dict(self, destination=None, prefix="", keep_vars=False):
+        """Snapshot CPU-backed masters before releasing their temporary CUDA storage."""
+        with self.param_and_grad_buffer.optimizer_weights_on_gpu():
+            state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+            if self.cpu_offload_optimizer:
+                for name, value in state.items():
+                    if name.startswith(f"{prefix}module.") and isinstance(value, DTensor):
+                        state[name] = value.clone()
+            return state
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load master weights into their existing shards and commit the CPU copies."""
+        if self.ddp_config.fsdp_cpu_offload:
+            if assign:
+                raise ValueError("assign=True is incompatible with Megatron-FSDP CPU offload.")
+            # Load into the authoritative DTensors and invalidate any gathered
+            # weights that were prefetched before the checkpoint was applied.
+            self.synchronize_param_gather()
+        with self.param_and_grad_buffer.optimizer_weights_on_gpu(write_back=True):
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def broadcast_params(self):
         """
         Syncs parameters across all DP ranks.
         """
-        for param in self.module.parameters():
-            is_expert_parallel = not getattr(param, "allreduce", True)
-
-            data_parallel_group = self.dist_index.get_dp_group(
-                is_expert_parallel=is_expert_parallel
-            )
-            torch.distributed.broadcast(
-                param.data,
-                src=torch.distributed.get_global_rank(data_parallel_group, 0),
-                group=data_parallel_group,
-            )
+        with self.param_and_grad_buffer.optimizer_weights_on_gpu(write_back=True):
+            for param in self.module.parameters():
+                is_expert_parallel = not getattr(param, "allreduce", True)
+                data_parallel_group = self.dist_index.get_dp_group(
+                    is_expert_parallel=is_expert_parallel
+                )
+                torch.distributed.broadcast(
+                    param.data,
+                    src=torch.distributed.get_global_rank(data_parallel_group, 0),
+                    group=data_parallel_group,
+                )
 
     def forward(self, *inputs, **kwargs):
         """

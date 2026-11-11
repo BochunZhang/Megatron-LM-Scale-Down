@@ -1097,6 +1097,14 @@ def validate_args(args, defaults={}):
         )
         args.stream_ckpt_dequant = False
 
+    if getattr(args, "fsdp_cpu_offload", ()):
+        if not args.use_megatron_fsdp or args.use_torch_fsdp2:
+            raise ValueError("--fsdp-cpu-offload requires --use-megatron-fsdp.")
+        if args.optimizer_cpu_offload:
+            raise ValueError("--fsdp-cpu-offload uses a GPU optimizer.")
+        if "optimizer" in args.fsdp_cpu_offload and args.use_precision_aware_optimizer:
+            raise ValueError("Megatron-FSDP optimizer offload requires MCore-owned main weights.")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -3556,6 +3564,13 @@ def _add_experimental_args(parser):
                         help="When using Megatron-FSDP double buffering, persist non-unit modules that "
                              "are not included in the symmetric buffer pool. May be necessary for NCCL "
                              "UBR or CUDA Graphs on hybrid architectures.")
+    group.add_argument(
+        "--fsdp-cpu-offload",
+        nargs="+",
+        choices=("optimizer", "weight", "gradient"),
+        default=(),
+        help="Store selected Megatron-FSDP components in CPU memory. Optimizer updates run on GPU.",
+    )
 
     return parser
 

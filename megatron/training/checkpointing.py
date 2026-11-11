@@ -2527,12 +2527,12 @@ def load_checkpoint(
                     load_return = module.load_state_dict(state_dict, strict=False)
                 print(f'load_return: {load_return}')
 
-    # Megatron-FSDP DTensors are loaded into the model buffers in-place above.
-    # Replaying the translated raw state dict through ``load_state_dict`` would
-    # reapply HybridModel-local entries that were intentionally omitted (for
-    # example fresh Mamba layers).
+    # The regular FSDP state dict aliases the model buffers. CPU-backed masters
+    # use snapshots instead, so they need an explicit model load after DCP.
     gpt_fsdp_model_loaded_in_place = (
-        ckpt_format == 'fsdp_dtensor' and gpt_compat_layer_maps is not None
+        ckpt_format == 'fsdp_dtensor'
+        and gpt_compat_layer_maps is not None
+        and 'optimizer' not in getattr(args, 'fsdp_cpu_offload', ())
     )
 
     # Model.
@@ -2609,7 +2609,11 @@ def load_checkpoint(
             )
             raise e
     else:
-        if (args.fp16 or args.bf16) and optimizer is not None:
+        # An fsdp_dtensor model load has already installed CPU-backed optimizer masters.
+        fsdp_masters_loaded = (
+            ckpt_format == 'fsdp_dtensor' and 'optimizer' in getattr(args, 'fsdp_cpu_offload', ())
+        )
+        if (args.fp16 or args.bf16) and optimizer is not None and not fsdp_masters_loaded:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
             else:

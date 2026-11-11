@@ -246,6 +246,19 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    fsdp_cpu_offload: tuple[str, ...] = ()
+    """Megatron-FSDP components stored on CPU between GPU uses. Select any of
+    `optimizer` (master weights and optimizer state), `weight` (compute weights),
+    and `gradient` (main gradients). An empty tuple disables offload."""
+
+    @property
+    def fsdp_cpu_offload_weight(self) -> bool:
+        return "weight" in self.fsdp_cpu_offload
+
+    @property
+    def fsdp_cpu_offload_grad(self) -> bool:
+        return "gradient" in self.fsdp_cpu_offload
+
     def __post_init__(self):
         import os
 
@@ -273,3 +286,49 @@ class DistributedDataParallelConfig:
         if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
             self.fsdp_double_buffer = True
+
+        if isinstance(self.fsdp_cpu_offload, str):
+            raise ValueError("fsdp_cpu_offload expects a sequence of component names.")
+        self.fsdp_cpu_offload = tuple(self.fsdp_cpu_offload)
+        if set(self.fsdp_cpu_offload) - {"optimizer", "weight", "gradient"}:
+            raise ValueError("fsdp_cpu_offload accepts optimizer, weight, and gradient.")
+        if self.fsdp_cpu_offload:
+            assert (
+                self.use_megatron_fsdp
+            ), "Megatron-FSDP CPU offloading requires use_megatron_fsdp."
+            assert self.data_parallel_sharding_strategy in (
+                "optim",
+                "optim_grads",
+                "optim_grads_params",
+            ), "Megatron-FSDP CPU offloading does not support the 'no_shard' sharding strategy."
+            assert (
+                not self.nccl_ub and not self.fsdp_manual_registration
+            ), "Megatron-FSDP CPU offloading does not support NCCL user buffer registration."
+            assert (
+                self.outer_dp_sharding_strategy == "no_shard"
+                and self.num_distributed_optimizer_instances == 1
+            ), "Megatron-FSDP CPU offloading does not support HSDP / HFSDP."
+            assert (
+                not self.megatron_fsdp_cuda_graph_mode
+            ), "Megatron-FSDP CPU offloading does not support CUDA graphs."
+            if self.fsdp_cpu_offload_grad and self.data_parallel_sharding_strategy == "optim":
+                assert self.overlap_grad_reduce, (
+                    "Megatron-FSDP CPU offloading of 'optim' gradients requires "
+                    "overlap_grad_reduce=True."
+                )
+
+        if self.fsdp_cpu_offload_weight:
+            assert (
+                not self.fp8_param_gather
+            ), "Megatron-FSDP CPU offloading of model weights does not support FP8 parameters."
+            assert self.megatron_fsdp_main_params_dtype is not None, (
+                "Megatron-FSDP CPU offloading of model weights requires "
+                "megatron_fsdp_main_params_dtype to be set."
+            )
+        if "optimizer" in self.fsdp_cpu_offload and (
+            self.megatron_fsdp_main_params_dtype is None or self.megatron_fsdp_use_decoupled_grad
+        ):
+            raise ValueError(
+                "Megatron-FSDP optimizer offload requires MCore-owned main weights "
+                "and a standard GPU optimizer."
+            )

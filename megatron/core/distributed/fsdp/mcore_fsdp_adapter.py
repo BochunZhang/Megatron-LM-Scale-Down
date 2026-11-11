@@ -156,13 +156,42 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.bucket_size = None
         self.device = device if device else torch.device(f'cuda:{torch.cuda.current_device()}')
 
+        cpu_offload = ddp_config.fsdp_cpu_offload_weight or ddp_config.fsdp_cpu_offload_grad
         if fsdp_unit_modules is not None:
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
-            if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+            # CPU offloading only applies to FSDP units, so they are also needed for optim(_grads).
+            if (
+                self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                or cpu_offload
+            ):
                 self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
+
+        if ddp_config.fsdp_cpu_offload:
+            assert (
+                not config.overlap_moe_expert_parallel_comm
+            ), "Megatron-FSDP CPU offloading does not support overlap_moe_expert_parallel_comm."
+            assert config.cuda_graph_impl == "none", (
+                "Megatron-FSDP CPU offloading does not support CUDA graphs "
+                f"(cuda_graph_impl={config.cuda_graph_impl!r})."
+            )
+            if (
+                cpu_offload
+                and (
+                    ddp_config.fsdp_cpu_offload_grad
+                    or ddp_config.data_parallel_sharding_strategy != "optim"
+                )
+                and config.num_moe_experts
+                and config.use_transformer_engine_op_fuser
+                and config.gradient_accumulation_fusion
+            ):
+                raise ValueError(
+                    "Megatron-FSDP CPU offload with gradient double buffering does not "
+                    "support TE fused MoE with gradient accumulation fusion. The fused "
+                    "experts acquire gradient buckets during forward."
+                )
 
         self._annotate_tensor_parallelism(module)
 

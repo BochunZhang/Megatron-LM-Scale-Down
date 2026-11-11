@@ -494,6 +494,11 @@ def _get_megatron_optimizer_based_on_param_groups(
         )
     if skip_megatron_wrapping and config.optimizer_cpu_offload:
         raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
+    if config.optimizer_cpu_offload and any(
+        getattr(getattr(chunk, "ddp_config", None), "fsdp_cpu_offload", ())
+        for chunk in model_chunks
+    ):
+        raise ValueError("Megatron-FSDP offload requires GPU optimizer updates.")
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
@@ -1025,6 +1030,10 @@ def get_megatron_optimizer(
             len(model_chunks) == 1
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
+
+    if "optimizer" in getattr(getattr(model_chunks[0], "ddp_config", None), "fsdp_cpu_offload", ()):
+        if config.optimizer != "adam" or not config.use_distributed_optimizer:
+            raise ValueError("Megatron-FSDP optimizer offload requires distributed Adam.")
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.

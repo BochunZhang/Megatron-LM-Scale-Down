@@ -6,12 +6,14 @@ import gc
 import itertools
 import logging
 from collections import ChainMap
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional
+from torch.distributed.tensor import DTensor
 
 from megatron.core.utils import log_single_rank
 
@@ -684,6 +686,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
+        self._fsdp_optimizer_offload = "optimizer" in getattr(
+            self.ddp_config, "fsdp_cpu_offload", ()
+        )
+        if self._fsdp_optimizer_offload:
+            if (
+                config.optimizer != "adam"
+                or config.optimizer_cuda_graph
+                or config.use_precision_aware_optimizer
+            ):
+                raise ValueError(
+                    "Megatron-FSDP optimizer offload requires standard GPU Adam with CUDA graphs disabled."
+                )
+            self._fsdp_cpu_state = {}
 
         assert (
             isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
@@ -922,6 +937,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 del state_dict["param_to_group_meta"]
             self.optimizer.load_state_dict(state_dict)
+            if self._fsdp_optimizer_offload:
+                self._store_fsdp_optimizer_state()
             return
 
         if len(self.optimizer.state) == 0:
@@ -1630,6 +1647,97 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             new_param_groups.append(new_group)
         return new_param_groups
 
+    def _store_fsdp_optimizer_state(self):
+        """Store the CUDA payloads on pinned CPU memory, preserving DTensor layouts."""
+        pending = []
+        cpu_state = {}
+        devices = set()
+        for param, state in self.optimizer.state.items():
+            for name, value in state.items():
+                local = value._local_tensor if isinstance(value, DTensor) else value
+                if not isinstance(local, torch.Tensor):
+                    continue
+                key = (param, name)
+                cached = self._fsdp_cpu_state.get(key)
+                if not local.is_cuda:
+                    if cached is not None and local is cached[0]:
+                        cpu_state[key] = cached
+                    continue
+                cpu = cached[0] if cached is not None else None
+                if cpu is None or cpu.shape != local.shape or cpu.dtype != local.dtype:
+                    cpu = torch.empty_like(local, device="cpu", pin_memory=True)
+                cpu.copy_(local, non_blocking=True)
+                cpu_state[key] = (cpu, local.device)
+                pending.append((state, name, value, cpu))
+                devices.add(local.device)
+        for device in devices:
+            torch.cuda.current_stream(device).synchronize()
+        for state, name, value, cpu in pending:
+            if isinstance(value, DTensor):
+                value._local_tensor = cpu
+            else:
+                state[name] = cpu
+        self._fsdp_cpu_state = cpu_state
+
+    @contextmanager
+    def _fsdp_optimizer_state_on_gpu(self):
+        if not self._fsdp_optimizer_offload or self.is_stub_optimizer:
+            yield
+            return
+        try:
+            for (param, name), (cpu, device) in self._fsdp_cpu_state.items():
+                state = self.optimizer.state[param]
+                value = state[name]
+                local = cpu.to(device, non_blocking=True)
+                if isinstance(value, DTensor):
+                    value._local_tensor = local
+                else:
+                    state[name] = local
+            yield
+        finally:
+            self._store_fsdp_optimizer_state()
+
+    @contextmanager
+    def _fsdp_checkpoint_load_template(self):
+        """Initialize missing Adam slots without taking a step on live optimizer state."""
+        optimizer = self.optimizer
+        missing = {
+            param: param.grad
+            for group in optimizer.param_groups
+            for param in group["params"]
+            if param._local_tensor.numel() and not optimizer.state.get(param)
+        }
+        if not missing:
+            yield
+            return
+
+        saved_state = optimizer.state
+        saved_groups = optimizer.param_groups
+        with ExitStack() as stack:
+            for model_chunk in self.model_chunks:
+                stack.enter_context(model_chunk.param_and_grad_buffer.optimizer_weights_on_gpu())
+            try:
+                optimizer.state = saved_state.copy()
+                optimizer.param_groups = [
+                    dict(
+                        group,
+                        params=[p for p in group["params"] if p in missing],
+                        lr=0.0,
+                        weight_decay=0.0,
+                    )
+                    for group in saved_groups
+                ]
+                self._init_optimizer_states_with_dummy_values()
+                for template_group, saved_group in zip(optimizer.param_groups, saved_groups):
+                    # Keep newly initialized fields such as FusedAdam's group step.
+                    template_group.update(saved_group)
+                yield
+            finally:
+                optimizer.state = saved_state
+                optimizer.param_groups = saved_groups
+                for param, grad in missing.items():
+                    param.grad = grad
+
     def sharded_param_state_fsdp_dtensor(self, is_loading: bool = False):
         """
         Sharded state dict where each parameter is a separate PyTorch DTensor.
@@ -1638,18 +1746,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.ddp_config.use_megatron_fsdp
         ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
 
-        # Initialize optimizer states with dummy values if loading.
-        if is_loading:
-            self._init_optimizer_states_with_dummy_values()
+        with ExitStack() as stack:
+            stack.enter_context(self._fsdp_optimizer_state_on_gpu())
+            if is_loading:
+                if self._fsdp_optimizer_offload:
+                    stack.enter_context(self._fsdp_checkpoint_load_template())
+                else:
+                    self._init_optimizer_states_with_dummy_values()
 
-        # Get the optimizer's parameter groups in distributed key value format.
-        param_to_group_meta = self._param_groups_to_param2group_meta(self.optimizer.param_groups)
-
-        # Remap state to use order indices as keys
-        packed_state = {
-            (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
-            for k, v in self.state.items()
-        }
+            param_to_group_meta = self._param_groups_to_param2group_meta(self.optimizer.param_groups)
+            packed_state = {}
+            for key, value in self.state.items():
+                if self._fsdp_optimizer_offload:
+                    # DCP may consume the checkpoint after the live state is offloaded again.
+                    value = {
+                        name: tensor.detach().clone() if isinstance(tensor, torch.Tensor) else tensor
+                        for name, tensor in value.items()
+                    }
+                packed_state[self._param_name(key) if isinstance(key, torch.Tensor) else key] = value
 
         state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
         return state_dict
@@ -3160,7 +3274,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
-        update_successful = super().step_with_ready_grads()
+        if self._fsdp_optimizer_offload and not self.is_stub_optimizer:
+            with ExitStack() as stack:
+                for model_chunk in self.model_chunks:
+                    stack.enter_context(
+                        model_chunk.param_and_grad_buffer.optimizer_weights_on_gpu(write_back=True)
+                    )
+                stack.enter_context(self._fsdp_optimizer_state_on_gpu())
+                update_successful = super().step_with_ready_grads()
+        else:
+            update_successful = super().step_with_ready_grads()
 
         should_sync_params = not self.ddp_config.overlap_param_gather and not getattr(
             self, '_defer_param_sync', False

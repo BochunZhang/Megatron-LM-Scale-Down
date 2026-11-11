@@ -186,8 +186,27 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    fsdp_cpu_offload: tuple[str, ...] = ()
+    """Megatron-FSDP components stored on CPU between GPU uses. Select any of
+    `optimizer` (master weights and optimizer state), `weight` (compute weights),
+    and `gradient` (main gradients). An empty tuple disables offload."""
+
+    @property
+    def fsdp_cpu_offload_weight(self) -> bool:
+        return "weight" in self.fsdp_cpu_offload
+
+    @property
+    def fsdp_cpu_offload_grad(self) -> bool:
+        return "gradient" in self.fsdp_cpu_offload
+
     def __post_init__(self):
         import os
+
+        if isinstance(self.fsdp_cpu_offload, str):
+            raise ValueError("fsdp_cpu_offload expects a sequence of component names.")
+        self.fsdp_cpu_offload = tuple(self.fsdp_cpu_offload)
+        if set(self.fsdp_cpu_offload) - {"optimizer", "weight", "gradient"}:
+            raise ValueError("fsdp_cpu_offload accepts optimizer, weight, and gradient.")
 
         """Check the validity of the config."""
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):

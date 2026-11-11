@@ -6,16 +6,16 @@ import os
 import sys
 import warnings
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import maybe_msc
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -46,7 +46,6 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
-
 
 
 def _compute_norm_2(params_list):
@@ -87,17 +86,18 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
         # params_data is a dict of device_mesh -> list of local tensors.
         params = []
-        for model_chunk in model:
-            model_chunk.stop_communication()
-            for name, param in model_chunk.named_parameters():
-                if not hasattr(param, "_local_tensor"):
-                    raise RuntimeError(
-                        f"Megatron FSDP requires parameters are PyTorch DTensor. "
-                        f"Parameter {name} is not a DTensor."
-                    )
-                params.append(param)
-
-        return calc_dtensor_params_l2_norm(params)
+        with ExitStack() as stack:
+            for model_chunk in model:
+                stack.enter_context(model_chunk.param_and_grad_buffer.optimizer_weights_on_gpu())
+                model_chunk.stop_communication()
+                for name, param in model_chunk.named_parameters():
+                    if not hasattr(param, "_local_tensor"):
+                        raise RuntimeError(
+                            f"Megatron FSDP requires parameters are PyTorch DTensor. "
+                            f"Parameter {name} is not a DTensor."
+                        )
+                    params.append(param)
+            return calc_dtensor_params_l2_norm(params)
 
     # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
     # Each category needs different reduction groups.

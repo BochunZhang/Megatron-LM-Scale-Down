@@ -26,7 +26,7 @@ import re
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
@@ -51,6 +51,7 @@ from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneve
 from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
     FSDPDistributedIndex,
+    GlobalMemoryBuffer,
     get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
@@ -956,6 +957,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         size: int = 2,
         dtype_fn: Callable[["ParameterGroup"], torch.dtype] = operator.attrgetter("dtype"),
         fallback_to_persistent_buffer: bool = False,
+        memory_buffer: Optional[GlobalMemoryBuffer] = None,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
@@ -965,6 +967,8 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         self.max_dtype_bucket_sizes = {}  # dtype -> [bucket sizes from smallest to largest]
         self.dtype_fn = dtype_fn
         self._fixed_graph_slots = False
+        self.memory_buffer = memory_buffer
+        self.slot_sizes = {}
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
         fsdp_unit_buckets = defaultdict(list)
@@ -1094,6 +1098,17 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 ),
             )
 
+    def reserve_slots(self, bucket_sizes: Dict[int, int]) -> None:
+        """Set the capacity of each slot from the actual, padded bucket sizes."""
+        for bucket_id, size in bucket_sizes.items():
+            if bucket_id not in self.bucket_alloc_index:
+                continue
+            _, offset = self.bucket_alloc_index[bucket_id]
+            dtype = self.dtype_fn(self.fsdp_param_groups[bucket_id])
+            dtype = torch.uint8 if dtype == "float8" else dtype
+            key = (dtype, offset)
+            self.slot_sizes[key] = max(self.slot_sizes.get(key, 0), size)
+
     def allocate(
         self,
         bucket_id: int,
@@ -1203,21 +1218,26 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 bucket_id=bucket_id, size=size, dtype=dtype, device=device
             )
 
-        # Use buffer_name to get memory from global memory.
+        # Use buffer_name to get memory from the configured pool.
+        memory_buffer = self.memory_buffer or get_global_memory_buffer()
+        capacity = (
+            self.slot_sizes.get((dtype, bucket_offset), size) if fsdp_unit_id is not None else size
+        )
+        assert capacity >= size
         if mem_alloc_context is not None and mem_alloc_context != nullcontext:
             # Check if a new buffer allocation is required. Mirror the logic in
             # GlobalMemoryBuffer.get_tensor() to ensure MALLOC synchronization.
             if (
                 self.allocation_tracker.get((buffer_name, dtype), None) is None
-                or self.allocation_tracker[(buffer_name, dtype)] < size
+                or self.allocation_tracker[(buffer_name, dtype)] < capacity
             ):
                 # Requires synchronization for new buffer allocation
-                self.allocation_tracker[(buffer_name, dtype)] = size
+                self.allocation_tracker[(buffer_name, dtype)] = capacity
                 torch.cuda.synchronize()
         return Bucket(
-            data=get_global_memory_buffer().get_tensor(
-                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
-            )
+            data=memory_buffer.get_tensor(
+                [capacity], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+            )[:size]
         )
 
     def _get_gbuf_name(self, buf_group_id: int, dtype: torch.dtype, bucket_index: int):
@@ -1281,6 +1301,7 @@ class DataParallelBuffer:
         item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
         bucket_index: Optional[BucketIndex] = None,
         shard_bucket_index: Optional[ShardBucketIndex] = None,
+        cpu_offload: bool = False,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -1345,15 +1366,106 @@ class DataParallelBuffer:
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
 
+        # CPU offloading: the persistent (shard of the) buffer lives in pinned host
+        # memory (cpu_data), and self.data is None outside of the optimizer step.
+        # All GPU accesses during forward / backward go through temporary buckets.
+        self.cpu_offload = cpu_offload
+        self.cpu_data: Optional[torch.Tensor] = None
+        # Completion event of the latest D2H copy that wrote cpu_data.
+        self.cpu_ready_event: Optional[torch.cuda.Event] = None
+        # The CPU copy has a value for this iteration (possibly pending cpu_ready_event).
+        # For gradients, an invalid copy represents a logical zero.
+        self.cpu_data_valid = False
+        # Gradients: whether cpu_data holds a reduced local shard.
+        self.cpu_data_reduced = False
+        # Gradients: whether the temporary bucket was filled from cpu_data / zeroed.
+        self.slot_filled = False
+        # Local index of self.data[0], non-zero when only a shard of an
+        # un-sharded offloaded buffer is resident on GPU.
+        self.data_offset = 0
+        if cpu_offload:
+            self.data = None
+
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
-        (shard of) the buffer.
+        (shard of) the buffer. Offloaded buffers accept a pinned CPU Tensor,
+        which is attached as the CPU copy of the buffer.
         """
         assert data.dtype == self.dtype, f"Data type mismatch: {data.dtype} != {self.dtype}"
         assert (
             data.numel() == self.data_size
         ), f"Data size mismatch: {data.numel()} != {self.data_size}"
+        if self.cpu_offload and data.device.type == "cpu":
+            self.cpu_data = data
+            return
         self.data = data
+
+    @property
+    def has_persistent_bucket(self) -> bool:
+        """Whether fetch_bucket() returns a view of persistently allocated un-sharded data."""
+        return not self.is_data_distributed and not self.cpu_offload
+
+    def reload_from_cpu(
+        self,
+        dst: torch.Tensor,
+        stream: torch.cuda.Stream,
+        cpu_range: Optional[Tuple[int, int]] = None,
+    ) -> torch.cuda.Event:
+        """
+        Asynchronously copy (a range of) cpu_data into dst on the given stream.
+
+        The copy waits for the latest D2H copy that wrote cpu_data. The caller
+        is responsible for ordering the stream after previous users of dst.
+
+        Args:
+            dst (torch.Tensor): Destination GPU tensor.
+            stream (torch.cuda.Stream): Stream to issue the H2D copy on.
+            cpu_range (Optional[Tuple[int, int]]): Range of cpu_data to copy.
+                Defaults to the entire cpu_data.
+
+        Returns:
+            torch.cuda.Event: Event recorded after the H2D copy.
+        """
+        assert self.cpu_data_valid, "Cannot reload an invalid CPU buffer."
+        src = self.cpu_data if cpu_range is None else self.cpu_data[cpu_range[0] : cpu_range[1]]
+        with torch.cuda.stream(stream):
+            if self.cpu_ready_event is not None:
+                stream.wait_event(self.cpu_ready_event)
+            dst.copy_(src, non_blocking=True)
+            event = stream.record_event()
+        dst.record_stream(stream)
+        return event
+
+    def offload_to_cpu(
+        self,
+        src: torch.Tensor,
+        stream: torch.cuda.Stream,
+        cpu_range: Optional[Tuple[int, int]] = None,
+    ) -> torch.cuda.Event:
+        """
+        Asynchronously copy src into (a range of) cpu_data on the given stream.
+
+        The caller is responsible for ordering the stream after the producers
+        of src and after previous readers of cpu_data.
+
+        Args:
+            src (torch.Tensor): Source GPU tensor.
+            stream (torch.cuda.Stream): Stream to issue the D2H copy on.
+            cpu_range (Optional[Tuple[int, int]]): Range of cpu_data to write.
+                Defaults to the entire cpu_data.
+
+        Returns:
+            torch.cuda.Event: Event recorded after the D2H copy, also stored
+                in cpu_ready_event.
+        """
+        dst = self.cpu_data if cpu_range is None else self.cpu_data[cpu_range[0] : cpu_range[1]]
+        with torch.cuda.stream(stream):
+            dst.copy_(src, non_blocking=True)
+            self.cpu_ready_event = stream.record_event()
+        self.cpu_data_valid = True
+        # src must not be freed or reused before the D2H copy completes.
+        src.record_stream(stream)
+        return self.cpu_ready_event
 
     def fetch_bucket(
         self,
@@ -1387,7 +1499,7 @@ class DataParallelBuffer:
         if dtype is None:
             dtype = self.dtype
 
-        if not self.is_data_distributed and dtype == self.dtype:
+        if self.has_persistent_bucket and dtype == self.dtype:
             # Use pre-allocated un-sharded bucket data as the communication buffer.
             bucket_index = self.bucket_index
             bucket = Bucket(
@@ -1397,7 +1509,7 @@ class DataParallelBuffer:
                 ]
             )
         else:
-            # Sharded or dtype-custom buffers require un-sharded bucket allocation.
+            # Sharded, dtype-custom or CPU-offloaded buffers require un-sharded bucket allocation.
             bucket = self.allocate_bucket_storage(
                 dtype=dtype, device=self.device, strict_assignments=strict_assignments
             )
@@ -1482,6 +1594,7 @@ class DataParallelBuffer:
         Release the storage of a temporarily-allocated communication bucket.
         """
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
+        self.slot_filled = False
 
     def reset_param_main_grad(self):
         """
@@ -1689,6 +1802,18 @@ class DataParallelBuffer:
             # When unsharded, return the entire item in the unsharded bucket stored in this buffer.
             start, end = self._get_item_local_index(item_id)
 
+        if self.data_offset:
+            # Only the local (virtual) shard of this un-sharded buffer is resident.
+            assert only_shard, "Only the local shard of this CPU-offloaded buffer is on GPU."
+            if start == end:
+                return self.data[:0]
+            assert start >= self.data_offset and end <= self.data_offset + self.data.numel(), (
+                f"Item {item_id} at [{start}, {end}) not in resident shard "
+                f"[{self.data_offset}, {self.data_offset + self.data.numel()})"
+            )
+            start -= self.data_offset
+            end -= self.data_offset
+
         return self.data[start:end]
 
     def get_item_from_bucket(self, bucket: Bucket, item_id: int):
@@ -1720,7 +1845,8 @@ class DataParallelBuffer:
         # If the buffer is sharded, return the shard stored in this buffer.
         # Otherwise, return the virtual shard of the bucket associated with this buffer,
         # corresponding to the process / rank of this buffer.
-        return self.data[index.local_data_index : index.local_data_index + index.size]
+        start = index.local_data_index - self.data_offset
+        return self.data[start : start + index.size]
 
 
 @dataclasses.dataclass
@@ -2069,6 +2195,10 @@ class ParamAndGradBuffer:
         only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad (bool):
             Whether to only create the gradient buffer and main weight buffer
             for parameters that require gradients. Default is True.
+        cpu_offload_h2d_stream (Optional[torch.cuda.Stream]): Stream for host-to-device
+            copies of CPU-offloaded buffers.
+        cpu_offload_d2h_stream (Optional[torch.cuda.Stream]): Stream for device-to-host
+            copies of CPU-offloaded buffers.
     """
 
     def __init__(
@@ -2083,6 +2213,8 @@ class ParamAndGradBuffer:
         device: torch.device = torch.device("cuda"),
         only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad: bool = True,
         reset_parameters_for_meta_device_init_module: bool = False,
+        cpu_offload_h2d_stream: Optional[torch.cuda.Stream] = None,
+        cpu_offload_d2h_stream: Optional[torch.cuda.Stream] = None,
     ):
         # Ensure consistent data parallel sharding settings across configurations
         # This assignment aligns the 'bucketing_policy' setting with the 'ddp_config'
@@ -2107,6 +2239,8 @@ class ParamAndGradBuffer:
         self.reset_parameters_for_meta_device_init_module = (
             reset_parameters_for_meta_device_init_module
         )
+        self.cpu_offload_h2d_stream = cpu_offload_h2d_stream
+        self.cpu_offload_d2h_stream = cpu_offload_d2h_stream
         self.ubr_groups = None
         self.already_registered = False
         # User buffer registration related settings
@@ -2228,6 +2362,12 @@ class ParamAndGradBuffer:
 
         # Initialize the optimizer named parameters.
         self.optimizer_named_parameters = self._init_optimizer_named_parameters()
+        self._offloaded_main_weights = [
+            group.main_weight_buffer
+            for group in self.parameter_groups
+            if group.main_weight_buffer is not None and group.main_weight_buffer.cpu_offload
+        ]
+        self._store_optimizer_weights(self._offloaded_main_weights)
 
         self._log_parameter_groups()
 
@@ -2590,13 +2730,15 @@ class ParamAndGradBuffer:
         # Set ParameterGroup.grad_dtype.
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
+        cpu_offload = self.ddp_config.fsdp_cpu_offload_weight or self.ddp_config.fsdp_cpu_offload_grad
+        pool_kwargs = {"memory_buffer": GlobalMemoryBuffer()} if cpu_offload else {}
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
             UB_BUFFER_NUM = 2
             # Double Buffer Allocator Choice
             FIXED_POOL_ALLOC_TYPE = (
                 MaxPoolAllocator
-                if self.ddp_config.megatron_fsdp_max_pool_double_buffer
+                if cpu_offload or self.ddp_config.megatron_fsdp_max_pool_double_buffer
                 else FixedPoolAllocator
             )
             self.weight_alloc = FIXED_POOL_ALLOC_TYPE(
@@ -2604,12 +2746,14 @@ class ParamAndGradBuffer:
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                **pool_kwargs,
             )
             self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                **pool_kwargs,
             )
             # Resolve gradient bucket dtype used for MaxPoolAllocator bucket allocation
             # planning and FixedPoolAllocator unit symmetries. Falls back to each
@@ -2627,6 +2771,7 @@ class ParamAndGradBuffer:
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
+                **pool_kwargs,
             )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -2717,6 +2862,25 @@ class ParamAndGradBuffer:
                 or group.requires_grad
             )
 
+            # CPU offloading only applies to FSDP unit modules. Model weights are only
+            # offloaded when the main weight buffer holds the optimizer copy of the weights.
+            offload_model_weight = (
+                self.ddp_config.fsdp_cpu_offload_weight
+                and group.fsdp_unit_id is not None
+                and should_create_grad_buffer_or_main_weight_buffer
+                and self.mp_policy.main_params_dtype is not None
+            )
+            offload_main_grad = (
+                self.ddp_config.fsdp_cpu_offload_grad
+                and group.fsdp_unit_id is not None
+                and group.requires_grad
+            )
+            if offload_model_weight and (is_dtype_float8 or should_create_transpose_weight_buffer):
+                raise NotImplementedError(
+                    "[Megatron-FSDP] CPU offloading of model weights does not support "
+                    "FP8 parameters."
+                )
+
             # Initialize the model weight buffer from bucket parameters.
             if data_parallel_sharding_strategy != "no_shard":
                 group.model_weight_buffer = DataParallelBuffer(
@@ -2735,6 +2899,7 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
+                    cpu_offload=offload_model_weight,
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2771,6 +2936,7 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
+                    cpu_offload="optimizer" in self.ddp_config.fsdp_cpu_offload,
                     **main_buf_extra_kwargs,
                 )
 
@@ -2784,7 +2950,9 @@ class ParamAndGradBuffer:
                     # Proxy because the number of gradient parameters is the same
                     # as the number of model parameters.
                     group.params,
-                    is_data_distributed=is_grad_buffer_distributed and main_buf_dp_group.size() > 1,
+                    # A singleton offloaded shard still accumulates after reduction.
+                    is_data_distributed=is_grad_buffer_distributed
+                    and (main_buf_dp_group.size() > 1 or offload_main_grad),
                     dtype=group.grad_dtype,
                     device=self.device,
                     # Note: This will be DP-Outer + DP-Shard when sharding
@@ -2797,11 +2965,27 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
+                    cpu_offload=offload_main_grad,
                     **main_buf_extra_kwargs,
                 )
 
-                # Track number of elements in the main grad buffer by dtype.
-                buffer_size[group.main_grad_buffer.dtype] += group.main_grad_buffer.data_size
+                if offload_main_grad:
+                    # Offloaded un-sharded gradients are reduced in place in the
+                    # temporary full bucket, which has no custom communication dtype.
+                    grad_comm_dtype = self.mp_policy.grad_comm_dtype
+                    if not group.main_grad_buffer.is_data_distributed and grad_comm_dtype not in (
+                        None,
+                        group.grad_dtype,
+                    ):
+                        raise NotImplementedError(
+                            "[Megatron-FSDP] CPU offloading of un-sharded gradients does not "
+                            f"support grad_comm_dtype ({grad_comm_dtype}) != main grad dtype "
+                            f"({group.grad_dtype})."
+                        )
+                else:
+                    # Track number of elements in the main grad buffer by dtype.
+                    # Offloaded gradients are excluded from the all-in-one buffer.
+                    buffer_size[group.main_grad_buffer.dtype] += group.main_grad_buffer.data_size
 
             # Initialize the HSDP weight and grad buffers if hsdp full sharding is enabled.
             if should_create_hfsdp_helper_buffers:
@@ -2870,6 +3054,43 @@ class ParamAndGradBuffer:
                     **hfsdp_kwargs,
                 )
 
+        self.offload_grad_staging_alloc = None
+        if cpu_offload:
+            # Size the GPU slots before first use so that a larger unit cannot replace
+            # a slot while a previous unit still has CUDA work referring to it.
+            self.weight_alloc.reserve_slots(
+                {
+                    i: group.model_weight_buffer.bucket_index.size
+                    for i, group in enumerate(self.parameter_groups)
+                    if group.model_weight_buffer is not None
+                }
+            )
+            self.main_grad_alloc.reserve_slots(
+                {
+                    i: group.main_grad_buffer.bucket_index.size
+                    for i, group in enumerate(self.parameter_groups)
+                    if group.main_grad_buffer is not None
+                }
+            )
+            staging_sizes = {
+                i: group.main_grad_buffer.data_size
+                for i, group in enumerate(self.parameter_groups)
+                if group.main_grad_buffer is not None
+                and group.main_grad_buffer.cpu_offload
+                and group.main_grad_buffer.is_data_distributed
+            }
+            if staging_sizes:
+                self.offload_grad_staging_alloc = MaxPoolAllocator(
+                    name="fsdp_offload_grad_shards",
+                    fsdp_param_groups=self.parameter_groups,
+                    dtype_fn=operator.attrgetter("grad_dtype"),
+                    **pool_kwargs,
+                )
+                self.offload_grad_staging_alloc.reserve_slots(staging_sizes)
+
+        # Allocate the pinned CPU copies of all CPU-offloaded buffers.
+        self._init_cpu_offload_data()
+
         reset_context_args = {"init_param_with_fp8": self.ddp_config.fp8_param_gather}
         module_reset_flag = {}
         if self.reset_parameters_for_meta_device_init_module:
@@ -2903,7 +3124,7 @@ class ParamAndGradBuffer:
         # of all the parameters across ranks in the model weight buffer.
         for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
-            if wbuf:
+            if wbuf and not wbuf.cpu_offload:
                 with self.mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
@@ -2921,7 +3142,8 @@ class ParamAndGradBuffer:
                         wbuf.init_data(
                             torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
                         )
-                # Allocate some memory to initialize the model.
+            if wbuf:
+                # Stage the original parameter data, including for CPU-backed weights.
                 bucket = wbuf.fetch_bucket(strict_assignments=False)
 
             tbuf = group.transpose_weight_buffer
@@ -3007,7 +3229,8 @@ class ParamAndGradBuffer:
 
                     # Copy the model weight parameter tensor into the buffer.
                     # When distributed, this shards and preserves the data across all ranks.
-                    wbuf.set_item(item_id, p_local)
+                    if not wbuf.cpu_offload:
+                        wbuf.set_item(item_id, p_local)
                     if tbuf:
                         tbuf.set_item(item_id, p_local)
 
@@ -3084,7 +3307,23 @@ class ParamAndGradBuffer:
                         )
                         mbuf.set_item(item_id, p_local)
 
-            if wbuf and wbuf.is_data_distributed:
+            if wbuf and wbuf.cpu_offload:
+                # Initialize pinned CPU data before releasing the GPU slot. Keep
+                # the original model precision when initializing this copy.
+                local_shard = wbuf.get_shard_from_bucket(bucket)
+                if wbuf.is_data_distributed:
+                    wbuf.cpu_data.copy_(local_shard)
+                else:
+                    if wbuf.dp_world_size > 1:
+                        torch.distributed.all_gather_into_tensor(
+                            bucket.data,
+                            local_shard,
+                            group=wbuf.data_parallel_group,
+                        )
+                    wbuf.cpu_data.copy_(bucket.data)
+                wbuf.cpu_data_valid = True
+
+            if wbuf and (wbuf.is_data_distributed or wbuf.cpu_offload):
                 # Free the memory backing the temporarily-allocated bucket associated
                 # with this buffer.
                 # The module parameters will still reference the (now empty) bucket Tensor.
@@ -3139,21 +3378,24 @@ class ParamAndGradBuffer:
                 # No gradient sharding.
                 continue
             # Allocate the main grad buffer data, and attach it to the main grad buffer.
-            with self.mem_alloc_context():
-                if group.hfsdp_helper_gbuf:
-                    _init_hfsdp_helper_and_dp_buffer_data(
-                        group.hfsdp_helper_gbuf,
-                        gbuf,
-                        mem_alloc=_alloc,
-                        outer_dp_group=self.dist_index.get_outer_fsdp_group(
-                            is_expert_parallel=group.is_expert_param
-                        ),
-                    )
-                    group.hfsdp_helper_gbuf.data.zero_()
-                else:
-                    # When not using HSDP, the main buffer shards across the FSDP group.
-                    gbuf.init_data(_alloc(gbuf.dtype, gbuf.data_size))
-                    gbuf.data.zero_()
+            # Offloaded gradients only have a pinned CPU copy, which is logically zero
+            # until the first gradient offload (cpu_data_valid=False).
+            if not gbuf.cpu_offload:
+                with self.mem_alloc_context():
+                    if group.hfsdp_helper_gbuf:
+                        _init_hfsdp_helper_and_dp_buffer_data(
+                            group.hfsdp_helper_gbuf,
+                            gbuf,
+                            mem_alloc=_alloc,
+                            outer_dp_group=self.dist_index.get_outer_fsdp_group(
+                                is_expert_parallel=group.is_expert_param
+                            ),
+                        )
+                        group.hfsdp_helper_gbuf.data.zero_()
+                    else:
+                        # When not using HSDP, the main buffer shards across the FSDP group.
+                        gbuf.init_data(_alloc(gbuf.dtype, gbuf.data_size))
+                        gbuf.data.zero_()
             for item_id, p in enumerate(group.params):
                 # Attach the main grad buffer data and metadata to the parameter.
                 p._gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else gbuf
@@ -3177,6 +3419,16 @@ class ParamAndGradBuffer:
                             self.mp_policy.grad_comm_dtype if p._gbuf.is_data_distributed else None
                         )
                     )
+                    if gbuf.cpu_offload and not gbuf.slot_filled:
+                        if gbuf.is_data_distributed:
+                            # Fused wgrad may accumulate into its output. Start
+                            # each microbatch with a clean communication bucket.
+                            bucket.data.zero_()
+                            gbuf.slot_filled = True
+                        else:
+                            p._megatron_fsdp_model.grad_reduce_pipeline.fill_offloaded_grad_bucket(
+                                gbuf, bucket
+                            )
                     # View it as p.shape so you can insert the param.grad into
                     # the bucket seamlessly.
                     return gbuf.get_item_from_bucket(bucket, item_id).view(
@@ -3193,6 +3445,67 @@ class ParamAndGradBuffer:
         # Clean up deallocated memory.
         gc.collect()
         torch.cuda.empty_cache()
+
+    def _init_cpu_offload_data(self):
+        """
+        Allocate the pinned CPU copies of all CPU-offloaded model weight and main
+        gradient buffers. Pinned memory allocation is slow, so one pinned Tensor
+        is allocated per dtype and sliced into the buffers.
+        """
+        offload_bufs = [
+            buf
+            for group in self.parameter_groups
+            for buf in (group.model_weight_buffer, group.main_weight_buffer, group.main_grad_buffer)
+            if buf is not None and buf.cpu_offload
+        ]
+        dtype_sizes = defaultdict(int)
+        for buf in offload_bufs:
+            dtype_sizes[buf.dtype] += buf.data_size
+        cpu_storage = {
+            dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=True)
+            for dtype, size in dtype_sizes.items()
+        }
+        offset = defaultdict(int)
+        for buf in offload_bufs:
+            start = offset[buf.dtype]
+            buf.init_data(cpu_storage[buf.dtype][start : start + buf.data_size])
+            offset[buf.dtype] += buf.data_size
+
+    @torch.no_grad()
+    def _store_optimizer_weights(self, buffers):
+        if not buffers:
+            return
+        for buf in buffers:
+            buf.cpu_data.copy_(buf.data, non_blocking=True)
+        torch.cuda.current_stream(self.device).synchronize()
+        for buf in buffers:
+            buf.cpu_data_valid = True
+            _free_storage(buf.data)
+
+    @contextmanager
+    def optimizer_weights_on_gpu(self, *, write_back: bool = False):
+        """Materialize CPU-backed master weights while their DTensor views are in use.
+
+        Args:
+            write_back: Commit changes to the CPU copy when leaving the context.
+        """
+        restored = []
+        try:
+            with torch.no_grad():
+                for buf in self._offloaded_main_weights:
+                    if buf.data_size == 0 or buf.data.untyped_storage().nbytes() != 0:
+                        continue
+                    assert buf.cpu_data_valid
+                    _alloc_storage(buf.data, buf.data.shape)
+                    restored.append(buf)
+                    buf.data.copy_(buf.cpu_data, non_blocking=True)
+            yield
+        finally:
+            if write_back:
+                self._store_optimizer_weights(restored)
+            else:
+                for buf in restored:
+                    _free_storage(buf.data)
 
     def _reset_parameters(self, old_params, new_params):
         assert len(old_params) == len(new_params)
@@ -3251,6 +3564,10 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             if group.main_grad_buffer is None:
                 continue
+            assert group.main_grad_buffer.data is not None, (
+                "CPU-offloaded main gradients are only resident on GPU between "
+                "finish_grad_sync() and zero_grad_buffer()."
+            )
             group.main_grad_buffer.data *= scaling_factor
         self.update_main_grads()
 
@@ -3281,13 +3598,58 @@ class ParamAndGradBuffer:
                 if name in self.dist_main_grad:
                     self.dist_main_grad[name]._local_tensor = None
 
+        if self.cpu_offload_d2h_stream is not None:
+            # Ensure any in-flight D2H copies of offloaded gradient buffers have completed
+            # before releasing GPU tensors. The normal path always calls finish_grad_sync
+            # first, which calls synchronize(); this guard protects against mis-ordered callers.
+            self.cpu_offload_d2h_stream.synchronize()
+
         # Zero the Megatron-FSDP sharded gradient buffer. If param.grad or param.decoupled_grad
         # is a view of this buffer, they will be zero'd as well.
         for group in self.parameter_groups:
-            if group.main_grad_buffer:
-                group.main_grad_buffer.data.zero_()
+            gbuf = group.main_grad_buffer
+            if gbuf and gbuf.cpu_offload:
+                # Release the GPU-resident gradient shard and lazily zero the CPU copy.
+                gbuf.data = None
+                gbuf.data_offset = 0
+                gbuf.cpu_data_valid = False
+                gbuf.cpu_data_reduced = False
+            elif gbuf:
+                gbuf.data.zero_()
             if group.hfsdp_helper_gbuf:
                 group.hfsdp_helper_gbuf.data.zero_()
+
+    def reload_offloaded_main_grads(self):
+        """
+        Reload the local (virtual) shard of all CPU-offloaded main gradients to GPU
+        for the optimizer step. The GPU shards stay resident until zero_grad().
+        Un-sharded buffers only keep their local shard resident (data_offset != 0).
+        """
+        h2d_stream = self.cpu_offload_h2d_stream
+        current_stream = torch.cuda.current_stream()
+        h2d_stream.wait_stream(current_stream)
+        for group in self.parameter_groups:
+            gbuf = group.main_grad_buffer
+            if gbuf is None or not gbuf.cpu_offload:
+                continue
+            index = gbuf.shard_bucket_index
+            grad_shard = torch.empty(index.size, dtype=gbuf.dtype, device=self.device)
+            if gbuf.cpu_data_valid:
+                if not gbuf.cpu_data_reduced:
+                    raise RuntimeError(
+                        "Cannot finalize unreduced Megatron-FSDP gradients. "
+                        "Run the final backward pass outside no_sync()."
+                    )
+                gbuf.reload_from_cpu(
+                    grad_shard,
+                    h2d_stream,
+                    cpu_range=(index.local_data_index, index.local_data_index + index.size),
+                )
+            else:
+                grad_shard.zero_()
+            gbuf.data = grad_shard
+            gbuf.data_offset = index.local_data_index
+        current_stream.wait_stream(h2d_stream)
 
     def _init_distributed_params(self):
         """
@@ -3500,6 +3862,15 @@ class ParamAndGradBuffer:
         data_parallel_group = None
         expert_data_parallel_group = None
         clear_quantize_kwargs = lambda kwargs: [d.clear() for d in kwargs.values()]
+        offload_sizes = {}
+        offload_slots = defaultdict(list)
+        if self.ddp_config.fsdp_cpu_offload_weight:
+            for group in self.parameter_groups:
+                wbuf = group.model_weight_buffer
+                if wbuf is not None and wbuf.cpu_offload:
+                    offload_sizes[wbuf.dtype] = max(
+                        offload_sizes.get(wbuf.dtype, 0), wbuf.data_size
+                    )
 
         def _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs):
             if len(dense_param_quantize_kwargs["model_params"]) > 0:
@@ -3549,6 +3920,19 @@ class ParamAndGradBuffer:
             tbuf = pg.transpose_weight_buffer
             if mbuf is None:
                 continue
+
+            if wbuf is not None and wbuf.cpu_offload:
+                # Reuse two GPU write-back slots per dtype. The compute stream must
+                # wait before overwriting a slot that is still being copied to CPU.
+                slots = offload_slots[wbuf.dtype]
+                if len(slots) == 2:
+                    staging, copy_done = slots.pop(0)
+                    torch.cuda.current_stream().wait_event(copy_done)
+                else:
+                    staging = torch.empty(
+                        offload_sizes[wbuf.dtype], dtype=wbuf.dtype, device=self.device
+                    )
+                wbuf.data = staging[: wbuf.data_size]
 
             if pg.is_expert_param:
                 quantize_func_kwargs = expert_param_quantize_kwargs
@@ -3636,6 +4020,10 @@ class ParamAndGradBuffer:
                 if model_param.numel() > 0:
                     model_param.data.copy_(main_weight.view(model_param.shape))
 
+            if wbuf is not None and wbuf.cpu_offload:
+                self._offload_updated_model_weights(wbuf)
+                slots.append((staging, wbuf.cpu_ready_event))
+
             if has_blockwise_fp8_param:
                 blockwise_fp8_weight_buffers.append(wbuf)
                 if (
@@ -3653,6 +4041,25 @@ class ParamAndGradBuffer:
         )
         _fp8_quantize_params(dense_param_quantize_kwargs, expert_param_quantize_kwargs)
 
+    def _offload_updated_model_weights(self, wbuf: DataParallelBuffer):
+        """
+        Write the updated, temporarily GPU-resident model weights of a CPU-offloaded
+        model weight buffer back to its CPU copy, and release the GPU memory.
+        """
+        if not wbuf.is_data_distributed and wbuf.dp_world_size > 1:
+            # Gather the other ranks' updated shards to keep a complete CPU copy.
+            torch.distributed.all_gather_into_tensor(
+                output_tensor=wbuf.data,
+                input_tensor=wbuf.get_shard_from_local_buffer(),
+                group=wbuf.data_parallel_group,
+            )
+        d2h_stream = self.cpu_offload_d2h_stream
+        d2h_stream.wait_stream(torch.cuda.current_stream())
+        # Finish any previous H2D read before overwriting the CPU copy.
+        d2h_stream.wait_stream(self.cpu_offload_h2d_stream)
+        wbuf.offload_to_cpu(wbuf.data, d2h_stream)
+        wbuf.data = None
+
     def all_gather_parameters(self, async_op: bool = True):
         """All gather the parameters.
         Args:
@@ -3669,7 +4076,8 @@ class ParamAndGradBuffer:
         all_gather_ops = []
         for g in self.parameter_groups:
             for buf in [g.model_weight_buffer, g.transpose_weight_buffer]:
-                if buf is None:
+                if buf is None or buf.cpu_offload:
+                    # CPU-offloaded weights are all-gathered before they are offloaded.
                     continue
                 shard = buf.get_shard_from_local_buffer()
                 all_gather_handler = torch.distributed.all_gather_into_tensor(
@@ -3915,6 +4323,9 @@ class GradReducePipeline:
         )
         # NVTX labels of the coalesced bucket groups seen so far, keyed by bucket IDs.
         self._nvtx_labels: Dict[tuple, str] = {}
+        # D2H completion event of the latest released un-sharded offloaded grad bucket,
+        # which must complete before a (recycled) grad bucket is overwritten.
+        self.offload_grad_bucket_free_event = None
 
         # Init outer-DP group gradient reduction related attributes.
         dist_index = self.buffer.dist_index
@@ -4011,6 +4422,93 @@ class GradReducePipeline:
                     outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
                 )
 
+    def offload_gradients(
+        self, params: List[torch.Tensor], suggested_queue_capacity: Optional[int] = None
+    ):
+        """Offload the locally accumulated (un-reduced) gradients of the given parameters
+        to CPU without reducing them. Used for un-sharded CPU-offloaded gradient buffers
+        on micro-batches that do not reduce gradients.
+
+        Args:
+            params (List[torch.Tensor]): The parameters.
+            suggested_queue_capacity (int, optional): The suggested queue capacity.
+                Defaults to None.
+        """
+        params = sorted(list(params), key=lambda x: self.buffer.param_to_param_group[x])
+        for param in params:
+            bucket_id = self.buffer.param_to_param_group[param]
+            if not param.requires_grad or not self.get_fsdp_buffer(bucket_id).cpu_offload:
+                # Non-offloaded un-sharded gradients are accumulated in place.
+                continue
+
+            # Mark grad as ready for offloading.
+            self.bucket_grad_ready_params[bucket_id].add(param)
+            bucket_group = self.get_ready_bucket_group_for_reduction(bucket_id)
+            if bucket_group:
+                self.wait_for_previous_grad_reduce(
+                    suggested_queue_capacity=suggested_queue_capacity
+                )
+                self._bucket_group_gradient_offload(bucket_group)
+
+    def _bucket_group_gradient_offload(self, bucket_group: List[int]):
+        """Asynchronously copy the full temporary grad buckets of an un-sharded,
+        CPU-offloaded bucket group to CPU, and release the buckets afterwards."""
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            self._enforce_double_buffer_limit(bucket_group)
+
+        gbuf_buckets = []
+        for bucket_id in bucket_group:
+            gbuf = self.get_fsdp_buffer(bucket_id)
+            bucket = gbuf.fetch_bucket()
+            self.fill_offloaded_grad_bucket(gbuf, bucket)
+            gbuf_buckets.append((gbuf, bucket))
+
+        # D2H after the gradients are accumulated on the current (compute) stream.
+        d2h_stream = self.buffer.cpu_offload_d2h_stream
+        d2h_stream.wait_stream(torch.cuda.current_stream())
+        for gbuf, bucket in gbuf_buckets:
+            offload_event = gbuf.offload_to_cpu(bucket.data, d2h_stream)
+            gbuf.cpu_data_reduced = False
+            self.bucket_status[gbuf.bucket_id] = BucketStatus.COMMUNICATING
+
+        # Release the grad buckets only after the (last) D2H copy completes.
+        for bucket_id in bucket_group:
+            self.grad_reduce_queue.append(
+                (
+                    offload_event,
+                    self._get_free_up_grad_bucket_closure(bucket_id, offload_event),
+                    bucket_id,
+                )
+            )
+
+    def fill_offloaded_grad_bucket(self, gbuf: DataParallelBuffer, bucket: Bucket):
+        """Fill the temporary full grad bucket of an un-sharded, CPU-offloaded gradient
+        buffer with the CPU partial sum (or zeros) once per bucket allocation, so that
+        gradients can be accumulated into it.
+
+        Args:
+            gbuf (DataParallelBuffer): The un-sharded, CPU-offloaded gradient buffer.
+            bucket (Bucket): The temporary full grad bucket allocated by gbuf.
+        """
+        if gbuf.slot_filled:
+            return
+        current_stream = torch.cuda.current_stream()
+        if self.offload_grad_bucket_free_event is not None:
+            # A recycled grad bucket may still be read by the D2H copy of its previous owner.
+            current_stream.wait_event(self.offload_grad_bucket_free_event)
+        if gbuf.cpu_data_valid:
+            assert not gbuf.cpu_data_reduced, (
+                "Cannot accumulate gradients into a reduced CPU-offloaded gradient. "
+                "Call zero_grad_buffer() after the gradient reduction of every "
+                "optimization step."
+            )
+            h2d_stream = self.buffer.cpu_offload_h2d_stream
+            h2d_stream.wait_stream(current_stream)
+            current_stream.wait_event(gbuf.reload_from_cpu(bucket.data, h2d_stream))
+        else:
+            bucket.data.zero_()
+        gbuf.slot_filled = True
+
     def wait_for_previous_grad_reduce(
         self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
     ):
@@ -4044,15 +4542,15 @@ class GradReducePipeline:
                 free_up_grad_bucket()
 
     def _enforce_double_buffer_limit(self, add_buckets):
-        if not self.buffer.ddp_config.fsdp_double_buffer:
+        if self.buffer.main_grad_alloc is None:
             return
 
         param_groups = self.buffer.parameter_groups
-        double_buf_units = set()
-        for bucket_id in add_buckets:
-            fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
-            if fsdp_unit_id in self.buffer.double_buf_units:
-                double_buf_units.add(fsdp_unit_id)
+        pool_units = self.buffer.main_grad_alloc.fsdp_double_buffer_units
+        double_buf_units = {param_groups[i].fsdp_unit_id for i in add_buckets}
+        double_buf_units.intersection_update(pool_units)
+        if not double_buf_units:
+            return
         assert (
             len(double_buf_units) <= 2
         ), f"Double buffer limit exceeded. Current double_buf_units: {double_buf_units}."
@@ -4060,12 +4558,14 @@ class GradReducePipeline:
         keep_n = len(self.grad_reduce_queue)
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
-            double_buf_units.add(fsdp_unit_id)
+            if fsdp_unit_id in pool_units:
+                double_buf_units.add(fsdp_unit_id)
             if len(double_buf_units) > 2:
                 keep_n -= 1
 
-        with torch.cuda.stream(self.rs_stream):
-            self.wait_for_previous_grad_reduce(keep_n)
+        # The caller's stream writes the recycled bucket. Waiting on the RS
+        # stream would leave those writes unordered with the previous user.
+        self.wait_for_previous_grad_reduce(keep_n)
 
     def get_ready_bucket_group_for_reduction(self, bucket_id: int) -> Optional[List[int]]:
         """Checks if all buckets in the bucket group containing the given bucket_id
@@ -4125,6 +4625,29 @@ class GradReducePipeline:
             self._enforce_double_buffer_limit(bucket_group)
 
         current_stream = torch.cuda.current_stream()
+        # CPU-offloaded gradient buffers. Sharded: the reduced gradient shard is
+        # accumulated into a staging shard that holds the CPU partial sum (H2D overlapped
+        # with the reduce-scatter). Un-sharded: the full grad bucket must be filled.
+        offload_staging = {}
+        for bucket_id in bucket_group:
+            gbuf = self.get_fsdp_buffer(bucket_id)
+            if not gbuf.cpu_offload:
+                continue
+            if gbuf.is_data_distributed:
+                staging = self.buffer.offload_grad_staging_alloc.allocate(
+                    bucket_id, gbuf.data_size, gbuf.dtype, gbuf.device
+                ).data
+                h2d_event = None
+                if gbuf.cpu_data_valid:
+                    # The backward pre-hook has already queued next-unit weight
+                    # prefetch. Reload the gradient partial sum alongside this RS.
+                    h2d_stream = self.buffer.cpu_offload_h2d_stream
+                    h2d_stream.wait_stream(current_stream)
+                    h2d_event = gbuf.reload_from_cpu(staging, h2d_stream)
+                offload_staging[bucket_id] = (staging, h2d_event)
+            else:
+                self.fill_offloaded_grad_bucket(gbuf, gbuf.fetch_bucket())
+
         reduce_scatter_stream = (
             self.rs_stream if self.rs_stream is not None else torch.cuda.current_stream()
         )
@@ -4141,6 +4664,8 @@ class GradReducePipeline:
                 # List of gradient accumulation closure tasks.
                 # (grad_buffer, reduced_grad)
                 grad_accum_closure = []
+                # (cpu_offload_grad_buffer, reduced_grad)
+                grad_offload_closure = []
                 for bucket_id in bucket_group:
 
                     # Get the DP-Shard gradient buffer associated with this bucket ID.
@@ -4203,7 +4728,9 @@ class GradReducePipeline:
                         # bucket is allocated, then the output bucket shard is backed by
                         # the unsharded gradient buffer and the reduce-scatter result
                         # has already been installed into the gradient buffer.
-                        if gbuf.is_data_distributed or custom_grad_comm_dtype:
+                        if gbuf.cpu_offload:
+                            grad_offload_closure.append((gbuf, grad_shard))
+                        elif gbuf.is_data_distributed or custom_grad_comm_dtype:
                             grad_accum_closure.append(
                                 # Target for sharded or un-sharded gradient buffers.
                                 (gbuf.get_shard_from_local_buffer(), grad_shard)
@@ -4222,8 +4749,42 @@ class GradReducePipeline:
                     # accumulated gradient and the buffer main_grads_dtype.
                     local_grad += reduced_grad
 
+            # (cpu_offload_grad_buffer, gradient to offload, cpu_data range)
+            grad_d2h_tasks = []
+            for gbuf, reduced_grad in grad_offload_closure:
+                if gbuf.is_data_distributed:
+                    # Same accumulation as `local_grad += reduced_grad` above, where the
+                    # staging shard replaces the (zero-initialized) local gradient buffer.
+                    staging, h2d_event = offload_staging[gbuf.bucket_id]
+                    if h2d_event is not None:
+                        reduce_scatter_stream.wait_event(h2d_event)
+                    else:
+                        staging.zero_()
+                    staging += reduced_grad
+                    staging.record_stream(reduce_scatter_stream)
+                    grad_d2h_tasks.append((gbuf, staging, None))
+                else:
+                    # The reduced shard is already installed in the full grad bucket.
+                    index = gbuf.shard_bucket_index
+                    cpu_range = (index.local_data_index, index.local_data_index + index.size)
+                    grad_d2h_tasks.append((gbuf, reduced_grad, cpu_range))
+
             # Record a checkpoint for the event to synchronize against the reduce-scatter stream.
             reduce_scatter_view_out_event = reduce_scatter_stream.record_event()
+
+        # Offload the accumulated / reduced gradients to CPU after the reduction.
+        unsharded_offload_event = None
+        if grad_d2h_tasks:
+            d2h_stream = self.buffer.cpu_offload_d2h_stream
+            d2h_stream.wait_event(reduce_scatter_view_out_event)
+            for gbuf, grad, cpu_range in grad_d2h_tasks:
+                offload_event = gbuf.offload_to_cpu(grad, d2h_stream, cpu_range)
+                gbuf.cpu_data_reduced = True
+                if not gbuf.is_data_distributed:
+                    unsharded_offload_event = offload_event
+            # Keep both the full bucket and its staging slot assigned until
+            # the last D2H finishes, so the two pools advance together.
+            reduce_scatter_view_out_event = offload_event
 
         # DP-Outer Gradient Reduction
         if outer_fsdp_group_grad_reduce:
@@ -4320,28 +4881,9 @@ class GradReducePipeline:
 
         free_up_grad_bucket_func = {}
         for bucket_id in bucket_group:
-
-            def get_closure(bucket_id):
-                def free_up_grad_bucket():
-                    # Empty the set of parameters that are ready for gradient reduction.
-                    self.bucket_grad_ready_params[bucket_id] = set()
-                    gbuf = self.get_fsdp_buffer(bucket_id)
-                    # Free the memory backing the temporarily-allocated communication
-                    # bucket associated with this buffer. Only exists for sharded
-                    # gradient buffers, or if a custom gradient data-type is used!
-                    gbuf.free_bucket_storage()
-                    # Gradient reduction completed, can de-reference param.main_grad.
-                    gbuf.reset_param_main_grad()
-                    hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
-                    if hsdp_comm_gbuf is not None:
-                        # Also de-allocate any communication buffers used for H(F)SDP.
-                        hsdp_comm_gbuf.free_bucket_storage()
-                    # Mark the bucket as deallocated / empty.
-                    self.bucket_status[bucket_id] = BucketStatus.EMPTY
-
-                return free_up_grad_bucket
-
-            free_up_grad_bucket_func[bucket_id] = get_closure(bucket_id)
+            free_up_grad_bucket_func[bucket_id] = self._get_free_up_grad_bucket_closure(
+                bucket_id, unsharded_offload_event
+            )
 
         if async_op:
             for bucket_id, free_up_grad_bucket in free_up_grad_bucket_func.items():
@@ -4354,6 +4896,42 @@ class GradReducePipeline:
         for free_up_grad_bucket in free_up_grad_bucket_func.values():
             free_up_grad_bucket()
         return True
+
+    def _get_free_up_grad_bucket_closure(
+        self, bucket_id: int, offload_event: Optional[torch.cuda.Event] = None
+    ) -> Callable:
+        """Get the closure that releases the temporary grad bucket of the given bucket ID
+        after its gradient reduction or CPU offload has completed.
+
+        Args:
+            bucket_id (int): The bucket ID.
+            offload_event (Optional[torch.cuda.Event]): Completion event of the D2H copy
+                that reads an un-sharded CPU-offloaded grad bucket, if any.
+        """
+
+        def free_up_grad_bucket():
+            # Empty the set of parameters that are ready for gradient reduction.
+            self.bucket_grad_ready_params[bucket_id] = set()
+            gbuf = self.get_fsdp_buffer(bucket_id)
+            # Free the memory backing the temporarily-allocated communication
+            # bucket associated with this buffer. Only exists for sharded
+            # gradient buffers, or if a custom gradient data-type is used!
+            gbuf.free_bucket_storage()
+            if gbuf.cpu_offload and gbuf.is_data_distributed:
+                self.buffer.offload_grad_staging_alloc.free(bucket_id)
+            if offload_event is not None and gbuf.cpu_offload and not gbuf.is_data_distributed:
+                # The released grad bucket may be recycled before this D2H copy completes.
+                self.offload_grad_bucket_free_event = offload_event
+            # Gradient reduction completed, can de-reference param.main_grad.
+            gbuf.reset_param_main_grad()
+            hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
+            if hsdp_comm_gbuf is not None:
+                # Also de-allocate any communication buffers used for H(F)SDP.
+                hsdp_comm_gbuf.free_bucket_storage()
+            # Mark the bucket as deallocated / empty.
+            self.bucket_status[bucket_id] = BucketStatus.EMPTY
+
+        return free_up_grad_bucket
 
 
 class PrefetchOrder(Enum):
@@ -4415,6 +4993,14 @@ class AllGatherPipeline:
                 for bucket_id in bucket_group:
                     self.bucket_to_bucket_group[bucket_id] = group_id
 
+        # With CPU offloading, FSDP units are also used by optim(_grads), where FSDP-unit
+        # buckets with persistent un-sharded weights must stay resident instead of being
+        # released and all-gathered again on every use.
+        ddp_config = self.buffer.ddp_config
+        self.keep_persistent_buckets = (
+            ddp_config.fsdp_cpu_offload_weight or ddp_config.fsdp_cpu_offload_grad
+        )
+
         if (
             self.buffer.dist_index.use_hybrid_fsdp
             and self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard"
@@ -4463,7 +5049,9 @@ class AllGatherPipeline:
                 # associated with FSDP non-units. Instead, mark the bucket as PRESERVED
                 # (not NEW) so a later all-gather refreshes preserved non-unit bucket
                 # storage in place.
-                if preserve_non_fsdp_units and not is_unit_bucket:
+                if preserve_non_fsdp_units and (
+                    not is_unit_bucket or self._is_persistent_bucket(bucket_id, bwd)
+                ):
                     self.bucket_status[bucket_key] = BucketStatus.PRESERVED
                 else:
                     self.bucket_can_be_released[bucket_key] = True
@@ -4601,11 +5189,21 @@ class AllGatherPipeline:
         # Buckets added below beyond these are prefetched (named in NVTX labels).
         requested_buckets = set(ag_buckets)
         parameter_groups = self.buffer.parameter_groups
-        if self.buffer.ddp_config.fsdp_double_buffer:
+        # Limit the all-gather / reload to 2 FSDP units when double-buffering, or when
+        # reloading CPU-offloaded weights to bound the GPU memory and H2D prefetch.
+        limit_fsdp_units = (
+            self.buffer.ddp_config.fsdp_double_buffer
+            or self.buffer.ddp_config.fsdp_cpu_offload_weight
+        )
+        if limit_fsdp_units:
             double_buf_units = set()
             for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                if fsdp_unit_id in self.buffer.double_buf_units:
+                if self.buffer.ddp_config.fsdp_double_buffer:
+                    is_limited_unit = fsdp_unit_id in self.buffer.double_buf_units
+                else:
+                    is_limited_unit = fsdp_unit_id is not None
+                if is_limited_unit:
                     double_buf_units.add(fsdp_unit_id)
             if len(double_buf_units) > 2:
                 raise ValueError(
@@ -4659,7 +5257,7 @@ class AllGatherPipeline:
             def need_skip_prefetch(bucket_id):
                 # If use double buffer, we need to check if the next bucket
                 # is exceeding the coverage of the double buffer.
-                if self.buffer.ddp_config.fsdp_double_buffer:
+                if limit_fsdp_units:
                     fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                     double_buf_units.add(fsdp_unit_id)
                     if len(double_buf_units) > 2:
@@ -4749,6 +5347,19 @@ class AllGatherPipeline:
             # Coalesce the asynchronous NCCL operations in this context.
             all_gather_stream.wait_stream(torch.cuda.current_stream())
             dp_group = self.get_fsdp_buffer(buckets[0]).data_parallel_group
+            # Un-sharded CPU-offloaded weights are only reloaded (H2D) without any
+            # collective, and keep their H2D event instead of the coalescing event.
+            reload_only_buckets = [
+                bucket_id
+                for bucket_id in buckets
+                if self.get_fsdp_buffer(bucket_id, bwd).cpu_offload
+                and not self.get_fsdp_buffer(bucket_id, bwd).is_data_distributed
+            ]
+            if len(reload_only_buckets) == len(buckets):
+                with torch.cuda.stream(all_gather_stream):
+                    for bucket_id in buckets:
+                        self.async_bucket_gather(bucket_id, bwd)
+                continue
             with torch.cuda.stream(all_gather_stream):
                 if (
                     (self._prefetch_graph_order is not None or self._prefetch_graphs)
@@ -4783,6 +5394,8 @@ class AllGatherPipeline:
 
             # Replace the parameter all-gather event with coalescing event.
             for bucket_id in buckets:
+                if bucket_id in reload_only_buckets:
+                    continue
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
                 _, mark_bucket_ready_to_use = self.param_gather_event_map[bucket_key]
                 self.param_gather_event_map[bucket_key] = (
@@ -4866,8 +5479,28 @@ class AllGatherPipeline:
         else:
             buf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
 
+        if self._is_persistent_bucket(bucket_id, bwd):
+            # Persistent un-sharded weights stay ready to use until the next reset.
+            return
+
         buf.free_bucket_storage()
         self.bucket_status[bucket_key] = BucketStatus.EMPTY
+
+    def _is_persistent_bucket(self, bucket_id: int, bwd: bool) -> bool:
+        """Whether the bucket is a view of persistent un-sharded weights that is kept
+        resident (instead of released) when FSDP units are introduced by CPU offloading."""
+        if bwd and self.buffer.parameter_groups[bucket_id].transpose_weight_buffer is not None:
+            buf = self.buffer.parameter_groups[bucket_id].transpose_weight_buffer
+        else:
+            buf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
+        if buf is None:
+            return False
+        group = self.buffer.parameter_groups[bucket_id]
+        return (
+            self.keep_persistent_buckets
+            and group.fsdp_unit_id is not None
+            and buf.has_persistent_bucket
+        )
 
     def recycle_unused_buckets(self):
         """Recycle the unused buckets."""
@@ -4917,14 +5550,36 @@ class AllGatherPipeline:
         # Allocate an empty bucket to store the module weights.
         bucket = wbuf.fetch_bucket(set_param_data=True)
 
-        # All-gather the module weights in each buffer shard into the allocated bucket.
-        # Now each rank will have a copy of this FSDP unit module's weights.
-        param_gather_event = torch.distributed.all_gather_into_tensor(
-            output_tensor=bucket.data,
-            input_tensor=wbuf.get_shard_from_local_buffer(),
-            group=wbuf.data_parallel_group,
-            async_op=True,
-        )
+        if wbuf.cpu_offload:
+            # Reload the CPU copy (shard) of the weights into the bucket. The current
+            # (all-gather) stream already waits for the compute stream, i.e. for the
+            # previous users of the recycled bucket.
+            h2d_stream = self.buffer.cpu_offload_h2d_stream
+            h2d_stream.wait_stream(torch.cuda.current_stream())
+            if wbuf.is_data_distributed:
+                # Reload the local shard into the bucket, then all-gather in-place.
+                local_shard = wbuf.get_shard_from_bucket(bucket)
+                torch.cuda.current_stream().wait_event(
+                    wbuf.reload_from_cpu(local_shard, h2d_stream)
+                )
+                param_gather_event = torch.distributed.all_gather_into_tensor(
+                    output_tensor=bucket.data,
+                    input_tensor=local_shard,
+                    group=wbuf.data_parallel_group,
+                    async_op=True,
+                )
+            else:
+                # Un-sharded weights are reloaded entirely, no all-gather is needed.
+                param_gather_event = wbuf.reload_from_cpu(bucket.data, h2d_stream)
+        else:
+            # All-gather the module weights in each buffer shard into the allocated bucket.
+            # Now each rank will have a copy of this FSDP unit module's weights.
+            param_gather_event = torch.distributed.all_gather_into_tensor(
+                output_tensor=bucket.data,
+                input_tensor=wbuf.get_shard_from_local_buffer(),
+                group=wbuf.data_parallel_group,
+                async_op=True,
+            )
 
         self._track_bucket_gather(bucket_key, param_gather_event)
 
