@@ -169,20 +169,30 @@ class FullyShardedDataParallel(_BaseDataParallel):
             else:
                 self.fsdp_unit_modules = []
 
+        local_attention_graph = (
+            config.cuda_graph_impl == "local" and config.cuda_graph_modules == [CudaGraphModule.attn]
+        )
         if ddp_config.fsdp_cpu_offload:
             assert (
                 not config.overlap_moe_expert_parallel_comm
             ), "Megatron-FSDP CPU offloading does not support overlap_moe_expert_parallel_comm."
-            assert config.cuda_graph_impl == "none" or (
+            full_iteration_graph = (
                 config.cuda_graph_impl == "full_iteration"
                 and not self.num_moe_experts
-                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
                 and ddp_config.megatron_fsdp_cuda_graph_mode
                 and not ddp_config.fsdp_all_gather_in_start_param_sync
+            )
+            assert config.cuda_graph_impl == "none" or (
+                ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                and (
+                    full_iteration_graph
+                    or (local_attention_graph and not ddp_config.megatron_fsdp_cuda_graph_mode)
+                )
             ), (
-                "Megatron-FSDP CPU offloading with CUDA graphs requires dense FSDP3, "
-                "cuda_graph_impl='full_iteration', megatron_fsdp_cuda_graph_mode=True, "
-                "and fsdp_all_gather_in_start_param_sync=False."
+                "Megatron-FSDP CPU offloading with CUDA graphs requires FSDP3. "
+                "Use local attention with megatron_fsdp_cuda_graph_mode=False, or dense "
+                "full_iteration with megatron_fsdp_cuda_graph_mode=True and "
+                "fsdp_all_gather_in_start_param_sync=False."
             )
             if (
                 cpu_offload
@@ -273,9 +283,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
 
-        if config.cuda_graph_impl == "local" and config.cuda_graph_modules == [
-            CudaGraphModule.attn
-        ]:
+        if local_attention_graph:
             from megatron.core.transformer.cuda_graphs import _configure_fsdp_attention_cuda_graphs
 
             _configure_fsdp_attention_cuda_graphs(self.module, module, config)

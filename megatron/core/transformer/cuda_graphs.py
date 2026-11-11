@@ -2233,7 +2233,7 @@ def _configure_fsdp_attention_cuda_graphs(fsdp, model, config):
 
         if params_by_layer:
             fsdp._attention_graph_warmup_remaining = config.cuda_graph_warmup_steps
-            fsdp.all_gather_pipeline._record_prefetch_cuda_graphs()
+            fsdp.all_gather_pipeline._prepare_attention_cuda_graphs()
         for layer, params in params_by_layer.items():
             layer._fsdp_attention_cuda_graph = _FSDPAttentionCudaGraph(fsdp, params)
             # Keep the manager registered so train/eval propagates to it, but put the

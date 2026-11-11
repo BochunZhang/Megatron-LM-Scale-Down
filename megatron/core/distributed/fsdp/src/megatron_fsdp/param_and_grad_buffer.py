@@ -5100,10 +5100,13 @@ class AllGatherPipeline:
             self._nvtx_labels[key] = label
         return label
 
-    def _record_prefetch_cuda_graphs(self):
+    def _prepare_attention_cuda_graphs(self):
+        """Fix weight addresses for attention and record GPU-resident prefetches."""
         self.buffer.weight_alloc._assign_cuda_graph_slots()
-        # Preserve the order in which the eager step launched these NCCL groups.
-        self._prefetch_graph_order = {}
+        if not self.buffer.ddp_config.fsdp_cpu_offload_weight:
+            # Prefetch graphs read resident GPU shards. Offloaded weights use eager
+            # H2D and all-gather to populate the same fixed attention slots.
+            self._prefetch_graph_order = {}
 
     def _capture_prefetch_cuda_graphs(self):
         """Capture the all-gathers observed during eager warmup."""

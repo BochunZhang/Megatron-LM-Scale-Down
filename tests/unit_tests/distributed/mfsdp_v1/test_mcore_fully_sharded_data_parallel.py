@@ -129,10 +129,12 @@ class TestFullyShardedDataParallel:
 
     @pytest.mark.skipif(not HAVE_TE, reason="Requires Transformer Engine attention.")
     @pytest.mark.parametrize(
-        ("num_experts", "warmup_steps"), [(None, 3), (4, 1)], ids=["dense", "dropless_moe"]
+        ("num_experts", "warmup_steps", "offload"),
+        [(None, 3, ()), (4, 1, ()), (4, 1, ("gradient",)), (4, 1, ("weight", "gradient"))],
+        ids=["dense", "dropless_moe", "gradient_offload", "weight_gradient_offload"],
     )
-    def test_native_attention_cuda_graph(self, num_experts, warmup_steps, monkeypatch):
-        """Check native replay with FSDP prefetch and compare gradients against eager."""
+    def test_native_attention_cuda_graph(self, num_experts, warmup_steps, offload, monkeypatch):
+        """Compare native attention replay against eager with the same FSDP offload."""
         from megatron.core.enums import ModelType
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
@@ -192,6 +194,7 @@ class TestFullyShardedDataParallel:
                 use_megatron_fsdp=True,
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_max_pool_double_buffer=True,
+                fsdp_cpu_offload=offload,
             )
             model = FullyShardedDataParallel(config, ddp_config, Model(config).cuda())
             config.no_sync_func = model.no_sync
@@ -287,8 +290,12 @@ class TestFullyShardedDataParallel:
                         assert runner.cudagraph_created and runner.bwd_graph is not None
                 else:
                     for bwd in (False, True):
-                        assert graph_prefetches[bwd]
-                        assert graph_prefetches[bwd] <= prefetched_buckets[bwd]
+                        if "weight" in offload:
+                            assert not graph_prefetches[bwd]
+                            assert prefetched_buckets[bwd]
+                        else:
+                            assert graph_prefetches[bwd]
+                            assert graph_prefetches[bwd] <= prefetched_buckets[bwd]
         finally:
             delete_cuda_graphs()
             model_parallel_cuda_manual_seed(42, force_reset_rng=True)
