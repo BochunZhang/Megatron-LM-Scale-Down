@@ -371,6 +371,28 @@ class MegatronFSDP(torch.nn.Module):
 
     def _check_cpu_offload_config(self):
         """Check that the CPU offloading configuration is supported."""
+        config = self.ddp_config
+        if config.fsdp_cpu_grad_accumulation and (
+            not self.cpu_offload_grad
+            or self.data_parallel_sharding_strategy not in ("optim_grads", "optim_grads_params")
+            or config.megatron_fsdp_cuda_graph_mode
+        ):
+            raise ValueError("CPU gradient accumulation requires eager FSDP2/3 gradient offload.")
+        if config.fsdp_cpu_optimizer and (
+            not self.cpu_offload_optimizer
+            or not config.fsdp_cpu_grad_accumulation
+            or self.data_parallel_sharding_strategy != "optim_grads_params"
+            or config.fp8_param_gather
+            or self.mp_policy.main_params_dtype != torch.float32
+        ):
+            raise ValueError(
+                "FSDP CPU AdamW requires eager FSDP3, optimizer and gradient offload, "
+                "FP32 master weights, and non-FP8 compute weights."
+            )
+        if config.fsdp_nvme_path is not None and (
+            not config.fsdp_nvme_path or not config.fsdp_cpu_optimizer or not self.cpu_offload_weight
+        ):
+            raise ValueError("FSDP NVMe offload requires a directory, CPU AdamW and weight offload.")
         if not self.ddp_config.fsdp_cpu_offload:
             return
         if self.data_parallel_sharding_strategy == "no_shard":

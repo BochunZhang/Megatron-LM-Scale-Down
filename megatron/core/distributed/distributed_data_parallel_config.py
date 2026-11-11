@@ -251,6 +251,15 @@ class DistributedDataParallelConfig:
     `optimizer` (master weights and optimizer state), `weight` (compute weights),
     and `gradient` (main gradients). An empty tuple disables offload."""
 
+    fsdp_cpu_grad_accumulation: bool = False
+    """Accumulate reduced gradient shards on CPU using pinned double buffers."""
+
+    fsdp_cpu_optimizer: bool = False
+    """Update FSDP-owned master weights with CPU AdamW."""
+
+    fsdp_nvme_path: str | None = None
+    """Local NVMe directory for spilling the CPU-offloaded FSDP buffers."""
+
     @property
     def fsdp_cpu_offload_weight(self) -> bool:
         return "weight" in self.fsdp_cpu_offload
@@ -292,6 +301,10 @@ class DistributedDataParallelConfig:
         self.fsdp_cpu_offload = tuple(self.fsdp_cpu_offload)
         if set(self.fsdp_cpu_offload) - {"optimizer", "weight", "gradient"}:
             raise ValueError("fsdp_cpu_offload accepts optimizer, weight, and gradient.")
+        if (
+            self.fsdp_cpu_grad_accumulation or self.fsdp_cpu_optimizer or self.fsdp_nvme_path is not None
+        ) and not self.use_megatron_fsdp:
+            raise ValueError("CPU gradient accumulation, CPU AdamW and NVMe require Megatron-FSDP.")
         if self.fsdp_cpu_offload:
             assert (
                 self.use_megatron_fsdp

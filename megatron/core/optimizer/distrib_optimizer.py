@@ -686,8 +686,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
-        self._fsdp_optimizer_offload = "optimizer" in getattr(
-            self.ddp_config, "fsdp_cpu_offload", ()
+        self._fsdp_cpu_optimizer = optimizer is not None and getattr(
+            self.ddp_config, "fsdp_cpu_optimizer", False
+        )
+        if self._fsdp_cpu_optimizer:
+            from megatron.core.optimizer.cpu_offloading.fsdp_adam import FSDPCPUAdam
+
+            if not isinstance(optimizer, FSDPCPUAdam):
+                raise ValueError("fsdp_cpu_optimizer requires FSDPCPUAdam.")
+        self._fsdp_optimizer_offload = (
+            not self._fsdp_cpu_optimizer
+            and "optimizer" in getattr(self.ddp_config, "fsdp_cpu_offload", ())
         )
         if self._fsdp_optimizer_offload:
             if (
@@ -1745,6 +1754,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         assert (
             self.ddp_config.use_megatron_fsdp
         ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
+
+        if self._fsdp_cpu_optimizer:
+            return {
+                "state": {
+                    self._param_name(param): state
+                    for param, state in self.optimizer.checkpoint_state(is_loading=is_loading).items()
+                },
+                "param_to_group_meta": self._param_groups_to_param2group_meta(
+                    self.optimizer.param_groups
+                ),
+            }
 
         with ExitStack() as stack:
             stack.enter_context(self._fsdp_optimizer_state_on_gpu())
@@ -2914,6 +2934,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.is_stub_optimizer:
             return
 
+        if self._fsdp_cpu_optimizer:
+            # CPU AdamW has already published each updated compute-weight shard.
+            return
         if self.ddp_config.use_megatron_fsdp:
             # Update Megatron-FSDP's compute weights with optimized main weights.
             # If using quantized parameters, this will also perform quantization.

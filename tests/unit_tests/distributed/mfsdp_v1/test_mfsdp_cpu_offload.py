@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import gc
+import os
 
 import pytest
 import torch
@@ -100,7 +101,16 @@ def _round_trip_checkpoint(model, optimizer, path):
     optimizer.load_state_dict(loaded["optimizer"])
 
 
-def _train(strategy, double_buffer, offload=(), checkpoint_path=None):
+def _train(
+    strategy,
+    double_buffer,
+    offload=(),
+    checkpoint_path=None,
+    *,
+    cpu_grad_accumulation=False,
+    cpu_optimizer=False,
+    nvme_path=None,
+):
     """Train a small GPT model with Megatron-FSDP and gradient accumulation.
 
     Returns the per-micro-batch losses, the gradient norms, the final main weights
@@ -135,6 +145,9 @@ def _train(strategy, double_buffer, offload=(), checkpoint_path=None):
         fsdp_double_buffer=double_buffer,
         megatron_fsdp_main_grads_dtype=torch.float32,
         fsdp_cpu_offload=offload,
+        fsdp_cpu_grad_accumulation=cpu_grad_accumulation,
+        fsdp_cpu_optimizer=cpu_optimizer,
+        fsdp_nvme_path=nvme_path,
     )
     offload_weight = "weight" in offload
     offload_grad = "gradient" in offload
@@ -157,16 +170,22 @@ def _train(strategy, double_buffer, offload=(), checkpoint_path=None):
     ]
     assert bool(master_buffers) == ("optimizer" in offload)
     for buf in master_buffers:
-        assert buf.cpu_data_valid and buf.cpu_data.is_pinned()
+        assert buf.cpu_data_valid
+        if nvme_path:
+            assert buf.cpu_data is None
+        else:
+            assert buf.cpu_data.is_pinned()
         assert buf.data.untyped_storage().nbytes() == 0
     if cpu_offload:
         assert ddp_config.fsdp_double_buffer
         for group in fsdp_model.param_and_grad_buffer.parameter_groups:
             wbuf, gbuf = group.model_weight_buffer, group.main_grad_buffer
             if wbuf is not None and wbuf.cpu_offload:
-                assert wbuf.cpu_data.is_pinned() and wbuf.cpu_data_valid and wbuf.data is None
+                assert wbuf.cpu_data_valid and wbuf.data is None
+                assert wbuf.cpu_data is None if nvme_path else wbuf.cpu_data.is_pinned()
             if gbuf is not None and gbuf.cpu_offload:
-                assert gbuf.cpu_data.is_pinned() and not gbuf.cpu_data_valid and gbuf.data is None
+                assert not gbuf.cpu_data_valid and gbuf.data is None
+                assert gbuf.cpu_data is None if nvme_path else gbuf.cpu_data.is_pinned()
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
             optimizer="adam",
@@ -208,7 +227,12 @@ def _train(strategy, double_buffer, offload=(), checkpoint_path=None):
                 for value in state.values()
                 if isinstance(value, torch.Tensor) and value.ndim > 0
             ]
-            assert tensors and all(t.device.type == "cpu" and t.is_pinned() for t in tensors)
+            if nvme_path:
+                assert not tensors  # Adam moments have been written to NVMe.
+            elif cpu_optimizer:
+                assert tensors and all(t.device.type == "cpu" for t in tensors)
+            else:
+                assert tensors and all(t.device.type == "cpu" and t.is_pinned() for t in tensors)
 
     with buffers.optimizer_weights_on_gpu():
         main_weights = {
@@ -309,3 +333,31 @@ class TestMegatronFSDPCpuOffload:
             "optim_grads_params", True, ("optimizer", "weight", "gradient"), checkpoint_path[0]
         )
         testing.assert_close(resumed, expected, rtol=0, atol=0)
+
+    def test_host_gradient_accumulation_matches_gpu_accumulation(self):
+        reference = _train("optim_grads_params", True, ("gradient",))
+        actual = _train("optim_grads_params", True, ("gradient",), cpu_grad_accumulation=True)
+        testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    def test_cpu_adamw_matches_gpu_adamw(self):
+        offload = ("optimizer", "weight", "gradient")
+        reference = _train("optim_grads_params", True, offload)
+        actual = _train(
+            "optim_grads_params", True, offload, cpu_grad_accumulation=True, cpu_optimizer=True
+        )
+        testing.assert_close(actual, reference, rtol=3e-3, atol=3e-4)
+
+    def test_nvme_offload_matches_cpu_and_resumes(self, tmp_path):
+        nvme_path = os.environ.get("MEGATRON_FSDP_TEST_NVME_PATH")
+        if not nvme_path:
+            pytest.skip("Set MEGATRON_FSDP_TEST_NVME_PATH to a local NVMe directory with the native AIO extension installed.")
+        rank = torch.distributed.get_rank()
+        checkpoint = [str(tmp_path / "nvme-checkpoint") if rank == 0 else None]
+        torch.distributed.broadcast_object_list(checkpoint, src=0)
+        offload = ("optimizer", "weight", "gradient")
+        kwargs = dict(cpu_grad_accumulation=True, cpu_optimizer=True)
+        reference = _train("optim_grads_params", True, offload, **kwargs)
+        actual = _train(
+            "optim_grads_params", True, offload, checkpoint[0], nvme_path=nvme_path, **kwargs
+        )
+        testing.assert_close(actual, reference, rtol=0, atol=0)

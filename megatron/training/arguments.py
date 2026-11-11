@@ -1101,7 +1101,7 @@ def validate_args(args, defaults={}):
         if not args.use_megatron_fsdp or args.use_torch_fsdp2:
             raise ValueError("--fsdp-cpu-offload requires --use-megatron-fsdp.")
         if args.optimizer_cpu_offload:
-            raise ValueError("--fsdp-cpu-offload uses a GPU optimizer.")
+            raise ValueError("Use --fsdp-cpu-optimizer for Megatron-FSDP CPU updates.")
         if "optimizer" in args.fsdp_cpu_offload and args.use_precision_aware_optimizer:
             raise ValueError("Megatron-FSDP optimizer offload requires MCore-owned main weights.")
 
@@ -3569,8 +3569,15 @@ def _add_experimental_args(parser):
         nargs="+",
         choices=("optimizer", "weight", "gradient"),
         default=(),
-        help="Store selected Megatron-FSDP components in CPU memory. Optimizer updates run on GPU.",
+        help="Store selected Megatron-FSDP components in CPU memory. Updates default to GPU.",
     )
+
+    group.add_argument("--fsdp-cpu-grad-accumulation", action="store_true",
+                       help="Accumulate reduce-scattered gradients in pinned CPU memory.")
+    group.add_argument("--fsdp-cpu-optimizer", action="store_true",
+                       help="Run AdamW on CPU-resident FSDP master weights.")
+    group.add_argument("--fsdp-nvme-path", type=str,
+                       help="Local NVMe directory for DeepSpeed AIO FSDP swap files.")
 
     return parser
 

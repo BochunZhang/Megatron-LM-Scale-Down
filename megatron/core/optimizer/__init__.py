@@ -498,13 +498,39 @@ def _get_megatron_optimizer_based_on_param_groups(
         getattr(getattr(chunk, "ddp_config", None), "fsdp_cpu_offload", ())
         for chunk in model_chunks
     ):
-        raise ValueError("Megatron-FSDP offload requires GPU optimizer updates.")
+        raise ValueError("Use ddp.fsdp_cpu_optimizer for Megatron-FSDP CPU updates.")
+
+    fsdp_cpu_optimizer = any(
+        getattr(getattr(chunk, "ddp_config", None), "fsdp_cpu_optimizer", False)
+        for chunk in model_chunks
+    )
+    if fsdp_cpu_optimizer and (
+        config.optimizer != "adam"
+        or not config.decoupled_weight_decay
+        or not config.use_distributed_optimizer
+        or config.use_precision_aware_optimizer
+        or config.optimizer_cuda_graph
+        or skip_megatron_wrapping
+    ):
+        raise ValueError("Megatron-FSDP CPU optimizer requires standard distributed AdamW.")
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions.
     if param_groups:
-        if config.optimizer_cpu_offload:
+        if fsdp_cpu_optimizer:
+            from megatron.core.optimizer.cpu_offloading.fsdp_adam import FSDPCPUAdam
+
+            optimizer = FSDPCPUAdam(
+                param_groups,
+                model_chunks,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                betas=(config.adam_beta1, config.adam_beta2),
+                eps=config.adam_eps,
+            )
+            init_state_fn = None
+        elif config.optimizer_cpu_offload:
             if torch.__version__ < '2.3.0':
                 warnings.warn(
                     "CPU offload is recommended for PyTorch >= 2.3.0, "
