@@ -385,9 +385,12 @@ class MegatronFSDP(torch.nn.Module):
             raise NotImplementedError(
                 "[Megatron-FSDP] CPU offloading does not support NCCL user buffer registration."
             )
-        if self.ddp_config.megatron_fsdp_cuda_graph_mode:
+        if (
+            self.ddp_config.megatron_fsdp_cuda_graph_mode
+            and self.data_parallel_sharding_strategy != "optim_grads_params"
+        ):
             raise NotImplementedError(
-                "[Megatron-FSDP] CPU offloading does not support CUDA graphs."
+                "[Megatron-FSDP] CPU offloading with CUDA graphs requires FSDP3."
             )
         if self.cpu_offload_optimizer and (
             self.mp_policy.main_params_dtype is None or self.ddp_config.megatron_fsdp_use_decoupled_grad

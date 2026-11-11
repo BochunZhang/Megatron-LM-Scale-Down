@@ -3599,10 +3599,15 @@ class ParamAndGradBuffer:
                     self.dist_main_grad[name]._local_tensor = None
 
         if self.cpu_offload_d2h_stream is not None:
-            # Ensure any in-flight D2H copies of offloaded gradient buffers have completed
-            # before releasing GPU tensors. The normal path always calls finish_grad_sync
-            # first, which calls synchronize(); this guard protects against mis-ordered callers.
+            # Finish D2H copies before releasing GPU tensors and starting the next iteration.
             self.cpu_offload_d2h_stream.synchronize()
+            if self.ddp_config.megatron_fsdp_cuda_graph_mode and self.ddp_config.fsdp_cpu_offload_weight:
+                # The optimizer's weight copies are complete. Avoid capturing a wait on
+                # an event recorded by the eager optimizer step.
+                for group in self.parameter_groups:
+                    wbuf = group.model_weight_buffer
+                    if wbuf is not None and wbuf.cpu_offload:
+                        wbuf.cpu_ready_event = None
 
         # Zero the Megatron-FSDP sharded gradient buffer. If param.grad or param.decoupled_grad
         # is a view of this buffer, they will be zero'd as well.

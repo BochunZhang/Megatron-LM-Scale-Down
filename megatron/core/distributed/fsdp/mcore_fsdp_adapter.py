@@ -173,9 +173,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
             assert (
                 not config.overlap_moe_expert_parallel_comm
             ), "Megatron-FSDP CPU offloading does not support overlap_moe_expert_parallel_comm."
-            assert config.cuda_graph_impl == "none", (
-                "Megatron-FSDP CPU offloading does not support CUDA graphs "
-                f"(cuda_graph_impl={config.cuda_graph_impl!r})."
+            assert config.cuda_graph_impl == "none" or (
+                config.cuda_graph_impl == "full_iteration"
+                and not self.num_moe_experts
+                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                and ddp_config.megatron_fsdp_cuda_graph_mode
+                and not ddp_config.fsdp_all_gather_in_start_param_sync
+            ), (
+                "Megatron-FSDP CPU offloading with CUDA graphs requires dense FSDP3, "
+                "cuda_graph_impl='full_iteration', megatron_fsdp_cuda_graph_mode=True, "
+                "and fsdp_all_gather_in_start_param_sync=False."
             )
             if (
                 cpu_offload

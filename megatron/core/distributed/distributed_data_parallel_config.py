@@ -310,7 +310,8 @@ class DistributedDataParallelConfig:
             ), "Megatron-FSDP CPU offloading does not support HSDP / HFSDP."
             assert (
                 not self.megatron_fsdp_cuda_graph_mode
-            ), "Megatron-FSDP CPU offloading does not support CUDA graphs."
+                or self.data_parallel_sharding_strategy == "optim_grads_params"
+            ), "Megatron-FSDP CPU offloading with CUDA graphs requires FSDP3."
             if self.fsdp_cpu_offload_grad and self.data_parallel_sharding_strategy == "optim":
                 assert self.overlap_grad_reduce, (
                     "Megatron-FSDP CPU offloading of 'optim' gradients requires "
