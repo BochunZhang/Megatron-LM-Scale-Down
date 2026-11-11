@@ -713,6 +713,25 @@ def _te_general_gemm(*args, **kwargs):
 # ============================================================================
 
 
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_te_general_gemm_wgrad_output(accumulate):
+    inputs = torch.ones(16, 16, **_device(torch.bfloat16))
+    grad_output = torch.ones_like(inputs)
+    main_grad = torch.full((16, 16), 3.0, **_device(torch.float32))
+
+    _te_general_gemm(
+        inputs,
+        grad_output,
+        out_dtype=main_grad.dtype,
+        layout="NT",
+        out=main_grad,
+        grad=True,
+        accumulate=accumulate,
+    )
+
+    torch.testing.assert_close(main_grad, torch.full_like(main_grad, 19.0 if accumulate else 16.0))
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_bik_te_general_gemm_chunking_deterministic(dtype):
     torch.manual_seed(123)
