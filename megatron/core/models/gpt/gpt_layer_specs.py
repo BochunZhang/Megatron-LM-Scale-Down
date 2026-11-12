@@ -12,7 +12,7 @@ from megatron.core.models.backends import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -36,6 +36,7 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MlpBuilder,
+    MoETransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -639,6 +640,9 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
         )
+
+    if config.cuda_graph_impl == "local" and CudaGraphModule.moe_router in config.cuda_graph_modules:
+        moe_layer_spec.module = MoETransformerLayer
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.

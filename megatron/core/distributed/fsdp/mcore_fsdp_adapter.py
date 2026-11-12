@@ -169,9 +169,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
             else:
                 self.fsdp_unit_modules = []
 
-        local_attention_graph = (
-            config.cuda_graph_impl == "local" and config.cuda_graph_modules == [CudaGraphModule.attn]
-        )
+        local_partial_graph = False
+        if config.cuda_graph_impl == "local":
+            from megatron.core.transformer.cuda_graphs import (
+                _FSDP_MOE_PARTIAL_GRAPH_MODULES,
+                _configure_fsdp_attention_cuda_graphs,
+            )
+
+            graph_modules = set(config.cuda_graph_modules or ())
+            local_partial_graph = graph_modules in (
+                {CudaGraphModule.attn},
+                _FSDP_MOE_PARTIAL_GRAPH_MODULES,
+            )
         if ddp_config.fsdp_cpu_offload:
             assert (
                 not config.overlap_moe_expert_parallel_comm
@@ -186,11 +195,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
                 and (
                     full_iteration_graph
-                    or (local_attention_graph and not ddp_config.megatron_fsdp_cuda_graph_mode)
+                    or (local_partial_graph and not ddp_config.megatron_fsdp_cuda_graph_mode)
                 )
             ), (
                 "Megatron-FSDP CPU offloading with CUDA graphs requires FSDP3. "
-                "Use local attention with megatron_fsdp_cuda_graph_mode=False, or dense "
+                "Use local partial graphs with megatron_fsdp_cuda_graph_mode=False, or dense "
                 "full_iteration with megatron_fsdp_cuda_graph_mode=True and "
                 "fsdp_all_gather_in_start_param_sync=False."
             )
@@ -283,9 +292,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
 
-        if local_attention_graph:
-            from megatron.core.transformer.cuda_graphs import _configure_fsdp_attention_cuda_graphs
-
+        if local_partial_graph:
             _configure_fsdp_attention_cuda_graphs(self.module, module, config)
 
         self.sync_rng_states_across_tp_group()

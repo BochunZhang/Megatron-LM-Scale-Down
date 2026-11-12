@@ -127,14 +127,54 @@ class TestFullyShardedDataParallel:
         assert fsdp_model.mp_policy.main_grads_dtype is None
         assert fsdp_model.mp_policy.grad_comm_dtype is None
 
+    @pytest.fixture
+    def attention_graph_cp_size(self, request):
+        cp_size = request.param
+        if Utils.world_size < 2 or Utils.world_size % cp_size:
+            pytest.skip(f"Requires at least two ranks and a world size divisible by CP={cp_size}.")
+        if cp_size == 1:
+            yield cp_size
+            return
+
+        Utils.initialize_model_parallel(context_parallel_size=cp_size)
+        try:
+            yield cp_size
+        finally:
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel()
+
     @pytest.mark.skipif(not HAVE_TE, reason="Requires Transformer Engine attention.")
     @pytest.mark.parametrize(
-        ("num_experts", "warmup_steps", "offload"),
-        [(None, 3, ()), (4, 1, ()), (4, 1, ("gradient",)), (4, 1, ("weight", "gradient"))],
-        ids=["dense", "dropless_moe", "gradient_offload", "weight_gradient_offload"],
+        ("strategy", "num_experts", "warmup_steps", "offload", "attention_graph_cp_size", "graph_moe"),
+        [
+            pytest.param("optim_grads_params", None, 3, (), 1, False, id="dense"),
+            pytest.param("optim_grads_params", 4, 1, (), 1, False, id="dropless_moe"),
+            pytest.param("optim_grads_params", 4, 1, ("gradient",), 1, False, id="gradient_offload"),
+            pytest.param(
+                "optim_grads_params", 4, 1, ("weight", "gradient"), 1, False, id="weight_gradient_offload"
+            ),
+            pytest.param("optim", 4, 3, (), 1, False, id="fsdp1_moe"),
+            pytest.param("optim_grads_params", 4, 3, (), 4, False, id="cp4"),
+            pytest.param("optim_grads_params", 4, 3, ("weight",), 4, False, id="cp4_weight_offload"),
+            pytest.param("optim", 4, 3, (), 1, True, id="fsdp1_router"),
+            pytest.param("optim_grads_params", 4, 3, (), 1, True, id="fsdp3_router"),
+            pytest.param(
+                "optim_grads_params", 4, 3, ("weight", "gradient"), 4, True, id="cp4_offloaded_router"
+            ),
+        ],
+        indirect=["attention_graph_cp_size"],
     )
-    def test_native_attention_cuda_graph(self, num_experts, warmup_steps, offload, monkeypatch):
-        """Compare native attention replay against eager with the same FSDP offload."""
+    def test_native_attention_cuda_graph(
+        self,
+        strategy,
+        num_experts,
+        warmup_steps,
+        offload,
+        attention_graph_cp_size,
+        graph_moe,
+        monkeypatch,
+    ):
+        """Compare native partial graph replay against eager with the same FSDP offload."""
         from megatron.core.enums import ModelType
         from megatron.core.models.gpt.gpt_layer_specs import (
             get_gpt_layer_with_transformer_engine_spec,
@@ -145,10 +185,11 @@ class TestFullyShardedDataParallel:
             delete_cuda_graphs,
         )
         from megatron.core.transformer.module import MegatronModule
+        from megatron.core.transformer.transformer_layer import MoETransformerLayer
 
-        if Utils.world_size < 2:
-            pytest.skip("Requires at least two FSDP ranks.")
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        sharded_weights = strategy == "optim_grads_params"
+        cp_size = attention_graph_cp_size
 
         class Model(MegatronModule):
             model_type = ModelType.encoder_or_decoder
@@ -156,8 +197,11 @@ class TestFullyShardedDataParallel:
             def __init__(self, config):
                 super().__init__(config)
                 spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
+                layer_cls = TransformerLayer
+                if graph_moe and config.cuda_graph_impl == "local":
+                    layer_cls = MoETransformerLayer
                 self.layers = torch.nn.ModuleList(
-                    TransformerLayer(config, spec.submodules, layer_number=i + 1)
+                    layer_cls(config, spec.submodules, layer_number=i + 1)
                     for i in range(config.num_layers)
                 )
                 annotate_first_last_layer(self.layers)
@@ -173,6 +217,7 @@ class TestFullyShardedDataParallel:
         def build(impl):
             torch.manual_seed(42)
             model_parallel_cuda_manual_seed(42, use_cudagraphable_rng=True, force_reset_rng=True)
+            graph_modules = ["attn", "moe_router", "moe_preprocess"] if graph_moe else ["attn"]
             config = TransformerConfig(
                 num_layers=3,
                 hidden_size=128,
@@ -182,18 +227,21 @@ class TestFullyShardedDataParallel:
                 attention_dropout=0.0,
                 hidden_dropout=0.0,
                 num_moe_experts=num_experts,
+                context_parallel_size=cp_size,
+                cp_comm_type="p2p",
                 moe_token_dispatcher_type="alltoall",
                 moe_router_load_balancing_type="none",
                 moe_router_topk=1,
                 moe_router_pre_softmax=True,
+                moe_shared_expert_intermediate_size=64 if graph_moe else None,
                 cuda_graph_impl=impl,
-                cuda_graph_modules=["attn"] if impl == "local" else [],
+                cuda_graph_modules=graph_modules if impl == "local" else [],
                 cuda_graph_warmup_steps=warmup_steps,
             )
             ddp_config = DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
-                data_parallel_sharding_strategy="optim_grads_params",
-                megatron_fsdp_max_pool_double_buffer=True,
+                data_parallel_sharding_strategy=strategy,
+                megatron_fsdp_max_pool_double_buffer=sharded_weights,
                 fsdp_cpu_offload=offload,
             )
             model = FullyShardedDataParallel(config, ddp_config, Model(config).cuda())
@@ -233,8 +281,14 @@ class TestFullyShardedDataParallel:
         delete_cuda_graphs()
         eager, eager_optimizer = build("none")
         graphed, graph_optimizer = build("local")
-        seq_length = 32
-        mask = ~torch.ones((1, 1, seq_length, seq_length), dtype=torch.bool, device="cuda").tril()
+        local_seq_length = 32
+        seq_length = local_seq_length * cp_size
+        mask = None
+        if cp_size == 1:
+            mask = ~torch.ones((1, 1, seq_length, seq_length), dtype=torch.bool, device="cuda").tril()
+        input_generator = torch.Generator(device="cuda").manual_seed(
+            42 + mpu.get_context_parallel_rank()
+        )
         pipeline = graphed.module.all_gather_pipeline
         gather = pipeline.all_gather_params
         prefetched_buckets = {False: set(), True: set()}
@@ -266,7 +320,12 @@ class TestFullyShardedDataParallel:
                 for buckets in graph_prefetches.values():
                     buckets.clear()
                 inputs = [
-                    torch.randn((seq_length, 1, 128), dtype=torch.bfloat16, device="cuda")
+                    torch.randn(
+                        (local_seq_length, 1, 128),
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                        generator=input_generator,
+                    )
                     for _ in range(2)
                 ]
                 expected = step(eager, eager_optimizer, inputs)
@@ -281,16 +340,30 @@ class TestFullyShardedDataParallel:
                 elif iteration == warmup_steps - 1:
                     assert not graph_prefetches[True]
                     addresses = [
-                        layer._fsdp_attention_cuda_graph.param_addresses for layer in layers
+                        layer._fsdp_layer_cuda_graph.param_addresses for layer in layers
                     ]
-                    assert addresses[0] == addresses[2]
+                    if sharded_weights:
+                        assert addresses[0] == addresses[2]
+                    else:
+                        assert addresses[0] != addresses[2]
                     assert addresses[0] != addresses[1]
                     for layer in layers:
                         runner = layer._attention_cuda_graph_manager.cudagraph_runners[0]
                         assert runner.cudagraph_created and runner.bwd_graph is not None
+                        if graph_moe:
+                            router = layer.cudagraph_manager_router.cudagraph_runners[0]
+                            assert router.cudagraph_created and router.bwd_graph is not None
+                            assert any(
+                                param is layer.mlp.router.weight for param in router.params_to_backprop
+                            )
+                            postprocess = layer.cudagraph_manager_postprocess.cudagraph_runners[0]
+                            assert postprocess.cudagraph_created and postprocess.bwd_graph is not None
                 else:
                     for bwd in (False, True):
-                        if "weight" in offload:
+                        if not sharded_weights:
+                            assert not prefetched_buckets[bwd]
+                            assert not graph_prefetches[bwd]
+                        elif "weight" in offload:
                             assert not graph_prefetches[bwd]
                             assert prefetched_buckets[bwd]
                         else:

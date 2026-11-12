@@ -5,7 +5,7 @@ from typing import List, Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
-from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -27,6 +27,7 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MlpBuilder,
+    MoETransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -229,6 +230,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
+    graph_router = (
+        config.cuda_graph_impl == "local" and CudaGraphModule.moe_router in config.cuda_graph_modules
+    )
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -255,7 +259,11 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
         layer_specs.append(
             ModuleSpec(
-                module=TransformerLayer,
+                module=(
+                    MoETransformerLayer
+                    if graph_router and moe_layer_pattern[layer_number] == 1
+                    else TransformerLayer
+                ),
                 submodules=TransformerLayerSubmodules(
                     input_layernorm=input_layernorm,
                     self_attention=attention,

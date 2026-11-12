@@ -477,32 +477,44 @@ def _restore_grads_after_capture(backup):
         p.main_grad.copy_(saved)
 
 
-class _FSDPAttentionCudaGraph:
-    """Use the same FSDP weight slots at capture and replay."""
+_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES = ("optim", "optim_grads_params")
+_FSDP_MOE_PARTIAL_GRAPH_MODULES = frozenset(
+    (CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess)
+)
+
+
+class _FSDPLayerCudaGraph:
+    """Keep a layer's graphed parameters at the same addresses during capture and replay."""
 
     def __init__(self, fsdp, params):
         self.fsdp = fsdp
         self.params = params
-        param_to_bucket = fsdp.param_and_grad_buffer.param_to_param_group
-        params_by_bucket = {param_to_bucket[param]: param for param in params}
-        self.bucket_ids = tuple(sorted(params_by_bucket))
-        self.bucket_params = tuple(params_by_bucket[i] for i in self.bucket_ids)
+        if fsdp.data_parallel_sharding_strategy == "optim_grads_params":
+            param_to_bucket = fsdp.param_and_grad_buffer.param_to_param_group
+            params_by_bucket = {param_to_bucket[param]: param for param in params}
+            self.bucket_ids = tuple(sorted(params_by_bucket))
+            self.address_params = tuple(params_by_bucket[i] for i in self.bucket_ids)
+        else:
+            # FSDP1's optimizer-step sync refreshes the persistent GPU compute weights.
+            self.bucket_ids = ()
+            self.address_params = params
         self.param_addresses = None
 
     def check_addresses(self):
-        if tuple(param.data_ptr() for param in self.bucket_params) != self.param_addresses:
-            raise RuntimeError("FSDP attention weight slots moved after CUDA graph capture.")
+        if tuple(param.data_ptr() for param in self.address_params) != self.param_addresses:
+            raise RuntimeError("FSDP weight slots moved after CUDA graph capture.")
 
     @contextmanager
     def capture_weights(self):
-        """Gather weights into their normal pool slots before capture."""
+        """Capture with raw compute weights at their normal addresses."""
         was_distributed = self.fsdp.is_param_fsdp_distributed
         self.fsdp._replace_param_with_raw_if_needed()
         try:
             try:
-                self.fsdp.all_gather_and_wait_parameters_ready(self.params, prefetch=False)
+                if self.bucket_ids:
+                    self.fsdp.all_gather_and_wait_parameters_ready(self.params, prefetch=False)
                 if self.param_addresses is None:
-                    self.param_addresses = tuple(param.data_ptr() for param in self.bucket_params)
+                    self.param_addresses = tuple(param.data_ptr() for param in self.address_params)
                 self.check_addresses()
                 yield
             finally:
@@ -572,9 +584,9 @@ class _CudagraphGlobalRecord:
     def create_cudagraphs(cls):
         """Create recorded CUDA graphs, then remove the saved-tensor observer."""
         fsdp_pipelines = dict.fromkeys(
-            runner.fsdp_attention.fsdp.all_gather_pipeline
+            runner.fsdp_graph.fsdp.all_gather_pipeline
             for runner, *_ in cls.cudagraph_record
-            if runner.fsdp_attention is not None
+            if runner.fsdp_graph is not None
         )
         rng_states = []
         try:
@@ -680,8 +692,8 @@ class _CudagraphGlobalRecord:
 
             runner, graph_type = g[0:2]
             weights = (
-                runner.fsdp_attention.capture_weights()
-                if runner.fsdp_attention is not None
+                runner.fsdp_graph.capture_weights()
+                if runner.fsdp_graph is not None
                 else nullcontext()
             )
             with weights:
@@ -755,12 +767,12 @@ def create_cudagraphs(training_model: torch.nn.Module | None = None):
     if training_model is not None:
         try:
             fsdp = get_attr_wrapped_model(
-                training_model, "_attention_graph_warmup_remaining", return_model_obj=True
+                training_model, "_partial_graph_warmup_remaining", return_model_obj=True
             )
         except RuntimeError:
             return result
-        if fsdp._attention_graph_warmup_remaining > 0:
-            fsdp._attention_graph_warmup_remaining -= 1
+        if fsdp._partial_graph_warmup_remaining > 0:
+            fsdp._partial_graph_warmup_remaining -= 1
     return result
 
 
@@ -893,8 +905,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        if runner.fsdp_attention is not None:
-            runner.fsdp_attention.check_addresses()
+        if runner.fsdp_graph is not None:
+            runner.fsdp_graph.check_addresses()
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
@@ -918,9 +930,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
         assert len(grads) == len(
             runner.static_grad_outputs
         ), "Bwd cudagraph received a different number of tensors than what it was graphed with!"
-        if runner.fsdp_attention is not None:
+        if runner.fsdp_graph is not None:
             # The layer's FSDP backward pre-hook has already gathered its weights.
-            runner.fsdp_attention.check_addresses()
+            runner.fsdp_graph.check_addresses()
 
         # Copy new data into bwd graph input buffer
         for user_output_grad, cudagraph_output_grad in zip(grads, runner.static_grad_outputs):
@@ -986,9 +998,9 @@ class _CudaGraphRunner(torch.nn.Module):
         super().__init__()
 
         self.base_module = base_module
-        self.fsdp_attention = getattr(base_module, "_fsdp_attention_cuda_graph", None)
+        self.fsdp_graph = getattr(base_module, "_fsdp_layer_cuda_graph", None)
         self.capture_stream = (
-            get_shared_capture_stream() if self.fsdp_attention is not None else None
+            get_shared_capture_stream() if self.fsdp_graph is not None else None
         )
         self.mempool = mempool
 
@@ -1254,7 +1266,7 @@ class _CudaGraphRunner(torch.nn.Module):
             for buf in self.base_module.buffers():
                 buffer_backup.append(buf.clone())
 
-            grad_backup = _backup_grads_before_capture(self) if self.fsdp_attention is None else {}
+            grad_backup = _backup_grads_before_capture(self) if self.fsdp_graph is None else {}
 
             saved_fp8_tensors = None
             if self.fp8_enabled:
@@ -1528,7 +1540,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         capture_kwargs = (
             {"stream": self.capture_stream, "capture_error_mode": "thread_local"}
-            if self.fsdp_attention is not None
+            if self.fsdp_graph is not None
             else {}
         )
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool, **capture_kwargs):
@@ -1547,7 +1559,7 @@ class _CudaGraphRunner(torch.nn.Module):
             n_act_grads = sum(
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
             )
-            if self.fsdp_attention is None:
+            if self.fsdp_graph is None:
                 for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
                     if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
                         param.main_grad.add_(wgrad)
@@ -1643,7 +1655,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.static_grad_inputs.append(None)
 
         assert len(self.params_to_backprop) == len(grad_inputs)
-        if self.fsdp_attention is not None:
+        if self.fsdp_graph is not None:
             # FSDP copies each wgrad into its reduction bucket in the AccumulateGrad hook
             # before the next backward replay can reuse the graph pool memory.
             for grad in grad_inputs:
@@ -1917,12 +1929,12 @@ class CudaGraphManager(torch.nn.Module):
             def wrapped_func(*args, eager=False, cache_key=None, **kwargs):
                 if eager:
                     return func(*args, **kwargs)
-                attention_graph = getattr(base_module, "_fsdp_attention_cuda_graph", None)
-                if attention_graph is not None:
+                fsdp_graph = getattr(base_module, "_fsdp_layer_cuda_graph", None)
+                if fsdp_graph is not None:
                     if (
                         not base_module.training
                         or not torch.is_grad_enabled()
-                        or attention_graph.fsdp._attention_graph_warmup_remaining > 1
+                        or fsdp_graph.fsdp._partial_graph_warmup_remaining > 1
                     ):
                         return func(*args, **kwargs)
                     _CudagraphGlobalRecord._enable_saved_tensors_observer()
@@ -2085,7 +2097,7 @@ class CudaGraphManager(torch.nn.Module):
             if (
                 self.training
                 and torch.is_grad_enabled()
-                and not hasattr(megatron_module, "_fsdp_attention_cuda_graph")
+                and not hasattr(megatron_module, "_fsdp_layer_cuda_graph")
             ):
                 # Trigger Mcore DDP pre-forward hooks
                 self.call_ddp_preforward_hook(megatron_module)
@@ -2169,15 +2181,18 @@ class CudaGraphManager(torch.nn.Module):
 
 
 def _configure_fsdp_attention_cuda_graphs(fsdp, model, config):
-    """Graph only the attention method, leaving the enclosing FSDP unit hooks active."""
+    """Graph attention and selected MoE regions within the FSDP unit's hooks."""
     if config.cuda_graph_warmup_steps < 1:
         raise ValueError("Local FSDP attention CUDA graphs require at least one eager warmup step.")
 
     ddp_config = fsdp.ddp_config
+    strategy = ddp_config.data_parallel_sharding_strategy
+    sharded_weights = strategy == "optim_grads_params"
     if (
-        ddp_config.data_parallel_sharding_strategy != "optim_grads_params"
+        strategy not in _FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES
         or ddp_config.outer_dp_sharding_strategy != "no_shard"
-        or not ddp_config.megatron_fsdp_max_pool_double_buffer
+        or (sharded_weights and not ddp_config.megatron_fsdp_max_pool_double_buffer)
+        or (strategy == "optim" and (ddp_config.overlap_param_gather or ddp_config.fsdp_cpu_offload))
         or ddp_config.nccl_ub
         or ddp_config.fp8_param_gather
         or ddp_config.fp4_param_gather
@@ -2192,16 +2207,19 @@ def _configure_fsdp_attention_cuda_graphs(fsdp, model, config):
         or config.gtp_weight_remat_size > 1
         or config.pipeline_model_parallel_size != 1
         or config.tensor_model_parallel_size != 1
-        or config.context_parallel_size != 1
     ):
         raise ValueError(
-            "Local attention CUDA graphs with Megatron-FSDP require BF16 FSDP3, "
-            "max-pool double buffering and TP=PP=CP=1. Disable outer DP sharding, "
+            "Local attention CUDA graphs with Megatron-FSDP require BF16 and TP=PP=1. "
+            "Use FSDP1 with synchronous parameter gather and resident GPU weights, or "
+            "FSDP3 with max-pool double buffering. Disable outer DP sharding, "
             "NCCL user buffers, fine-grained parameter gather, fused or delayed wgrad, "
             "recompute, activation offload and GTP."
         )
 
+    from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    graph_router = CudaGraphModule.moe_router in config.cuda_graph_modules
 
     was_distributed = fsdp.is_param_fsdp_distributed
     fsdp._replace_param_with_raw_if_needed()
@@ -2209,44 +2227,55 @@ def _configure_fsdp_attention_cuda_graphs(fsdp, model, config):
         pg_buffer = fsdp.param_and_grad_buffer
         params_by_layer = {}
         for layer in model.modules():
-            if not isinstance(layer, TransformerLayer) or not hasattr(layer, "cudagraph_manager"):
+            if not isinstance(layer, TransformerLayer):
+                continue
+            graph_layer_router = graph_router and layer.is_moe_layer
+            if graph_layer_router and not getattr(layer, "use_partial_cudagraphs", False):
+                raise ValueError("FSDP router graphs require a MoETransformerLayer layer spec.")
+            graph_attention = layer.submodules_config.self_attention != IdentityOp and (
+                hasattr(layer, "cudagraph_manager") or graph_layer_router
+            )
+            if not (graph_attention or graph_layer_router):
                 continue
             params = dict.fromkeys(
                 param
                 for submodule in layer._get_submodules_under_cudagraphs()
                 for param in submodule.parameters()
             )
-            unit_ids = {
-                pg_buffer.parameter_groups[pg_buffer.param_to_param_group[param]].fsdp_unit_id
-                for param in params
-            }
-            if (
-                not isinstance(layer, tuple(fsdp.fsdp_unit_modules))
-                or None in unit_ids
-                or len(unit_ids) > 1
-            ):
-                raise ValueError(
-                    "Local FSDP attention graphs require a TransformerLayer FSDP unit."
-                )
+            if sharded_weights:
+                unit_ids = {
+                    pg_buffer.parameter_groups[pg_buffer.param_to_param_group[param]].fsdp_unit_id
+                    for param in params
+                }
+                if (
+                    not isinstance(layer, tuple(fsdp.fsdp_unit_modules))
+                    or None in unit_ids
+                    or len(unit_ids) > 1
+                ):
+                    raise ValueError(
+                        "Local FSDP3 partial graphs require a TransformerLayer FSDP unit."
+                    )
 
-            params_by_layer[layer] = tuple(params)
+            params_by_layer[layer] = (tuple(params), graph_attention)
 
         if params_by_layer:
-            fsdp._attention_graph_warmup_remaining = config.cuda_graph_warmup_steps
-            fsdp.all_gather_pipeline._prepare_attention_cuda_graphs()
-        for layer, params in params_by_layer.items():
-            layer._fsdp_attention_cuda_graph = _FSDPAttentionCudaGraph(fsdp, params)
-            # Keep the manager registered so train/eval propagates to it, but put the
-            # capture inside the layer's forward and its normal PyTorch hooks.
-            del layer.cudagraph_manager
-            layer._attention_cuda_graph_manager = CudaGraphManager(
-                config,
-                layer,
-                function_name="_forward_attention",
-                pg_collection=layer.pg_collection,
-                # Keep a local warmup for operations with a distinct capture-time path.
-                num_warmup_steps=1,
-            )
+            fsdp._partial_graph_warmup_remaining = config.cuda_graph_warmup_steps
+            if sharded_weights:
+                fsdp.all_gather_pipeline._prepare_attention_cuda_graphs()
+        for layer, (params, graph_attention) in params_by_layer.items():
+            layer._fsdp_layer_cuda_graph = _FSDPLayerCudaGraph(fsdp, params)
+            # The MoE layer already owns its router and postprocess managers.
+            if graph_attention:
+                if hasattr(layer, "cudagraph_manager"):
+                    del layer.cudagraph_manager
+                layer._attention_cuda_graph_manager = CudaGraphManager(
+                    config,
+                    layer,
+                    function_name="_forward_attention",
+                    pg_collection=layer.pg_collection,
+                    # Keep a local warmup for operations with a distinct capture-time path.
+                    num_warmup_steps=1,
+                )
     finally:
         if was_distributed:
             fsdp._replace_param_with_distributed_if_needed()
