@@ -1616,16 +1616,45 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             "Call initialize_model_parallel() first."
         )
 
+    return _create_fsdp_collective_groups("AG", for_expert_parallelism, timeout, nccl_comm_cfgs)
+
+
+def create_reduce_scatter_groups(
+    for_expert_parallelism: bool = False,
+    timeout: timedelta | None = None,
+    nccl_comm_cfgs: dict | None = None,
+) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup | None]:
+    """Create separate DP-with-CP and optional expert DP communicators for FSDP RS.
+
+    Args:
+        for_expert_parallelism: Also create the expert-data-parallel RS communicator.
+        timeout: Timeout for distributed collectives.
+        nccl_comm_cfgs: NCCL options keyed by ``dp_cp`` and ``ep_dp``.
+
+    Returns:
+        The local dense RS group and, if requested, the local expert RS group.
+    """
+    if not is_initialized():
+        raise RuntimeError(
+            "create_reduce_scatter_groups() requires parallel state to be initialized. "
+            "Call initialize_model_parallel() first."
+        )
+
+    return _create_fsdp_collective_groups("RS", for_expert_parallelism, timeout, nccl_comm_cfgs)
+
+
+def _create_fsdp_collective_groups(suffix, for_expert_parallelism, timeout, nccl_comm_cfgs):
     rank = torch.distributed.get_rank()
     pp_size = get_pipeline_model_parallel_world_size()
     cp_size = get_context_parallel_world_size()
     tp_size = get_tensor_model_parallel_world_size()
     ep_size = get_expert_model_parallel_world_size()
-    dp_size = get_data_parallel_world_size()
+    # Preserve the existing AG factory convention. The RS group mirrors the shard mesh,
+    # where the GTP-remat axis is separate from the DP degree.
+    dp_size = get_data_parallel_world_size(with_gtp_remat=suffix == "AG")
     gtp_remat_size = get_gtp_weight_remat_world_size() or 1
 
-    # Create regular DP all-gather group
-    dp_cp_ag_group = None
+    dp_cp_group = None
     decoder_rank_gen = RankGenerator(
         tp=tp_size,
         ep=1,
@@ -1638,20 +1667,19 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     )
 
     for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
-        group_with_cp_ag = create_group(
+        group_with_cp = create_group(
             ranks_with_cp,
             timeout=timeout,
             pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+            group_desc=f'DATA_PARALLEL_GROUP_WITH_CP_{suffix}',
         )
         if rank in ranks_with_cp:
-            dp_cp_ag_group = group_with_cp_ag
+            dp_cp_group = group_with_cp
 
-    # Create expert DP all-gather group if requested
-    expt_dp_ag_group = None
-    if for_expert_parallelism and ep_size > 1:
+    expt_dp_group = None
+    if for_expert_parallelism and (ep_size > 1 or suffix == "RS"):
         expert_tp_size = get_expert_tensor_parallel_world_size()
-        expert_dp_size = get_expert_data_parallel_world_size()
+        expert_dp_size = get_expert_data_parallel_world_size(with_gtp_remat=suffix == "AG")
         egtp_remat_size = get_expert_gtp_weight_remat_world_size() or 1
 
         expert_rank_gen = RankGenerator(
@@ -1666,16 +1694,16 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         )
 
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
+            expert_dp = create_group(
                 expert_dp_ranks,
                 timeout=timeout,
                 pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                group_desc=f'EXPERT_DATA_PARALLEL_GROUP_{suffix}',
             )
             if rank in expert_dp_ranks:
-                expt_dp_ag_group = expert_dp_ag
+                expt_dp_group = expert_dp
 
-    return dp_cp_ag_group, expt_dp_ag_group
+    return dp_cp_group, expt_dp_group
 
 
 def is_initialized():

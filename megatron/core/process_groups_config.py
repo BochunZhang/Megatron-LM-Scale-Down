@@ -134,6 +134,9 @@ class ProcessGroupCollection:
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
+    # Separate dp_cp communicator for FSDP gradient reduce-scatter
+    dp_cp_rs: torch.distributed.ProcessGroup = field(init=False)
+
     # _GTP_WEIGHT_REMAT_GROUP
     gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
@@ -154,6 +157,9 @@ class ProcessGroupCollection:
 
     # _EXPERT_DATA_PARALLEL_GROUP_AG
     expt_dp_ag: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_DATA_PARALLEL_GROUP_RS
+    expt_dp_rs: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     intra_dp_cp: torch.distributed.ProcessGroup = field(init=False)
@@ -267,6 +273,7 @@ class ProcessGroupCollection:
                 parallel_state.get_data_parallel_group, with_context_parallel=True
             ),
             'dp_cp_ag': lambda: None,
+            'dp_cp_rs': lambda: None,
             'intra_dp_cp': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
@@ -297,6 +304,7 @@ class ProcessGroupCollection:
                 parallel_state.get_expert_data_parallel_group, check_initialized=False
             ),
             'expt_dp_ag': lambda: None,
+            'expt_dp_rs': lambda: None,
             'tp_dp_cp': partial(
                 parallel_state.get_tensor_and_data_parallel_group,
                 check_initialized=False,

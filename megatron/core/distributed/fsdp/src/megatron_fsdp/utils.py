@@ -537,6 +537,8 @@ class FSDPDistributedIndex:
         expt_device_mesh: Optional[DeviceMesh] = None,
         fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
         expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+        fsdp_group_rs: torch.distributed.ProcessGroup | None = None,
+        expt_fsdp_group_rs: torch.distributed.ProcessGroup | None = None,
     ):
         """
         Args:
@@ -565,6 +567,8 @@ class FSDPDistributedIndex:
             expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
                 process group for expert parameters in MoE models. When provided, enables AG/RS
                 overlap optimization for expert parameters.
+            fsdp_group_rs: Independent reduce-scatter process group for non-expert gradients.
+            expt_fsdp_group_rs: Independent reduce-scatter process group for expert gradients.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
@@ -605,6 +609,22 @@ class FSDPDistributedIndex:
             and contains_submesh(self.expt_device_mesh, self.dp_shard_dim)
             else None
         )
+        self.fsdp_group_rs = fsdp_group_rs
+        self.expt_fsdp_group_rs = expt_fsdp_group_rs
+        for rs_group, shard_group in (
+            (self.fsdp_group_rs, self.fsdp_group),
+            (self.expt_fsdp_group_rs, self.expt_fsdp_group),
+        ):
+            if rs_group is not None and (
+                shard_group is None
+                or rs_group is shard_group
+                or torch.distributed.get_process_group_ranks(rs_group)
+                != torch.distributed.get_process_group_ranks(shard_group)
+            ):
+                raise ValueError(
+                    "An independent reduce-scatter group must be distinct from the FSDP shard "
+                    "group and preserve its ordered ranks."
+                )
 
         self.expt_outer_fsdp_group = (
             self.expt_device_mesh[self.dp_outer_dim].get_group()
@@ -737,6 +757,10 @@ class FSDPDistributedIndex:
         if independent_all_gather:
             return self.fsdp_group_ag
         return self.fsdp_group
+
+    def get_reduce_scatter_group(self, is_expert_parallel: bool = False) -> ProcessGroup | None:
+        """Return the independent reduce-scatter group when configured."""
+        return self.expt_fsdp_group_rs if is_expert_parallel else self.fsdp_group_rs
 
     def get_outer_fsdp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the outer-FSDP process group."""

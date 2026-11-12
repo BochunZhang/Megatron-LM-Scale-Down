@@ -457,6 +457,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
         expt_dp_ag = (
             getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
         )
+        dp_cp_rs = getattr(pg_collection, 'dp_cp_rs', None)
+        expt_dp_rs = getattr(pg_collection, 'expt_dp_rs', None)
+        if (dp_cp_rs is not None or expt_dp_rs is not None) and (
+            enable_hsdp
+            or self.ddp_config.outer_dp_sharding_strategy != "no_shard"
+            or self.ddp_config.data_parallel_sharding_strategy != "optim_grads_params"
+        ):
+            raise ValueError("Independent reduce-scatter groups require non-hybrid Megatron FSDP-3.")
 
         if enable_hsdp:
             if self.num_moe_experts is not None:
@@ -514,6 +522,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 expt_device_mesh=expt_device_mesh,
                 fsdp_group_ag=dp_cp_ag,
                 expt_fsdp_group_ag=expt_dp_ag,
+                fsdp_group_rs=dp_cp_rs,
+                expt_fsdp_group_rs=expt_dp_rs,
             )
 
         self.tp_group = tp_group

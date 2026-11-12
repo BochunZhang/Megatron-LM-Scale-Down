@@ -1423,13 +1423,10 @@ class MegatronFSDP(torch.nn.Module):
                     # The unit hooks materialize these buckets as slots become available.
                     continue
 
-                with (
-                    nvtx_range(
-                        lambda: self.all_gather_pipeline.all_gather_nvtx_label(
-                            [bucket_id], {bucket_id}, bwd=False
-                        )
-                    ),
-                    self.param_and_grad_buffer._fsdp_multicast_scope(wbuf.data_parallel_group),
+                with nvtx_range(
+                    lambda: self.all_gather_pipeline.all_gather_nvtx_label(
+                        [bucket_id], {bucket_id}, bwd=False
+                    )
                 ):
                     self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
 
