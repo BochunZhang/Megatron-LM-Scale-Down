@@ -82,6 +82,28 @@ def test_deallocate_output_tensor():
     assert out.nelement() == 6
 
 
+def test_backward_step_closes_nvtx_range_on_failure(monkeypatch):
+    ranges = ["outer range"]
+
+    def pop_range(msg):
+        assert ranges.pop() == msg
+
+    monkeypatch.setattr(schedule, "nvtx_range_push", lambda msg: ranges.append(msg))
+    monkeypatch.setattr(schedule, "nvtx_range_pop", pop_range)
+
+    def fail_backward(*args):
+        raise TypeError("wgrad failed")
+
+    monkeypatch.setattr(schedule, "custom_backward", fail_backward)
+    output = torch.tensor(1.0, requires_grad=True)
+    output.current_microbatch = 0
+    config = SimpleNamespace(timers=None, grad_scale_func=None, deallocate_pipeline_outputs=True)
+
+    with pytest.raises(TypeError, match="wgrad failed"):
+        schedule.backward_step(None, output, None, config)
+    assert ranges == ["outer range"]
+
+
 @contextmanager
 def _no_sync():
     yield

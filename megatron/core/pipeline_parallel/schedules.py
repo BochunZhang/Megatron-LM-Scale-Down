@@ -395,6 +395,16 @@ def forward_step_calc_loss(
     return output_tensor, num_tokens
 
 
+@contextlib.contextmanager
+def _profile_step(msg: str):
+    nvtx_range_push(msg=msg)
+    try:
+        with torch.autograd.profiler.record_function(msg):
+            yield
+    finally:
+        nvtx_range_pop(msg=msg)
+
+
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -486,54 +496,46 @@ def forward_step(
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     msg = f"forward_step[{current_microbatch}]" if current_microbatch is not None else "forward_step"
-    nvtx_range_push(msg=msg)
+    with _profile_step(msg):
+        if config.timers is not None:
+            config.timers('forward-compute', log_level=2).start()
 
-    profiler_handle = torch.autograd.profiler.record_function(msg)
-    profiler_handle.__enter__()
+        if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
+            model.set_is_first_microbatch()
+        if current_microbatch is not None:
+            set_current_microbatch(model, current_microbatch)
 
-    if config.timers is not None:
-        config.timers('forward-compute', log_level=2).start()
+        unwrap_output_tensor = False
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+            unwrap_output_tensor = True
 
-    if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
-        model.set_is_first_microbatch()
-    if current_microbatch is not None:
-        set_current_microbatch(model, current_microbatch)
+        set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
+        set_input_tensor(input_tensor)
 
-    unwrap_output_tensor = False
-    if not isinstance(input_tensor, list):
-        input_tensor = [input_tensor]
-        unwrap_output_tensor = True
-
-    set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
-    set_input_tensor(input_tensor)
-
-    if config.enable_autocast:
-        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
-    else:
-        context_manager = contextlib.nullcontext()
-    with context_manager:
-        if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+        if config.enable_autocast:
+            context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
         else:
-            output_tensor, loss_func = forward_step_func(
-                data_iterator, model, checkpoint_activations_microbatch
-            )
-    output_tensor, num_tokens = forward_step_calc_loss(
-        model,
-        output_tensor,
-        loss_func,
-        config,
-        vp_stage,
-        collect_non_loss_data,
-        num_microbatches,
-        forward_data_store,
-        cp_group_size,
-        is_last_stage,
-    )
-
-    profiler_handle.__exit__(None, None, None)
-
-    nvtx_range_pop(msg=msg)
+            context_manager = contextlib.nullcontext()
+        with context_manager:
+            if checkpoint_activations_microbatch is None:
+                output_tensor, loss_func = forward_step_func(data_iterator, model)
+            else:
+                output_tensor, loss_func = forward_step_func(
+                    data_iterator, model, checkpoint_activations_microbatch
+                )
+        output_tensor, num_tokens = forward_step_calc_loss(
+            model,
+            output_tensor,
+            loss_func,
+            config,
+            vp_stage,
+            collect_non_loss_data,
+            num_microbatches,
+            forward_data_store,
+            cp_group_size,
+            is_last_stage,
+        )
 
     setattr(output_tensor, 'current_microbatch', current_microbatch)
 
@@ -556,63 +558,54 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     current_microbatch = getattr(output_tensor, 'current_microbatch', None)
     msg = f"backward_step[{current_microbatch}]" if current_microbatch is not None else "backward_step"
-    nvtx_range_push(msg=msg)
+    with _profile_step(msg):
+        if config.timers is not None:
+            config.timers('backward-compute', log_level=2).start()
 
-    profiler_handle = torch.autograd.profiler.record_function(msg)
-    profiler_handle.__enter__()
-
-
-    if config.timers is not None:
-        config.timers('backward-compute', log_level=2).start()
-
-    # Retain the grad on the input_tensor.
-    unwrap_input_tensor_grad = False
-    if not isinstance(input_tensor, list):
-        input_tensor = [input_tensor]
-        unwrap_input_tensor_grad = True
-    for x in input_tensor:
-        if x is not None:
-            x.retain_grad()
-
-    if not isinstance(output_tensor, list):
-        output_tensor = [output_tensor]
-    if not isinstance(output_tensor_grad, list):
-        output_tensor_grad = [output_tensor_grad]
-
-    # Backward pass.
-    if output_tensor_grad[0] is None and config.grad_scale_func is not None:
-        output_tensor[0] = config.grad_scale_func(output_tensor[0])
-
-    # In multi-modal models like VLM, some batches may not have images.
-    # When no image is present, the vision encoder (as a separate pipeline stage)
-    # will not participate in the computation.
-    # This results in a tensor that does not require gradients.
-    # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
-        if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
-        else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
-
-    # Collect the grad of the input_tensor.
-    input_tensor_grad = [None]
-    if input_tensor is not None:
-        input_tensor_grad = []
+        # Retain the grad on the input_tensor.
+        unwrap_input_tensor_grad = False
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+            unwrap_input_tensor_grad = True
         for x in input_tensor:
-            if x is None:
-                input_tensor_grad.append(None)
+            if x is not None:
+                x.retain_grad()
+
+        if not isinstance(output_tensor, list):
+            output_tensor = [output_tensor]
+        if not isinstance(output_tensor_grad, list):
+            output_tensor_grad = [output_tensor_grad]
+
+        # Backward pass.
+        if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+            output_tensor[0] = config.grad_scale_func(output_tensor[0])
+
+        # In multi-modal models like VLM, some batches may not have images.
+        # When no image is present, the vision encoder (as a separate pipeline stage)
+        # will not participate in the computation.
+        # This results in a tensor that does not require gradients.
+        # In such cases, we intentionally skip the backward pass while preserving zero gradients.
+        if output_tensor[0].requires_grad:
+            if config.deallocate_pipeline_outputs:
+                custom_backward(output_tensor[0], output_tensor_grad[0])
             else:
-                input_tensor_grad.append(x.grad)
+                torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
-    if unwrap_input_tensor_grad:
-        input_tensor_grad = input_tensor_grad[0]
+        # Collect the grad of the input_tensor.
+        input_tensor_grad = [None]
+        if input_tensor is not None:
+            input_tensor_grad = []
+            for x in input_tensor:
+                if x is None:
+                    input_tensor_grad.append(None)
+                else:
+                    input_tensor_grad.append(x.grad)
 
-    if config.timers is not None:
-        config.timers('backward-compute').stop()
+        if unwrap_input_tensor_grad:
+            input_tensor_grad = input_tensor_grad[0]
 
-    profiler_handle.__exit__(None, None, None)
-
-    nvtx_range_pop(msg=msg)
+        if config.timers is not None:
+            config.timers('backward-compute').stop()
     return input_tensor_grad
 
 
