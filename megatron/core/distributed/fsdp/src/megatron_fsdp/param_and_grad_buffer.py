@@ -15,6 +15,7 @@
 # TODO: Split this file into smaller files.
 
 import copy
+import ctypes
 import dataclasses
 import functools
 import gc
@@ -22,13 +23,14 @@ import inspect
 import logging
 import math
 import operator
+import os
 import re
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
 from contextlib import ExitStack, contextmanager, nullcontext
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, cast
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -2289,6 +2291,29 @@ class ParamAndGradBuffer:
         self.cpu_grad_accumulator = None
         self.ubr_groups = None
         self.already_registered = False
+        self._set_nccl_fsdp_multicast = None
+        if os.getenv("MEGATRON_FSDP_MULTICAST") == "1":
+            if not (
+                ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                and ddp_config.outer_dp_sharding_strategy == "no_shard"
+                and ddp_config.nccl_ub
+                and ddp_config.fsdp_manual_registration
+                and not ddp_config.disable_symmetric_registration
+                and NCCL_ALLOCATOR == "MCORE"
+            ):
+                raise ValueError(
+                    "MEGATRON_FSDP_MULTICAST requires Megatron FSDP-3 with manual NCCL "
+                    "symmetric buffer registration and no outer DP sharding."
+                )
+            try:
+                setter = ctypes.CDLL(None).ncclSetFsdpMulticast
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "MEGATRON_FSDP_MULTICAST requires the NCCL build exporting ncclSetFsdpMulticast."
+                ) from exc
+            setter.argtypes = (ctypes.c_int,)
+            setter.restype = ctypes.c_int
+            self._set_nccl_fsdp_multicast = setter
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -2490,8 +2515,6 @@ class ParamAndGradBuffer:
         assert self.ddp_config.fsdp_manual_registration, "FSDP manual registration is not enabled"
         assert not self.already_registered, "Mem pool is already registered"
 
-        self.already_registered = True
-
         global NCCL_MEMORY_POOL
         torch.cuda.synchronize()
         torch.distributed.barrier(async_op=False)
@@ -2515,6 +2538,20 @@ class ParamAndGradBuffer:
                 f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
                 f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
             )
+        self.already_registered = True
+
+    @contextmanager
+    def _fsdp_multicast_scope(self, group: torch.distributed.ProcessGroup) -> Iterator[None]:
+        """Mark FSDP AG or RS enqueue calls after symmetric buffer registration."""
+        setter = self._set_nccl_fsdp_multicast
+        if setter is None or not self.already_registered or group.size() <= 1:
+            yield
+            return
+        previous = setter(1)
+        try:
+            yield
+        finally:
+            setter(previous)
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -4225,13 +4262,14 @@ class ParamAndGradBuffer:
             if self.ddp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
-            reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
-                output=gbuf.get_shard_from_local_buffer(),
-                input=gbuf.data,
-                op=reduce_op,
-                group=g.main_grad_buffer.data_parallel_group,
-                async_op=async_op,
-            )
+            with self._fsdp_multicast_scope(gbuf.data_parallel_group):
+                reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
+                    output=gbuf.get_shard_from_local_buffer(),
+                    input=gbuf.data,
+                    op=reduce_op,
+                    group=gbuf.data_parallel_group,
+                    async_op=async_op,
+                )
 
             if async_op:
                 reduce_scatter_ops.append(reduce_scatter_handler)
@@ -4771,9 +4809,11 @@ class GradReducePipeline:
         with torch.cuda.stream(reduce_scatter_stream):
             # The coalesced collective launches when the manager exits, inside the
             # NVTX range that names the layers of the reduced buckets.
-            with nvtx_range(
-                lambda: self.grad_reduce_nvtx_label(bucket_group)
-            ), _coalescing_manager(dp_group):
+            with (
+                nvtx_range(lambda: self.grad_reduce_nvtx_label(bucket_group)),
+                self.buffer._fsdp_multicast_scope(dp_group),
+                _coalescing_manager(dp_group),
+            ):
                 # List of gradient accumulation closure tasks.
                 # (grad_buffer, reduced_grad)
                 grad_accum_closure = []
@@ -5245,7 +5285,10 @@ class AllGatherPipeline:
                 with torch.cuda.graph(
                     graph, stream=self.ag_stream, capture_error_mode="thread_local"
                 ):
-                    with _coalescing_manager(dp_group, async_ops=True) as work:
+                    with (
+                        self.buffer._fsdp_multicast_scope(dp_group),
+                        _coalescing_manager(dp_group, async_ops=True) as work,
+                    ):
                         for output, shard in zip(outputs, inputs):
                             torch.distributed.all_gather_into_tensor(
                                 output, shard, group=dp_group, async_op=True
@@ -5515,11 +5558,11 @@ class AllGatherPipeline:
                         self._prefetch_graph_order[graph_key] = None
                 # The coalesced all-gather launches when the manager exits, inside
                 # the NVTX range that names the layers of the gathered buckets.
-                with nvtx_range(
-                    lambda: self.all_gather_nvtx_label(buckets, requested_buckets, bwd)
-                ), _coalescing_manager(
-                    dp_group, async_ops=async_param_gather
-                ) as coalescing_event:
+                with (
+                    nvtx_range(lambda: self.all_gather_nvtx_label(buckets, requested_buckets, bwd)),
+                    self.buffer._fsdp_multicast_scope(dp_group),
+                    _coalescing_manager(dp_group, async_ops=async_param_gather) as coalescing_event,
+                ):
                     for bucket_id in buckets:
                         # All-gather the module weights from each FSDP buffer shard
                         # into an allocated bucket containing unsharded weights.
