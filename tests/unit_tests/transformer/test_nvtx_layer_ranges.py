@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megatron.core import utils as mcore_utils
+from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode, _GraphStatus
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
@@ -80,3 +81,48 @@ def test_layer_skips_backward_range_when_nvtx_disabled(nvtx_events, monkeypatch)
     out, _ = TransformerLayer.forward(layer, torch.ones(4, requires_grad=True))
     out.sum().backward()
     assert nvtx_events == ["L0 compute"]
+
+
+def test_layer_backward_range_runs_on_each_cuda_graph_replay(nvtx_events, monkeypatch):
+    """A graphed MoE postprocess can return the layer output directly on every replay."""
+    output_buffer = torch.empty(4)
+    output_buffer.can_skip_replay_copy = False
+    graph = types.SimpleNamespace(replay=lambda: None)
+    grad_buffer = torch.empty_like(output_buffer)
+    runner = types.SimpleNamespace(
+        status=_GraphStatus.FWD_READY,
+        grad_enabled=True,
+        fwd_graph=graph,
+        bwd_graph=graph,
+        fwd_graph_input_surface=(torch.empty_like(output_buffer),),
+        fwd_graph_output_surface=(output_buffer,),
+        static_grad_outputs=(grad_buffer,),
+        static_grad_inputs=(grad_buffer,),
+        static_param_grads=(),
+        params_to_backprop=(),
+        bwd_graph_replay_complete_event=types.SimpleNamespace(record=lambda stream: None),
+        fp8_enabled=False,
+        fp4_enabled=False,
+        fsdp_graph=None,
+        use_stream=False,
+        gtp_remat=False,
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    layer = _fake_layer("L3", torch.tensor(2.0), nvtx_events)
+
+    def replay_postprocess(hidden_states, *args, **kwargs):
+        (output,) = _CudagraphReplayNode.apply(runner, False, hidden_states)
+        runner.status = _GraphStatus.BWD_READY
+        return output
+
+    layer._forward_mlp = replay_postprocess
+    for _ in range(2):
+        hidden = torch.ones(4, requires_grad=True)
+        output, _ = TransformerLayer.forward(layer, hidden)
+        nvtx_events.clear()
+        output.sum().backward()
+        assert nvtx_events == ["push L3 bwd", "pop"]
+        assert mcore_utils._nvtx_range_messages == []
+        assert output.data_ptr() == output_buffer.data_ptr()
+        assert output.can_skip_replay_copy is False
+        assert torch.equal(hidden.grad, torch.full((4,), 2.0))

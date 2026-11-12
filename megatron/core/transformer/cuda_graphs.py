@@ -914,7 +914,21 @@ class _CudagraphReplayNode(torch.autograd.Function):
             torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
         else:
             runner.fwd_graph.replay()
-        return runner.fwd_graph_output_surface
+
+        if not runner.grad_enabled:
+            return runner.fwd_graph_output_surface
+
+        # Reusing the same Tensor would replace its grad_fn but leave its hook
+        # dictionary attached to the previous replay's node. Share the captured
+        # storage through a fresh Tensor so downstream hooks attach to this replay.
+        outputs = []
+        for buffer in runner.fwd_graph_output_surface:
+            output = buffer.detach()
+            for attr in ("is_from_global_mempool", "cg_buffer_metadata", "can_skip_replay_copy"):
+                if hasattr(buffer, attr):
+                    setattr(output, attr, getattr(buffer, attr))
+            outputs.append(output)
+        return tuple(outputs)
 
     @staticmethod
     def backward(ctx, *grads):
