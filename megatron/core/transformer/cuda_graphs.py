@@ -477,7 +477,7 @@ def _restore_grads_after_capture(backup):
         p.main_grad.copy_(saved)
 
 
-_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES = ("optim", "optim_grads_params")
+_FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES = ("optim", "optim_grads", "optim_grads_params")
 _FSDP_MOE_PARTIAL_GRAPH_MODULES = frozenset(
     (CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess)
 )
@@ -495,7 +495,7 @@ class _FSDPLayerCudaGraph:
             self.bucket_ids = tuple(sorted(params_by_bucket))
             self.address_params = tuple(params_by_bucket[i] for i in self.bucket_ids)
         else:
-            # FSDP1's optimizer-step sync refreshes the persistent GPU compute weights.
+            # FSDP1/2's optimizer-step sync refreshes the persistent GPU compute weights.
             self.bucket_ids = ()
             self.address_params = params
         self.param_addresses = None
@@ -2202,29 +2202,46 @@ def _configure_fsdp_attention_cuda_graphs(fsdp, model, config):
     ddp_config = fsdp.ddp_config
     strategy = ddp_config.data_parallel_sharding_strategy
     sharded_weights = strategy == "optim_grads_params"
+    tensor_parallel = config.tensor_model_parallel_size > 1
+    quantized_compute = config.fp8 or config.fp4
+    if quantized_compute or tensor_parallel:
+        # Capture only static routing/preprocessing with resident BF16 weights.
+        # HybridEP's dispatch, including variable expert token counts, stays eager.
+        if (
+            sharded_weights
+            or set(config.cuda_graph_modules) != _FSDP_MOE_PARTIAL_GRAPH_MODULES
+            or config.moe_token_dispatcher_type != "flex"
+            or config.moe_flex_dispatcher_backend != "hybridep"
+            or config.moe_hybridep_pad_uneven_dispatch_inputs
+            or (tensor_parallel and not config.sequence_parallel)
+            or (config.fp8 and config.fp8_recipe != "mxfp8")
+            or (config.fp4 and config.fp4_recipe != "nvfp4")
+        ):
+            raise ValueError(
+                "Local FSDP partial graphs with MXFP8, NVFP4 or TP > 1 require FSDP1/2, "
+                "attn+moe_router+moe_preprocess, and HybridEP with fixed input token counts. "
+                "TP > 1 also requires sequence parallelism."
+            )
     if (
         strategy not in _FSDP_ATTENTION_GRAPH_SHARDING_STRATEGIES
         or ddp_config.outer_dp_sharding_strategy != "no_shard"
         or (sharded_weights and not ddp_config.megatron_fsdp_max_pool_double_buffer)
-        or (strategy == "optim" and (ddp_config.overlap_param_gather or ddp_config.fsdp_cpu_offload))
+        or (not sharded_weights and (ddp_config.overlap_param_gather or ddp_config.fsdp_cpu_offload))
         or ddp_config.nccl_ub
         or ddp_config.fp8_param_gather
         or ddp_config.fp4_param_gather
         or fsdp.enable_fine_grained_param_gather_hook
         or not config.bf16
-        or config.fp8
-        or config.fp4
         or config.gradient_accumulation_fusion
         or config.delay_wgrad_compute
         or config.recompute_granularity
         or config.fine_grained_activation_offloading
         or config.gtp_weight_remat_size > 1
         or config.pipeline_model_parallel_size != 1
-        or config.tensor_model_parallel_size != 1
     ):
         raise ValueError(
-            "Local attention CUDA graphs with Megatron-FSDP require BF16 and TP=PP=1. "
-            "Use FSDP1 with synchronous parameter gather and resident GPU weights, or "
+            "Local attention CUDA graphs with Megatron-FSDP require BF16 model weights and PP=1. "
+            "Use FSDP1/2 with synchronous parameter gather and resident GPU weights, or "
             "FSDP3 with max-pool double buffering. Disable outer DP sharding, "
             "NCCL user buffers, fine-grained parameter gather, fused or delayed wgrad, "
             "recompute, activation offload and GTP."
