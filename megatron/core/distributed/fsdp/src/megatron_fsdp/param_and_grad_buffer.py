@@ -3000,9 +3000,17 @@ class ParamAndGradBuffer:
                     # Proxy because the number of gradient parameters is the same
                     # as the number of model parameters.
                     group.params,
-                    # A singleton offloaded shard still accumulates after reduction.
+                    # A mixed-dtype singleton still needs a separate microbatch bucket.
+                    # Otherwise the BF16 reduction adds the FP32 running sum back to itself.
                     is_data_distributed=is_grad_buffer_distributed
-                    and (main_buf_dp_group.size() > 1 or offload_main_grad),
+                    and (
+                        main_buf_dp_group.size() > 1
+                        or offload_main_grad
+                        or (
+                            not self.dist_index.use_hybrid_fsdp
+                            and self.mp_policy.grad_comm_dtype not in (None, group.grad_dtype)
+                        )
+                    ),
                     dtype=group.grad_dtype,
                     device=self.device,
                     # Note: This will be DP-Outer + DP-Shard when sharding

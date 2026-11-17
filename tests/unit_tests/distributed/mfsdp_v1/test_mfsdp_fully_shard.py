@@ -277,6 +277,36 @@ class TestMegatronFsdpFullyShard:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    def test_fsdp2_single_rank_gradient_accumulation(self):
+        """Accumulate each BF16 microbatch gradient once into the FP32 main gradient."""
+        if version.parse(torch.__version__) < version.parse("2.4.0"):
+            pytest.skip("Megatron FSDP requires PyTorch 2.4 or later")
+
+        device_mesh = build_distributed_environment((1, 1, 1, Utils.world_size))
+        layer = torch.nn.Linear(4, 4, bias=False, device="cuda", dtype=torch.bfloat16)
+        model = fully_shard_model(
+            module=layer,
+            device_mesh=device_mesh,
+            dp_shard_dim=DP_SHARD,
+            tp_dim=TP,
+            zero_dp_strategy=OPTIM_GRADS,
+            overlap_param_gather=False,
+            sync_model_each_microbatch=False,
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_grads_dtype=torch.float32, grad_comm_dtype=torch.bfloat16
+            ),
+        )
+
+        for value in (1.0, 2.0):
+            x = torch.full((1, 4), value, device="cuda", dtype=torch.bfloat16)
+            model(x).sum().backward()
+        model.finish_grad_sync()
+
+        grad_buffer = model.param_and_grad_buffer.parameter_groups[0].main_grad_buffer
+        torch.testing.assert_close(
+            grad_buffer.get_item(0), torch.full((16,), 3.0, device="cuda", dtype=torch.float32)
+        )
+
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
         reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",
