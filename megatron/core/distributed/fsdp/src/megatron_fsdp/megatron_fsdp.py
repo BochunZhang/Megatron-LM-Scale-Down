@@ -386,7 +386,7 @@ class MegatronFSDP(torch.nn.Module):
             raise ValueError("CPU gradient accumulation requires eager FSDP2/3 gradient offload.")
         if config.fsdp_cpu_optimizer and (
             not self.cpu_offload_optimizer
-            or not config.fsdp_cpu_grad_accumulation
+            or not (config.fsdp_cpu_grad_accumulation or self.layer_by_layer_cpu_optimizer)
             or self.data_parallel_sharding_strategy != "optim_grads_params"
             or config.fp8_param_gather
             or self.mp_policy.main_params_dtype != torch.float32
@@ -398,6 +398,7 @@ class MegatronFSDP(torch.nn.Module):
         if self.layer_by_layer_cpu_optimizer and (
             not config.fsdp_cpu_optimizer
             or not self.cpu_offload_grad
+            or config.fsdp_cpu_grad_accumulation
             or config.fsdp_nvme_path is not None
             or not config.overlap_grad_reduce
             or config.megatron_fsdp_cuda_graph_mode
@@ -407,7 +408,7 @@ class MegatronFSDP(torch.nn.Module):
         ):
             raise ValueError(
                 "FSDP layer-by-layer CPU AdamW requires TP=1 and eager gradient reduction "
-                "with BF16 communication and FP32 CPU gradient accumulation."
+                "with BF16 communication and direct FP32 gradient offload."
             )
         if config.fsdp_nvme_path is not None and (
             not config.fsdp_nvme_path or not config.fsdp_cpu_optimizer or not self.cpu_offload_weight
@@ -1592,11 +1593,12 @@ class MegatronFSDP(torch.nn.Module):
         # Synchronize gradient reduce-scatter operations for all model gradients.
         self.synchronize_gradient_reduce()
 
-        if self.cpu_offload_grad and not self.layer_by_layer_cpu_optimizer:
+        if self.layer_by_layer_cpu_optimizer:
+            # The pinned shards are read by the host during optimizer finalization.
+            self.side_stream_for_cpu_offload_d2h.synchronize()
+        elif self.cpu_offload_grad:
             # Each reload waits for the D2H event of its latest accumulated shard.
             self.param_and_grad_buffer.reload_offloaded_main_grads()
-        elif self.param_and_grad_buffer.cpu_grad_accumulator is not None:
-            self.param_and_grad_buffer.cpu_grad_accumulator.wait()
 
         # Once the gradients have been reduced and scattered into main_grad_buffer,
         # update the gradients for all buffered weights in optimizer_named_parameters.

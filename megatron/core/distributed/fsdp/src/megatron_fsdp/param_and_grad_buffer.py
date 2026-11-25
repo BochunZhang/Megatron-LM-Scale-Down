@@ -76,14 +76,18 @@ _NVTX_NON_LAYER_PARAMS = (
 )
 
 
-def _nvtx_param_unit(name: str) -> str:
+def _nvtx_param_unit(name: str, *, layer_by_layer: bool) -> str:
     """Return the layer tag of a parameter name for NVTX labels."""
     for pattern, prefix in _NVTX_LAYER_PATTERNS:
         match = pattern.search(name)
         if match:
+            if layer_by_layer and prefix == "L":
+                return f"transformer.{match.group(1)}"
             return f"{prefix}{match.group(1)}"
     for key, tag in _NVTX_NON_LAYER_PARAMS:
         if key in name:
+            if layer_by_layer and tag in ("output_layer", "final_norm"):
+                return "output"
             return tag
     return name.removeprefix("module.").split(".")[0]
 
@@ -94,17 +98,24 @@ def _nvtx_unit_sort_key(unit: str) -> list:
 
 
 def _parameter_group_nvtx_label(
-    params: List[torch.nn.Parameter], param_to_name: Dict[torch.nn.Parameter, str]
+    params: List[torch.nn.Parameter],
+    param_to_name: Dict[torch.nn.Parameter, str],
+    *,
+    layer_by_layer: bool = False,
 ) -> str:
     """Return the NVTX label ``<layers> <kind> <params>`` of a parameter group.
 
     ``<layers>`` lists the layers whose parameters the group holds (``L3``,
     ``mtp0``, ``embedding``, ...), ``<kind>`` is ``expert`` for routed-expert
     groups, ``dense`` otherwise (``mixed`` if both), and ``<params>`` is the
-    unsharded parameter count.
+    unsharded parameter count. Layer-by-layer optimizer runs use dotted labels
+    such as ``transformer.3.dense.123.4M``.
     """
     names = [param_to_name.get(p, "?") for p in params]
-    units = sorted(set(map(_nvtx_param_unit, names)), key=_nvtx_unit_sort_key)
+    units = sorted(
+        {_nvtx_param_unit(name, layer_by_layer=layer_by_layer) for name in names},
+        key=_nvtx_unit_sort_key,
+    )
     num_experts = sum(".experts." in name for name in names)
     if num_experts == 0:
         kind = "dense"
@@ -113,7 +124,8 @@ def _parameter_group_nvtx_label(
     else:
         kind = "mixed"
     numel = sum(p.numel() for p in params)
-    return f"{','.join(units)} {kind} {numel / 1e6:.1f}M"
+    separator = "." if layer_by_layer else " "
+    return separator.join((",".join(units), kind, f"{numel / 1e6:.1f}M"))
 
 
 try:
@@ -2415,7 +2427,11 @@ class ParamAndGradBuffer:
         # Name each bucket once here, so labelling its collectives in NVTX ranges
         # costs no name lookup or size reduction at run time.
         for group in self.parameter_groups:
-            group.nvtx_label = _parameter_group_nvtx_label(group.params, self.param_to_name)
+            group.nvtx_label = _parameter_group_nvtx_label(
+                group.params,
+                self.param_to_name,
+                layer_by_layer=self.ddp_config.fsdp_layer_by_layer_cpu_optimizer,
+            )
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
         self._init_distributed_params()
 
@@ -3154,14 +3170,10 @@ class ParamAndGradBuffer:
                 sizes = defaultdict(int)
                 for i, size in staging_sizes.items():
                     gbuf = self.parameter_groups[i].main_grad_buffer
-                    dtype = gbuf.dtype
-                    if not layer_by_layer_cpu_optimizer:
-                        dtype = self.mp_policy.grad_comm_dtype or dtype
+                    dtype = self.mp_policy.grad_comm_dtype or gbuf.dtype
                     sizes[dtype] = max(sizes[dtype], size)
-                self.cpu_grad_accumulator = CPUGradientAccumulator(
-                    sizes, zero_then_add=layer_by_layer_cpu_optimizer
-                )
-            elif staging_sizes:
+                self.cpu_grad_accumulator = CPUGradientAccumulator(sizes)
+            elif staging_sizes and not layer_by_layer_cpu_optimizer:
                 self.offload_grad_staging_alloc = MaxPoolAllocator(
                     name="fsdp_offload_grad_shards",
                     fsdp_param_groups=self.parameter_groups,
@@ -4784,6 +4796,7 @@ class GradReducePipeline:
         # many empty bucket requests.
         ddp_config = self.buffer.ddp_config
         mp_policy = self.buffer.mp_policy
+        layer_by_layer_cpu_optimizer = ddp_config.fsdp_layer_by_layer_cpu_optimizer
         if ddp_config.fsdp_double_buffer:
             self._enforce_double_buffer_limit(bucket_group)
 
@@ -4794,7 +4807,7 @@ class GradReducePipeline:
         offload_staging = {}
         for bucket_id in bucket_group:
             gbuf = self.get_fsdp_buffer(bucket_id)
-            if not gbuf.cpu_offload:
+            if not gbuf.cpu_offload or layer_by_layer_cpu_optimizer:
                 continue
             if gbuf.is_data_distributed:
                 if self.buffer.cpu_grad_accumulator is not None:
@@ -4921,11 +4934,12 @@ class GradReducePipeline:
             # (cpu_offload_grad_buffer, gradient to offload, cpu_data range)
             grad_d2h_tasks = []
             for gbuf, reduced_grad in grad_offload_closure:
-                if self.buffer.cpu_grad_accumulator is not None:
-                    if ddp_config.fsdp_layer_by_layer_cpu_optimizer:
-                        # Promote the BF16 RS output on GPU, before the D2H stream
-                        # transports it to the FP32 accumulator's pinned slot.
-                        reduced_grad = reduced_grad.to(dtype=gbuf.dtype)
+                if layer_by_layer_cpu_optimizer:
+                    # One grouped backward produces the complete gradient of a stage.
+                    # Promote the reduced shard on GPU before copying it to its main buffer.
+                    assert not gbuf.cpu_data_valid, "Gradient shard already offloaded this step."
+                    grad_d2h_tasks.append((gbuf, reduced_grad.to(dtype=gbuf.dtype), None))
+                elif self.buffer.cpu_grad_accumulator is not None:
                     grad_d2h_tasks.append((gbuf, reduced_grad, None))
                 elif gbuf.is_data_distributed:
                     # Same accumulation as `local_grad += reduced_grad` above, where the
@@ -4953,18 +4967,19 @@ class GradReducePipeline:
             d2h_stream = self.buffer.cpu_offload_d2h_stream
             d2h_stream.wait_event(reduce_scatter_view_out_event)
             for gbuf, grad, cpu_range in grad_d2h_tasks:
-                if self.buffer.cpu_grad_accumulator is not None:
+                if layer_by_layer_cpu_optimizer:
+                    with nvtx_range(lambda: f"fsdp.cpu_grad.d2h bucket={gbuf.bucket_id}"):
+                        offload_event = gbuf.offload_to_cpu(grad, d2h_stream)
+                elif self.buffer.cpu_grad_accumulator is not None:
                     offload_event = self.buffer.cpu_grad_accumulator.submit(grad, gbuf, d2h_stream)
                 else:
                     offload_event = gbuf.offload_to_cpu(grad, d2h_stream, cpu_range)
                 gbuf.cpu_data_reduced = True
                 if not gbuf.is_data_distributed:
                     unsharded_offload_event = offload_event
-            if not ddp_config.fsdp_layer_by_layer_cpu_optimizer:
-                # The D2H source can alias the full bucket or its staging slot.
-                # Layer-major D2H instead reads the separately allocated FP32 cast,
-                # whose recorded D2H stream keeps it alive until the copy completes.
-                reduce_scatter_view_out_event = offload_event
+            # Retire the bucket after D2H so the queue regulates outstanding
+            # copies and the communication bucket or staging storage is safe to reuse.
+            reduce_scatter_view_out_event = offload_event
 
         # DP-Outer Gradient Reduction
         if outer_fsdp_group_grad_reduce:

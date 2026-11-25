@@ -199,7 +199,7 @@ class DistributedDataParallelConfig:
 
     fsdp_layer_by_layer_cpu_optimizer: bool = False
     """Reduce gradients at layer-by-layer stage boundaries, keeping decoder layer 0
-    gradients and optimizer on the GPU and accumulating other gradient shards on CPU."""
+    gradients and optimizer on the GPU and offloading other reduced shards to CPU as FP32."""
 
     fsdp_nvme_path: str | None = None
     """Local NVMe directory for spilling the CPU-offloaded FSDP buffers."""

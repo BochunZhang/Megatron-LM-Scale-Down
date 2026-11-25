@@ -69,8 +69,9 @@ class FSDPCPUAdam(torch.optim.AdamW):
             for _, param in buffers.optimizer_named_parameters:
                 bucket = buffers.param_to_param_group[param.orig_param]
                 params_by_bucket[bucket][param] = param.orig_param
-            for bucket, params_in_bucket in params_by_bucket.items():
-                self.buckets.append((buffers, buffers.parameter_groups[bucket], params_in_bucket))
+            for bucket_id, bucket in enumerate(buffers.parameter_groups):
+                if bucket_id in params_by_bucket:
+                    self.buckets.append((buffers, bucket, params_by_bucket[bucket_id]))
 
     def _moments(self, master, *, load):
         if master.nvme is None:
@@ -87,40 +88,47 @@ class FSDPCPUAdam(torch.optim.AdamW):
         ]
 
     @staticmethod
-    def _step_grace_adam(
-        optimizer, group, weights, grads, averages, squares, steps, *, bucket_id=None
-    ) -> None:
-        native_group = optimizer.param_groups[0]
-        native_group.update(
-            params=weights,
-            lr=group["lr"],
-            betas=group["betas"],
-            eps=group["eps"],
-            weight_decay=group["weight_decay"],
-        )
+    def _step_grace_adam(optimizer, updates, *, label=None) -> None:
+        idle_groups = optimizer.param_groups
+        native_groups = []
+        step_tensors = {}
         try:
             # DeepSpeed borrows the CPU shards while FSDP retains the checkpoint state.
-            for weight, grad, average, square, step in zip(
-                weights, grads, averages, squares, steps
-            ):
-                weight.grad = grad
-                optimizer.state[weight] = {
-                    "step": int(step.item()),
-                    "exp_avg": average,
-                    "exp_avg_sq": square,
-                }
-            if bucket_id is None:
+            for group, weights, grads, averages, squares, steps in updates:
+                native_groups.append(
+                    dict(
+                        idle_groups[0],
+                        params=weights,
+                        lr=group["lr"],
+                        betas=group["betas"],
+                        eps=group["eps"],
+                        weight_decay=group["weight_decay"],
+                    )
+                )
+                for weight, grad, average, square, step in zip(
+                    weights, grads, averages, squares, steps
+                ):
+                    step_tensors[weight] = step
+                    weight.grad = grad
+                    optimizer.state[weight] = {
+                        "step": int(step.item()),
+                        "exp_avg": average,
+                        "exp_avg_sq": square,
+                    }
+
+            optimizer.param_groups = native_groups
+            if label is None:
                 optimizer.step()
             else:
                 # The native call waits for its OpenMP team before returning.
-                with nvtx_range(lambda: f"GraceAdam bucket={bucket_id}"):
+                with nvtx_range(label):
                     optimizer.step()
-            for weight, step in zip(weights, steps):
+            for weight, step in step_tensors.items():
                 step.fill_(optimizer.state[weight]["step"])
         finally:
-            for weight in weights:
+            for weight in step_tensors:
                 weight.grad = None
-            native_group["params"] = []
+            optimizer.param_groups = idle_groups
             optimizer.state.clear()
 
     def _active_bucket_groups(self, groups):
@@ -145,8 +153,14 @@ class FSDPCPUAdam(torch.optim.AdamW):
         moments = self._moments(
             master, load=any(p._local_tensor.numel() and p in self.state for p in params)
         )
-        range_name = "fsdp.layer_by_layer.GPUAdamW" if on_gpu else "fsdp.cpu_optimizer.adamw"
-        with nvtx_range(lambda: f"{range_name} bucket={master.bucket_id}"):
+        grace_updates = []
+        with nvtx_range(
+            lambda: (
+                f"fsdp.layer_by_layer.GPUAdamW bucket={master.bucket_id} {bucket.nvtx_label}"
+                if on_gpu
+                else f"fsdp.cpu_optimizer.adamw bucket={master.bucket_id}"
+            )
+        ):
             for active_params in by_group.values():
                 group = groups[active_params[0]]
                 weights, grads, averages, squares, steps = [], [], [], [], []
@@ -177,16 +191,11 @@ class FSDPCPUAdam(torch.optim.AdamW):
                     squares.append(sq)
                     steps.append(state["step"])
                 if self._grace_adam is not None and not on_gpu:
-                    self._step_grace_adam(
-                        self._grace_adam,
-                        group,
-                        weights,
-                        grads,
-                        averages,
-                        squares,
-                        steps,
-                        bucket_id=master.bucket_id if self._layer_by_layer else None,
-                    )
+                    update = (group, weights, grads, averages, squares, steps)
+                    if self._layer_by_layer:
+                        grace_updates.append(update)
+                    else:
+                        self._step_grace_adam(self._grace_adam, [update])
                     continue
                 beta1, beta2 = group["betas"]
                 adamw(
@@ -204,6 +213,12 @@ class FSDPCPUAdam(torch.optim.AdamW):
                     weight_decay=group["weight_decay"],
                     eps=group["eps"],
                     maximize=False,
+                )
+            if grace_updates:
+                self._step_grace_adam(
+                    self._grace_adam,
+                    grace_updates,
+                    label=lambda: f"GraceAdam bucket={master.bucket_id} {bucket.nvtx_label}",
                 )
         if on_gpu:
             wbuf = bucket.model_weight_buffer
@@ -231,7 +246,7 @@ class FSDPCPUAdam(torch.optim.AdamW):
                 groups, buffers, bucket, params, by_group, bucket.main_weight_buffer.data, None
             )
 
-        # The CPU grad views already reference the accumulated and clipped FP32 shards.
+        # The CPU grad views already reference the finalized and clipped FP32 shards.
         for active in cpu_buckets:
             _, bucket, _, _ = active
             self._update_bucket(groups, *active, bucket.main_weight_buffer.read_cpu_data(), None)

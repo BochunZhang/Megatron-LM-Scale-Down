@@ -87,25 +87,31 @@ def test_grace_adam_updates_restored_fsdp_state(monkeypatch):
     torch.testing.assert_close(state["exp_avg_sq"], 1.0 + gradient.square())
 
 
-def test_layer_by_layer_mixes_gpu_adam_and_accumulated_grace_adam(monkeypatch):
-    params, buckets = [], []
-    for index in range(4):
-        weight = torch.tensor([2.0])
-        gradient = torch.tensor([0.25 * (index + 1)])
-        param = torch.nn.Parameter(weight)
-        param._local_tensor = param.detach()
-        param.orig_param = object()
-        if index == 0:
-            gradient._local_tensor = gradient
-            param.grad = gradient
-        else:
-            param._fsdp_cpu_grad = gradient
-        param_idx = {param.orig_param: 0}
+def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch):
+    params, bucket_params, buckets = [], [], []
+    for index, width in enumerate((1, 2, 1, 1)):
+        weight = torch.full((width,), 2.0)
+        gradient = 0.25 * torch.arange(
+            len(params) + 1, len(params) + width + 1, dtype=torch.float32
+        )
+        group_params = []
+        for item in range(width):
+            param = torch.nn.Parameter(weight[item : item + 1])
+            param._local_tensor = param.detach()
+            param.orig_param = object()
+            grad = gradient[item : item + 1]
+            if index == 0:
+                grad._local_tensor = grad
+                param.grad = grad
+            else:
+                param._fsdp_cpu_grad = grad
+            group_params.append(param)
+        param_idx = {param.orig_param: item for item, param in enumerate(group_params)}
 
         def make_buffer(tensor, *, cpu_offload=False):
             def get_item(item_id, *, only_shard, data=None):
-                assert item_id == 0 and only_shard
-                return tensor if data is None else data
+                assert only_shard
+                return (tensor if data is None else data)[item_id : item_id + 1]
 
             return SimpleNamespace(
                 bucket_id=index,
@@ -118,10 +124,12 @@ def test_layer_by_layer_mixes_gpu_adam_and_accumulated_grace_adam(monkeypatch):
                 read_cpu_data=lambda: tensor,
             )
 
-        params.append(param)
+        params.extend(group_params)
+        bucket_params.append(group_params)
         buckets.append(
             SimpleNamespace(
-                params=[param.orig_param],
+                params=[param.orig_param for param in group_params],
+                nvtx_label=f"transformer.{index}.dense.0.0M",
                 main_weight_buffer=make_buffer(weight, cpu_offload=index > 0),
                 model_weight_buffer=make_buffer(weight.to(torch.bfloat16)),
                 main_grad_buffer=make_buffer(gradient),
@@ -134,25 +142,44 @@ def test_layer_by_layer_mixes_gpu_adam_and_accumulated_grace_adam(monkeypatch):
     def nvtx_range(message):
         label = message()
         if label.startswith(("fsdp.layer_by_layer.", "GraceAdam ")):
-            events.append(label.split(".")[-1])
+            events.append(label.removeprefix("fsdp.layer_by_layer."))
         yield
 
     monkeypatch.setattr(fsdp_adam, "nvtx_range", nvtx_range)
 
-    grace_adam = SimpleNamespace(param_groups=[{"params": []}], state={})
-    expected_cpu_grads = iter(param._fsdp_cpu_grad for param in params[1:])
+    idle_groups = [{"params": [], "bias_correction": True}]
+    grace_adam = SimpleNamespace(param_groups=idle_groups, state={})
+    grace_calls = []
 
     def grace_step():
-        (weight,) = grace_adam.param_groups[0]["params"]
-        assert weight.grad.data_ptr() == next(expected_cpu_grads).data_ptr()
-        weight.sub_(weight.grad)
-        grace_adam.state[weight]["step"] += 1
+        updated = []
+        for group in grace_adam.param_groups:
+            assert group["bias_correction"]
+            for weight in group["params"]:
+                updated.append(
+                    (
+                        weight.grad.data_ptr(),
+                        group["lr"],
+                        group["betas"],
+                        group["eps"],
+                        group["weight_decay"],
+                    )
+                )
+                weight.sub_(weight.grad, alpha=group["lr"])
+                grace_adam.state[weight]["step"] += 1
+        grace_calls.append(updated)
 
     grace_adam.step = grace_step
     monkeypatch.setattr(fsdp_adam, "_create_grace_adam", lambda: grace_adam)
     buffers = SimpleNamespace(
-        optimizer_named_parameters=[(str(index), param) for index, param in enumerate(params)],
-        param_to_param_group={param.orig_param: index for index, param in enumerate(params)},
+        optimizer_named_parameters=[
+            ("weight", param) for group_params in reversed(bucket_params) for param in group_params
+        ],
+        param_to_param_group={
+            param.orig_param: index
+            for index, group_params in enumerate(bucket_params)
+            for param in group_params
+        },
         parameter_groups=buckets,
         commit_cpu_optimizer_bucket=Mock(),
     )
@@ -160,16 +187,38 @@ def test_layer_by_layer_mixes_gpu_adam_and_accumulated_grace_adam(monkeypatch):
         param_and_grad_buffer=buffers,
         ddp_config=SimpleNamespace(fsdp_layer_by_layer_cpu_optimizer=True),
     )
-    optimizer = fsdp_adam.FSDPCPUAdam([{"params": params}], [chunk], backend="grace_adam", lr=0.1)
+    optimizer = fsdp_adam.FSDPCPUAdam(
+        [
+            {"params": params[:2] + params[3:]},
+            {
+                "params": [params[2]],
+                "lr": 0.05,
+                "betas": (0.8, 0.9),
+                "eps": 1e-6,
+                "weight_decay": 0.0,
+            },
+        ],
+        [chunk],
+        backend="grace_adam",
+        lr=0.1,
+    )
     clip_grads.clip_grad_by_total_norm_fp32(params[1:], max_norm=0.5, total_norm=1.0)
     optimizer.step()
 
     assert events == [
-        "GPUAdamW bucket=0",
-        "GraceAdam bucket=1",
-        "GraceAdam bucket=2",
-        "GraceAdam bucket=3",
+        "GPUAdamW bucket=0 transformer.0.dense.0.0M",
+        "GraceAdam bucket=1 transformer.1.dense.0.0M",
+        "GraceAdam bucket=2 transformer.2.dense.0.0M",
+        "GraceAdam bucket=3 transformer.3.dense.0.0M",
     ]
+    grad_ptrs = [param._fsdp_cpu_grad.data_ptr() for param in params[1:]]
+    default = (0.1, (0.9, 0.999), 1e-8, 0.01)
+    assert grace_calls == [
+        [(grad_ptrs[0], *default), (grad_ptrs[1], 0.05, (0.8, 0.9), 1e-6, 0.0)],
+        [(grad_ptrs[2], *default)],
+        [(grad_ptrs[3], *default)],
+    ]
+    assert grace_adam.param_groups is idle_groups and not grace_adam.state
     reference = torch.nn.Parameter(torch.tensor([2.0]))
     reference.grad = torch.tensor([0.25])
     torch.optim.AdamW([reference], lr=0.1).step()
@@ -178,7 +227,8 @@ def test_layer_by_layer_mixes_gpu_adam_and_accumulated_grace_adam(monkeypatch):
     assert buffers.commit_cpu_optimizer_bucket.call_count == 3
     for index, param in enumerate(params[1:], start=1):
         grad = 0.25 * (index + 1) * (0.5 / (1.0 + 1.0e-6))
-        torch.testing.assert_close(param, torch.tensor([2.0 - grad]))
+        lr = 0.05 if index == 2 else 0.1
+        torch.testing.assert_close(param, torch.tensor([2.0 - lr * grad]))
         assert optimizer.state[param]["step"].item() == 1
 
 

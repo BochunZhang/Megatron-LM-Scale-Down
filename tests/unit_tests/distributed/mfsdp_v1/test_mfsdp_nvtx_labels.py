@@ -47,6 +47,39 @@ def test_parameter_group_nvtx_label_names_layer_kind_and_size(fake_buffer):
     ]
 
 
+def test_layer_by_layer_nvtx_labels_use_stage_names():
+    names = (
+        "module.embedding.word_embeddings.weight",
+        "module.decoder.layers.0.self_attention.linear_qkv.weight",
+        "module.decoder.final_layernorm.weight",
+        "module.output_layer.weight",
+    )
+    params = [
+        torch.nn.Parameter(torch.empty(size, device="meta"))
+        for size in (500_000, 2_000_000, 100, 3_000_000)
+    ]
+    param_to_name = dict(zip(params, names))
+    groups = [
+        types.SimpleNamespace(
+            nvtx_label=_parameter_group_nvtx_label(group, param_to_name, layer_by_layer=True)
+        )
+        for group in ([params[0]], [params[1]], params[2:])
+    ]
+    assert [group.nvtx_label for group in groups] == [
+        "embedding.dense.0.5M",
+        "transformer.0.dense.2.0M",
+        "output.dense.3.0M",
+    ]
+    pipeline = types.SimpleNamespace(
+        buffer=types.SimpleNamespace(parameter_groups=groups),
+        _nvtx_collective="RS",
+        _nvtx_labels={},
+    )
+    assert GradReducePipeline.grad_reduce_nvtx_label(pipeline, [1, 2]) == (
+        "FSDP RS transformer.0.dense.2.0M + output.dense.3.0M"
+    )
+
+
 def test_all_gather_nvtx_label_separates_prefetched_buckets(fake_buffer):
     pipeline = types.SimpleNamespace(buffer=fake_buffer, _nvtx_labels={})
     label = AllGatherPipeline.all_gather_nvtx_label(pipeline, [0, 1, 2], {0}, bwd=True)
