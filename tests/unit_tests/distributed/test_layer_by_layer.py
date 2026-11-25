@@ -167,6 +167,10 @@ def test_layer_by_layer_matches_unsharded_adamw(
         eps=eps,
         weight_decay=decay,
     ) as trainer:
+        cpu_parameters = tier.removesuffix("_param") == "cpu"
+        assert trainer.parameter_backend == ("megatron_fsdp" if cpu_parameters else "layer_by_layer")
+        if cpu_parameters:
+            assert trainer.weights.pool.size == 2
         if tier == "gpu":
             assert not trainer.weights.host and not trainer.weights.local
         for step in range(2):
@@ -181,6 +185,15 @@ def test_layer_by_layer_matches_unsharded_adamw(
             expected_loss = _reference_step(reference, batches, optimizer)
             assert actual_loss == pytest.approx(expected_loss, abs=1e-6, rel=1e-5)
             _assert_weights(trainer, reference)
+            if cpu_parameters:
+                # The loss head's forward bucket remains bound for backward.
+                assert trainer.weights.reloads == (step + 1) * (2 * len(trainer.units) - 1)
+                for unit in trainer.units:
+                    for bucket in unit.buckets:
+                        weight_buffer = bucket.weight_buffer
+                        assert weight_buffer is not None and weight_buffer.data is None
+                        host = weight_buffer.cpu_data
+                        assert host is not None and host.device.type == "cpu" and host.is_pinned()
             boundaries = (step + 1) * (len(modules) - 1) * len(batches)
             storage = activation_tier.removesuffix("_act")
             d2h = 0 if storage == "gpu" else boundaries

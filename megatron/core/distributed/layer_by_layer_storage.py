@@ -6,10 +6,13 @@ import mmap
 import os
 from pathlib import Path
 from threading import local
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from torch.optim._functional import adamw
+
+if TYPE_CHECKING:
+    from .fsdp.src.megatron_fsdp.param_and_grad_buffer import DataParallelBuffer
 
 try:
     import megatron_nvme_aio
@@ -102,6 +105,7 @@ class OffloadedShard:
         optimizer_tier: StorageTier,
         device: torch.device,
         weight_decay: float,
+        weight_buffer: "DataParallelBuffer | None" = None,
     ) -> None:
         if parameter_tier not in {"gpu", "cpu", "nvme"}:
             raise ValueError(f"Unknown layer-by-layer parameter tier {parameter_tier!r}")
@@ -120,6 +124,7 @@ class OffloadedShard:
         self._weight_decay = weight_decay
         self._parameter_tier = parameter_tier
         self._optimizer_tier = optimizer_tier
+        self._weight_buffer = weight_buffer
         cpu = torch.device("cpu")
         parameter_device = device if parameter_tier == "gpu" else cpu
         optimizer_device = device if optimizer_tier == "gpu" else cpu
@@ -133,7 +138,14 @@ class OffloadedShard:
             directory.mkdir(parents=True)
 
         initial = initial.detach()
-        parameter = initial.to(device=parameter_device, copy=parameter_tier != "nvme")
+        if weight_buffer is None:
+            parameter = initial.to(device=parameter_device, copy=parameter_tier != "nvme")
+        else:
+            assert parameter_tier == "cpu"
+            parameter = weight_buffer.new_cpu_data()
+            parameter.copy_(initial)
+            weight_buffer.init_data(parameter)
+            weight_buffer.store_cpu_data(parameter)
         if parameter_tier == "nvme":
             write_tensor(self._parameter_path, parameter)
         else:
@@ -228,5 +240,9 @@ class OffloadedShard:
             self._optimizer_state = None
         if self._parameter is None:
             write_tensor(self._parameter_path, master.to(device="cpu", dtype=self.dtype))
+        elif self._weight_buffer is not None and master.is_cuda:
+            self._weight_buffer.offload_to_cpu(
+                master.to(dtype=self.dtype), torch.cuda.current_stream(master.device)
+            )
         else:
             self._parameter.copy_(master)

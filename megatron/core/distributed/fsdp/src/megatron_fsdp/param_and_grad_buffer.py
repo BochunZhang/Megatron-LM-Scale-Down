@@ -949,6 +949,8 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
     is pre-computed to recycle buffers across different FSDP units. To efficiently allocate
     buckets, size maxima are stratified by dtype, and FSDP unit bucket assignments are
     sorted such that the smallest bucket is assigned to the smallest buffer in the pool.
+    Schedules that have already released parameter storage can pass the padded sizes
+    via `bucket_sizes` instead of deriving them from the parameter tensors.
     """
 
     def __init__(
@@ -959,6 +961,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         dtype_fn: Callable[["ParameterGroup"], torch.dtype] = operator.attrgetter("dtype"),
         fallback_to_persistent_buffer: bool = False,
         memory_buffer: Optional[GlobalMemoryBuffer] = None,
+        bucket_sizes: Optional[Dict[int, int]] = None,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
@@ -981,7 +984,9 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         self.fsdp_unit_buckets = fsdp_unit_buckets
 
         # Asymmetrical Max-Pool Double Buffers
-        self._build_fixed_max_pool()
+        self._build_fixed_max_pool(bucket_sizes)
+        if bucket_sizes is not None:
+            self.reserve_slots(bucket_sizes)
 
         # --- Fixed Pool Buffering Check ---
         # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
@@ -1035,7 +1040,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                 _, offset = self.bucket_alloc_index[bucket_id]
                 self.bucket_alloc_index[bucket_id] = (index % self.size, offset)
 
-    def _build_fixed_max_pool(self):
+    def _build_fixed_max_pool(self, precomputed_sizes: Optional[Dict[int, int]] = None):
         """
         Compute the maximum double-buffer pool required to support all FSDP units.
         """
@@ -1047,7 +1052,11 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
             for bucket_id in fsdp_unit_bucket_ids:
                 # Get the parameter group dtype and size.
                 pg = self.fsdp_param_groups[bucket_id]
-                num_group_elements = sum(p.numel() for p in pg.params)
+                num_group_elements = (
+                    precomputed_sizes[bucket_id]
+                    if precomputed_sizes is not None
+                    else sum(p.numel() for p in pg.params)
+                )
                 bucket_dtype = self.dtype_fn(pg)
                 dtype_bucket_sizes = unit_dtype_bucket_sizes.setdefault(bucket_dtype, [])
                 dtype_bucket_sizes.append(

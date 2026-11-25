@@ -14,6 +14,9 @@ from torch import Tensor
 from torch import distributed as dist
 from torch import nn
 
+from .fsdp.src.megatron_fsdp.distributed_data_parallel_config import DistributedDataParallelConfig
+from .fsdp.src.megatron_fsdp.param_and_grad_buffer import DataParallelBuffer
+from .layer_by_layer_fsdp import _FSDPWeightSlots
 from .layer_by_layer_storage import OffloadedShard, read_tensor, write_tensor
 
 _GroupKey = tuple[torch.dtype, bool]
@@ -27,15 +30,32 @@ class _Bucket:
     sizes: list[int]
     shard_size: int
     shard: OffloadedShard
+    weight_buffer: DataParallelBuffer | None = None
 
     @classmethod
     def create(
-        cls, key, params, directory, *, rank, world, tier, optimizer_tier, device, weight_decay
+        cls,
+        key,
+        params,
+        directory,
+        *,
+        rank,
+        world,
+        tier,
+        optimizer_tier,
+        device,
+        weight_decay,
+        weight_buffer=None,
     ):
         shapes = [param.shape for param in params]
         sizes = [param.numel() for param in params]
         shard_size = (sum(sizes) + world - 1) // world
         start = rank * shard_size
+        if weight_buffer is not None:
+            # FSDP uses the same flat layout with chunk_size_factor=1.
+            assert weight_buffer.data_size == shard_size
+            assert weight_buffer.shard_bucket_index.bucket_data_index == start
+            assert [item.size for item in weight_buffer.bucket_index.items] == sizes
         end = start + shard_size
         shard_device = device if "gpu" in (tier, optimizer_tier) else "cpu"
         initial = torch.zeros(shard_size, dtype=key[0], device=shard_device)
@@ -55,8 +75,9 @@ class _Bucket:
             optimizer_tier=optimizer_tier,
             device=device,
             weight_decay=weight_decay if key[1] else 0.0,
+            weight_buffer=weight_buffer,
         )
-        return cls(key, params, shapes, sizes, shard_size, shard)
+        return cls(key, params, shapes, sizes, shard_size, shard, weight_buffer)
 
     def bind(self, full: Tensor) -> None:
         for param, flat, shape in zip(
@@ -459,6 +480,7 @@ class LayerByLayerTrainer:
     batches. The last unit returns a scalar loss. All other units return new
     hidden-state tensors of the same shape and dtype.
     The trainer owns its worker threads and uses the caller's scratch directory.
+    CPU parameter shards use Megatron-FSDP's host buffers and GPU double buffer.
     """
 
     def __init__(
@@ -493,6 +515,15 @@ class LayerByLayerTrainer:
         self.param_count = 0
         self.units = []
         self.activations: _Activations | _GpuActivations | None = None
+        fsdp_config = None
+        weight_bucket_id = 0
+        if tier == "cpu":
+            fsdp_config = DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                fsdp_cpu_offload=("weight",),
+                fsdp_double_buffer=True,
+                megatron_fsdp_max_pool_double_buffer=True,
+            )
         seen = set()
         for index, module in enumerate(modules):
             groups: dict[_GroupKey, list[nn.Parameter]] = {}
@@ -511,6 +542,18 @@ class LayerByLayerTrainer:
                 groups.setdefault((param.dtype, param.ndim > 1), []).append(param)
             buckets = []
             for number, (key, params) in enumerate(groups.items()):
+                weight_buffer = None
+                if fsdp_config is not None:
+                    weight_buffer = DataParallelBuffer(
+                        fsdp_config,
+                        params,
+                        is_data_distributed=True,
+                        bucket_id=weight_bucket_id,
+                        device=device,
+                        data_parallel_group=group,
+                        cpu_offload=True,
+                    )
+                    weight_bucket_id += 1
                 bucket = _Bucket.create(
                     key,
                     params,
@@ -521,6 +564,7 @@ class LayerByLayerTrainer:
                     optimizer_tier=optimizer_tier,
                     device=device,
                     weight_decay=weight_decay,
+                    weight_buffer=weight_buffer,
                 )
                 bucket.unbind(torch.empty(0, dtype=key[0], device=device))
                 buckets.append(bucket)
@@ -543,14 +587,19 @@ class LayerByLayerTrainer:
                     "adam-update",
                 )
             ]
-            self.weights = _WeightSlots(
-                self.units,
-                self.device,
-                self.group,
-                readers[0],
-                parameter_tier=self.parameter_tier,
-                initialized=self._initialized,
-            )
+            if self.parameter_tier == "cpu":
+                self.weights = _FSDPWeightSlots(
+                    self.units, self.device, self.group, initialized=self._initialized
+                )
+            else:
+                self.weights = _WeightSlots(
+                    self.units,
+                    self.device,
+                    self.group,
+                    readers[0],
+                    parameter_tier=self.parameter_tier,
+                    initialized=self._initialized,
+                )
             self.activation_reader, self.activation_writer = readers[1:3]
             if self.optimizer_tier == "gpu":
                 self.updates = _GpuUpdates(
@@ -574,6 +623,18 @@ class LayerByLayerTrainer:
 
     def __exit__(self, *exc):
         return self.workers.__exit__(*exc)
+
+    @property
+    def parameter_backend(self) -> str:
+        """Return the parameter storage backend selected by the trainer."""
+        return "megatron_fsdp" if self.parameter_tier == "cpu" else "layer_by_layer"
+
+    @property
+    def parameter_prefetch_stats(self) -> tuple[int, int]:
+        """Return FSDP GPU slots and CPU-to-GPU unit reloads after CUDA synchronization."""
+        if isinstance(self.weights, _FSDPWeightSlots):
+            return self.weights.pool.size, self.weights.reloads
+        return 0, 0
 
     @property
     def activation_transfer_counts(self) -> tuple[int, int]:
