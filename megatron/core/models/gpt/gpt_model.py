@@ -2,6 +2,7 @@
 
 import logging
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -46,6 +47,56 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _GPTLayerByLayerSchedulePlan:
+    """One microbatch's inputs for layer-major GPT training."""
+
+    model: "GPTModel"
+    input_ids: Tensor
+    position_ids: Tensor
+    attention_mask: Tensor | None
+    labels: Tensor
+    packed_seq_params: PackedSeqParams | None
+    loss_mask: Tensor | None
+    rotary_pos_emb: Tensor | None = field(init=False, default=None)
+
+    def num_layers(self) -> int:
+        return len(self.model.decoder.layers)
+
+    def preprocess(self) -> Tensor:
+        hidden_states, self.rotary_pos_emb, *_ = self.model._preprocess(
+            input_ids=self.input_ids,
+            position_ids=self.position_ids,
+            packed_seq_params=self.packed_seq_params,
+        )
+        return hidden_states
+
+    def forward_layer(self, index: int, hidden_states: Tensor) -> Tensor:
+        hidden_states, _ = self.model.decoder.layers[index](
+            hidden_states=hidden_states,
+            attention_mask=self.attention_mask,
+            rotary_pos_emb=self.rotary_pos_emb,
+            packed_seq_params=self.packed_seq_params,
+        )
+        return hidden_states
+
+    def postprocess(self, hidden_states: Tensor) -> Tensor:
+        if self.model.decoder.final_layernorm is not None:
+            hidden_states = self.model.decoder.final_layernorm(hidden_states)
+        return self.model._postprocess(
+            hidden_states=hidden_states,
+            input_ids=self.input_ids,
+            position_ids=self.position_ids,
+            labels=self.labels,
+            rotary_pos_emb=self.rotary_pos_emb,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            loss_mask=self.loss_mask,
+            attention_mask=self.attention_mask,
+            packed_seq_params=self.packed_seq_params,
+        ).float()
 
 
 class GPTModel(LanguageModule):
@@ -794,6 +845,41 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    def build_layer_by_layer_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor | None,
+        labels: Tensor,
+        *,
+        packed_seq_params: PackedSeqParams | None = None,
+        loss_mask: Tensor | None = None,
+    ) -> _GPTLayerByLayerSchedulePlan:
+        """Expose the normal GPT embedding, decoder layers, and loss head to the PP=1 schedule.
+
+        Args:
+            input_ids: Input tokens for one microbatch.
+            position_ids: Token positions for the microbatch.
+            attention_mask: Mask passed to each decoder layer.
+            labels: Next-token targets.
+            packed_seq_params: Packed sequence metadata, if applicable.
+            loss_mask: Mask identifying which token losses contribute to training.
+
+        Returns:
+            A plan that executes model stages one at a time.
+        """
+        if not (self.pre_process and self.post_process) or self.mtp_process:
+            raise ValueError("Layer-by-layer GPT training requires PP=1 without multi-token prediction.")
+        return _GPTLayerByLayerSchedulePlan(
+            model=self,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            packed_seq_params=packed_seq_params,
+            loss_mask=loss_mask,
+        )
 
     def build_schedule_plan(
         self,

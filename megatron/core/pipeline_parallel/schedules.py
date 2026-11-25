@@ -6,8 +6,9 @@ from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
+from torch.utils.checkpoint import checkpoint
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -31,9 +32,9 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_model_config,
     get_model_type,
+    nvtx_decorator,
     nvtx_range_pop,
     nvtx_range_push,
-    nvtx_decorator,
 )
 
 from .combined_1f1b import (
@@ -50,6 +51,8 @@ def get_forward_backward_func(
     pp_size: Optional[int] = None,
     vp_size: Optional[int] = None,
     schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    *,
+    layer_by_layer: bool = False,
 ):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -145,14 +148,22 @@ def get_forward_backward_func(
             Otherwise, provided values are used as-is and None is treated as an explicit input.
         schedule_pg_collection (Optional[MultiModuleProcessGroupCollection]): When a
             multi-module (cross-grid) collection is passed, select the bridge schedule.
+        layer_by_layer: Schedule all microbatches at each layer before advancing.
 
     """
     if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
+        if layer_by_layer:
+            raise ValueError("Layer-by-layer scheduling requires a single model.")
         return forward_backward_pipelining_without_interleaving
 
     if pp_size is None and vp_size is None:
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+    if layer_by_layer:
+        if pp_size != 1 or vp_size is not None:
+            raise ValueError("Layer-by-layer scheduling requires PP=1 without virtual pipelining.")
+        return layer_by_layer_forward_backward_no_pipelining
 
     if pp_size > 1:
         if vp_size is not None:
@@ -878,6 +889,156 @@ def forward_backward_no_pipelining(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs(training_model=None if forward_only else model)
 
+    return forward_data_store
+
+
+@nvtx_decorator()
+def layer_by_layer_forward_backward_no_pipelining(
+    *,
+    forward_step_func: Callable,
+    data_iterator: Iterator | list[Iterator],
+    model: torch.nn.Module | list[torch.nn.Module],
+    num_microbatches: int,
+    seq_length: int,  # unused
+    micro_batch_size: int,  # unused
+    decoder_seq_length: int | None = None,  # unused
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool | None = None,
+    adjust_tensor_shapes_fn: Callable | None = None,
+    p2p_communicator: P2PCommunicator | None = None,  # unused
+    pg_collection: ProcessGroupCollection | None = None,
+    force_all_reduce: bool | None = False,
+) -> list:
+    """Run a dense PP=CP=1 step with all microbatches grouped by model layer.
+
+    The forward step supplies one plan and the ordinary loss callback per
+    microbatch. Each plan executes preprocessing, decoder layers, and
+    postprocessing using the resident model. The schedule passes detached
+    activations and their gradients across those boundaries.
+    """
+    if isinstance(model, list):
+        assert len(model) == 1, "Layer-by-layer scheduling requires one model chunk."
+        model = model[0]
+    if isinstance(data_iterator, list):
+        assert len(data_iterator) == 1, "Layer-by-layer scheduling requires one data iterator."
+        data_iterator = data_iterator[0]
+    assert (
+        adjust_tensor_shapes_fn is None
+    ), "Layer-by-layer scheduling does not support shape adjustments."
+    assert num_microbatches > 0, "Layer-by-layer scheduling requires at least one microbatch."
+
+    if pg_collection is None:
+        pg_collection = _build_default_pg_collection()
+    if pg_collection.pp.size() != 1 or pg_collection.cp.size() != 1:
+        raise ValueError("Layer-by-layer scheduling requires PP=CP=1.")
+    config = get_model_config(model)
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+        config.timers('forward-compute', log_level=2).start()
+
+    if check_first_val_step(first_val_step, forward_only, True) and hasattr(
+        model, 'set_is_first_microbatch'
+    ):
+        model.set_is_first_microbatch()
+    set_input_tensor = get_attr_wrapped_model(model, 'set_input_tensor')
+    set_input_tensor([None])
+    autocast = (
+        partial(torch.autocast, 'cuda', dtype=config.autocast_dtype)
+        if config.enable_autocast
+        else contextlib.nullcontext
+    )
+    with autocast():
+        plans, loss_funcs = zip(
+            *(
+                forward_step_func(data_iterator, model, return_schedule_plan=True)
+                for _ in range(num_microbatches)
+            )
+        )
+        hidden_states = tuple(plan.preprocess() for plan in plans)
+
+    def forward_layer(layer_index: int, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        with autocast():
+            return tuple(
+                plan.forward_layer(layer_index, value)
+                for plan, value in zip(plans, inputs, strict=True)
+            )
+
+    # One checkpoint per layer keeps its boundary activations and groups all
+    # microbatches in the checkpoint's inner backward. DDP sees one accumulated
+    # gradient per parameter when its AccumulateGrad hook fires.
+    stages = []
+    inputs: tuple[torch.Tensor, ...] = ()
+    for layer_index in range(plans[0].num_layers()):
+        if forward_only:
+            hidden_states = forward_layer(layer_index, *hidden_states)
+        else:
+            stages.append((inputs, hidden_states))
+            inputs = tuple(value.detach().requires_grad_() for value in hidden_states)
+            hidden_states = tensor_parallel.checkpoint(
+                partial(forward_layer, layer_index), False, *inputs
+            )
+
+    if config.timers is not None:
+        config.timers('forward-compute').stop()
+
+    if forward_only:
+        head_inputs = hidden_states
+    else:
+        stages.append((inputs, hidden_states))
+        head_inputs = tuple(value.detach().requires_grad_() for value in hidden_states)
+
+    forward_data_store = []
+    losses = []
+    total_num_tokens = torch.zeros([], dtype=torch.int, device=head_inputs[0].device)
+    for plan, loss_func, value in zip(plans, loss_funcs, head_inputs, strict=True):
+        if config.timers is not None:
+            config.timers('forward-compute', log_level=2).start()
+        with autocast():
+            if forward_only:
+                output = plan.postprocess(value)
+            else:
+                # Keep large vocabulary projections out of the retained graphs.
+                output = checkpoint(plan.postprocess, value, use_reentrant=False)
+        loss, num_tokens = forward_step_calc_loss(
+            model,
+            output,
+            loss_func,
+            config,
+            None,
+            collect_non_loss_data,
+            num_microbatches,
+            forward_data_store,
+            pg_collection.cp.size(),
+            is_last_stage=True,
+        )
+        total_num_tokens += num_tokens
+        if not forward_only:
+            if config.grad_scale_func is not None:
+                loss = config.grad_scale_func(loss)
+            losses.append(loss)
+
+    if not forward_only:
+        if config.timers is not None:
+            config.timers('backward-compute', log_level=2).start()
+        torch.autograd.backward(losses)
+        inputs = head_inputs
+        while stages:
+            grad_outputs = tuple(value.grad for value in inputs)
+            inputs, outputs = stages.pop()
+            torch.autograd.backward(outputs, grad_outputs)
+        if config.timers is not None:
+            config.timers('backward-compute').stop()
+        if config.finalize_model_grads_func is not None:
+            config.finalize_model_grads_func(
+                [model],
+                total_num_tokens if config.calculate_per_token_loss else None,
+                pg_collection=pg_collection,
+                force_all_reduce=force_all_reduce,
+            )
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
     return forward_data_store
 
 
