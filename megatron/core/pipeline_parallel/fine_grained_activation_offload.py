@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import defaultdict, deque
-from contextlib import nullcontext
-from typing import Any, Dict, Optional, Tuple
+from contextlib import contextmanager, nullcontext
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
@@ -822,6 +822,145 @@ class PipelineOffloadManager:
         return self.cur_backward_chunk().tensor_pop(saved_state)
 
 
+def _copy_tensor_to_cpu(
+    src_tensor: torch.Tensor, *, pin_memory: bool, cpu_tensor_pool: OffloadTensorPool | None = None
+) -> torch.Tensor:
+    if not src_tensor.is_contiguous():
+        src_tensor = src_tensor.contiguous()
+    if cpu_tensor_pool is not None:
+        cpu_backup = cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
+    else:
+        cpu_backup = torch.empty(
+            src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
+        )
+    cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
+    return cpu_backup
+
+
+def _copy_tensor_to_device(
+    device: torch.device, cpu_backup: torch.Tensor, *, non_blocking: bool
+) -> torch.Tensor:
+    gpu_tensor = torch.empty(
+        cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=device
+    )
+    gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
+    return gpu_tensor
+
+
+class LayerByLayerActivationOffload:
+    """Manage saved checkpoint boundaries for one eager layer-major schedule."""
+
+    def __init__(self) -> None:
+        manager = PipelineOffloadManager.get_instance()
+        self.d2h_stream = manager.d2h_stream
+        self.h2d_stream = manager.h2d_stream
+        self._groups: dict[int, dict[int, OffloadTensorGroup]] = {}
+        self._active_group: int | None = None
+        self._pending: deque[int] = deque()
+
+    @contextmanager
+    def checkpoint(
+        self, group_id: int, name: str, *, microbatch: int | None = None
+    ) -> Iterator[None]:
+        """Collect and offload the input tensors saved by a checkpoint.
+
+        A grouped decoder checkpoint saves one boundary per microbatch in order.
+        An output checkpoint supplies its microbatch explicitly and can save a
+        dummy CPU tensor, which stays on its original device.
+        """
+        groups: dict[int, OffloadTensorGroup] = {}
+        next_microbatch = 0
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor | tuple[int, int, int]:
+            nonlocal next_microbatch
+            mb = next_microbatch if microbatch is None else microbatch
+            next_microbatch += 1
+            if not tensor.is_cuda or not tensor.numel():
+                return tensor.detach()
+            if mb not in groups:
+                groups[mb] = OffloadTensorGroup(f"{name} microbatch={mb}")
+            group = groups[mb]
+            tag = (mb, group_id, len(group._tensors))
+            group.push_tensor(tag, tensor.detach())
+            return tag
+
+        with saved_tensors_hooks(pack, self._unpack):
+            yield
+        if not groups:
+            return
+
+        stage = self._groups.setdefault(group_id, {})
+        if stage.keys() & groups.keys():
+            raise RuntimeError(f"Activation checkpoints for group {group_id} overlap.")
+        self.d2h_stream.wait_stream(torch.cuda.current_stream())
+        for mb, group in groups.items():
+            with (
+                torch.cuda.nvtx.range(f"activation offloading {group._name}"),
+                torch.cuda.stream(self.d2h_stream),
+            ):
+                for tag, tensor in group._tensors.items():
+                    host = _copy_tensor_to_cpu(tensor, pin_memory=True)
+                    tensor.record_stream(self.d2h_stream)
+                    group.push_tensor(tag, (tensor.device, host))
+                group.record_offload_event(self.d2h_stream)
+            stage[mb] = group
+
+    @contextmanager
+    def backward_group(self, group_id: int) -> Iterator[None]:
+        """Allow reloads only for the current backward group."""
+        if self._active_group is not None:
+            raise RuntimeError("Activation backward groups cannot overlap.")
+        stage = self._groups.get(group_id, {})
+        self._active_group = group_id
+        self._pending = deque(sorted(stage))
+        try:
+            if self._pending:
+                # The preceding layer's backward must complete before this
+                # layer starts staging inputs, even on a separate CUDA stream.
+                self.h2d_stream.wait_stream(torch.cuda.current_stream())
+                self._reload_through(self._pending[0])
+            yield
+            if any(group._tensors for group in stage.values()):
+                raise RuntimeError(f"Activation backward group {group_id} has unconsumed tensors.")
+        finally:
+            self._groups.pop(group_id, None)
+            self._pending.clear()
+            self._active_group = None
+
+    def _reload_through(self, microbatch: int) -> None:
+        assert self._active_group is not None
+        stage = self._groups[self._active_group]
+        while self._pending and self._pending[0] <= microbatch:
+            group = stage[self._pending.popleft()]
+            with (
+                torch.cuda.nvtx.range(f"activation reloading {group._name}"),
+                torch.cuda.stream(self.h2d_stream),
+            ):
+                group.wait_offload_event(self.h2d_stream)
+                for tag, (device, host) in group._tensors.items():
+                    tensor = _copy_tensor_to_device(device, host, non_blocking=True)
+                    group.push_tensor(tag, tensor)
+                group.record_reload_event(self.h2d_stream)
+
+    def _unpack(self, saved: torch.Tensor | tuple[int, int, int]) -> torch.Tensor:
+        if isinstance(saved, torch.Tensor):
+            return saved
+        mb, group_id, _ = saved
+        if group_id != self._active_group:
+            raise RuntimeError(
+                f"Attempted to reload activation group {group_id} outside its backward."
+            )
+        # The output graph may request microbatches out of order. Dispatch
+        # the missing prefix and one lookahead for the current stage only.
+        self._reload_through(mb + 1)
+        group = self._groups[group_id][mb]
+        compute_stream = torch.cuda.current_stream()
+        group.wait_reload_event(compute_stream)
+        tensor = group.pop_tensor(saved)
+        tensor.record_stream(compute_stream)
+        return tensor
+
+
 class ChunkOffloadHandler:
     """
     Handles activation offloading and reloading for a single pipeline chunk (microbatch).
@@ -831,18 +970,11 @@ class ChunkOffloadHandler:
     def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
         """Offload."""
         debug_rank("--------offload")
-
-        if not src_tensor.is_contiguous():
-            src_tensor = src_tensor.contiguous()
-
-        if use_cpu_pool:
-            cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
-        else:
-            cpu_backup = torch.empty(
-                src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
-            )
-
-        cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
+        cpu_backup = _copy_tensor_to_cpu(
+            src_tensor,
+            pin_memory=pin_memory,
+            cpu_tensor_pool=self.cpu_tensor_pool if use_cpu_pool else None,
+        )
         state = (src_tensor.device, cpu_backup, use_cpu_pool)
         return state
 
@@ -852,10 +984,7 @@ class ChunkOffloadHandler:
         dev, cpu_backup, use_cpu_pool = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
-        gpu_tensor = torch.empty(
-            cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
-        )
-        gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
+        gpu_tensor = _copy_tensor_to_device(dev, cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
         return gpu_tensor

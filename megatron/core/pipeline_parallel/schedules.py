@@ -13,6 +13,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    LayerByLayerActivationOffload,
+)
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
@@ -893,6 +896,21 @@ def forward_backward_no_pipelining(
     return forward_data_store
 
 
+class _LayerByLayerBoundary(torch.autograd.Function):
+    """Collect a stage input gradient without retaining the input's activation storage."""
+
+    @staticmethod
+    def forward(ctx, _anchor, value, grad_slots, microbatch):
+        ctx.grad_slots = grad_slots
+        ctx.microbatch = microbatch
+        return value
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.grad_slots[ctx.microbatch] = grad
+        return None, None, None, None
+
+
 @nvtx_decorator()
 def layer_by_layer_forward_backward_no_pipelining(
     *,
@@ -934,6 +952,21 @@ def layer_by_layer_forward_backward_no_pipelining(
     if pg_collection.pp.size() != 1 or pg_collection.cp.size() != 1:
         raise ValueError("Layer-by-layer scheduling requires PP=CP=1.")
     config = get_model_config(model)
+    offload_activations = not forward_only and getattr(
+        config, "layer_by_layer_activation_offload", False
+    )
+    activation_offload = LayerByLayerActivationOffload() if offload_activations else None
+
+    def activation_checkpoint(group_id: int, name: str, *, microbatch: int | None = None):
+        if activation_offload is not None:
+            return activation_offload.checkpoint(group_id, name, microbatch=microbatch)
+        return contextlib.nullcontext()
+
+    def activation_backward_group(group_id: int):
+        if activation_offload is not None:
+            return activation_offload.backward_group(group_id)
+        return contextlib.nullcontext()
+
     fsdp = find_megatron_fsdp(model)
     if fsdp is not None:
         # The layer plans call inner modules directly, bypassing MegatronFSDP.forward.
@@ -1002,8 +1035,43 @@ def layer_by_layer_forward_backward_no_pipelining(
             for mb, plan in enumerate(plans):
                 with nvtx_range(f"fwd.microbatch.{mb}.embedding"):
                     embedding_outputs.append(plan.preprocess())
+                if not forward_only:
+                    # The embedding's weight gradient is shared by all microbatches,
+                    # so their ranges close at the grouped backward's end.
+                    trace_microbatch_backward(mb, "embedding", embedding_outputs[-1])
         hidden_states = tuple(embedding_outputs)
         del embedding_outputs
+
+    anchor = hidden_states[0].new_empty(0, requires_grad=True) if offload_activations else None
+
+    def stage_inputs(outputs: tuple[torch.Tensor, ...]):
+        if anchor is None:
+            inputs = tuple(value.detach().requires_grad_() for value in outputs)
+            return inputs, lambda: tuple(value.grad for value in inputs)
+
+        # AccumulateGrad holds its leaf tensor and therefore its GPU storage.
+        # Use a storage-free gradient edge for checkpoint inputs offloaded to CPU.
+        grad_slots: list[torch.Tensor | None] = [None] * len(outputs)
+        inputs = tuple(
+            _LayerByLayerBoundary.apply(anchor, value.detach(), grad_slots, mb)
+            for mb, value in enumerate(outputs)
+        )
+
+        def take_gradients():
+            gradients = tuple(grad_slots)
+            grad_slots.clear()
+            return gradients
+
+        return inputs, take_gradients
+
+    def backward_roots(outputs: tuple[torch.Tensor, ...]):
+        if offload_activations:
+            # A native view node owns the Python checkpoint node even on PyTorch
+            # versions where GradientEdge doesn't carry an ownership token.
+            return tuple(
+                torch.autograd.graph.get_gradient_edge(value.view_as(value)) for value in outputs
+            )
+        return outputs
 
     def forward_layer(layer_index: int, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
         # The reentrant checkpoint first runs without gradients and then replays
@@ -1025,12 +1093,12 @@ def layer_by_layer_forward_backward_no_pipelining(
     # microbatches in the checkpoint's inner backward. DDP sees one accumulated
     # gradient per parameter when its AccumulateGrad hook fires.
     stages = []
-    inputs: tuple[torch.Tensor, ...] = ()
+    input_gradients: Callable[[], tuple[torch.Tensor | None, ...]] = tuple
     unit = None
     num_layers = plans[0].num_layers()
     for layer_index in range(num_layers):
         if not forward_only:
-            stages.append((layer_index, unit, inputs, hidden_states))
+            stages.append((layer_index, unit, input_gradients, backward_roots(hidden_states)))
         unit = plans[0].layer_module(layer_index) if fsdp is not None else None
         weight_scope = (
             fsdp.layer_by_layer_unit(unit, backward=False)
@@ -1041,10 +1109,12 @@ def layer_by_layer_forward_backward_no_pipelining(
             if forward_only:
                 hidden_states = forward_layer(layer_index, *hidden_states)
             else:
-                inputs = tuple(value.detach().requires_grad_() for value in hidden_states)
-                hidden_states = tensor_parallel.checkpoint(
-                    partial(forward_layer, layer_index), False, *inputs
-                )
+                inputs, input_gradients = stage_inputs(hidden_states)
+                with activation_checkpoint(layer_index, f"transformer.{layer_index}"):
+                    hidden_states = tensor_parallel.checkpoint(
+                        partial(forward_layer, layer_index), False, *inputs
+                    )
+                del inputs
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
@@ -1052,8 +1122,9 @@ def layer_by_layer_forward_backward_no_pipelining(
     if forward_only:
         head_inputs = hidden_states
     else:
-        stages.append((num_layers, unit, inputs, hidden_states))
-        head_inputs = tuple(value.detach().requires_grad_() for value in hidden_states)
+        stages.append((num_layers, unit, input_gradients, backward_roots(hidden_states)))
+        head_inputs, input_gradients = stage_inputs(hidden_states)
+    del hidden_states
 
     forward_data_store = []
     losses = []
@@ -1069,7 +1140,8 @@ def layer_by_layer_forward_backward_no_pipelining(
                     output = plan.postprocess(value)
                 else:
                     # Keep large vocabulary projections out of the retained graphs.
-                    output = checkpoint(plan.postprocess, value, use_reentrant=False)
+                    with activation_checkpoint(num_layers, "output", microbatch=mb):
+                        output = checkpoint(plan.postprocess, value, use_reentrant=False)
             loss, num_tokens = forward_step_calc_loss(
                 model,
                 output,
@@ -1086,7 +1158,9 @@ def layer_by_layer_forward_backward_no_pipelining(
             if not forward_only:
                 if config.grad_scale_func is not None:
                     loss = config.grad_scale_func(loss)
+                trace_microbatch_backward(mb, "output", loss, value)
                 losses.append(loss)
+    del head_inputs, value, output, loss
 
     if not forward_only:
         if config.timers is not None:
@@ -1095,27 +1169,27 @@ def layer_by_layer_forward_backward_no_pipelining(
             # Each stage builds its own autograd graph; there is one root
             # FSDP backward lifecycle for the entire microbatch group.
             fsdp.pre_backward()
-        with backward_stage("output"):
-            for mb, (loss, value) in enumerate(zip(losses, head_inputs, strict=True)):
-                trace_microbatch_backward(mb, "output", loss, value)
+        with activation_backward_group(num_layers), backward_stage("output"):
             torch.autograd.backward(losses)
-        inputs = head_inputs
+        del losses
         while stages:
-            grad_outputs = tuple(value.grad for value in inputs)
-            stage_index, unit, inputs, outputs = stages.pop()
+            grad_outputs = input_gradients()
+            stage_index, unit, input_gradients, outputs = stages.pop()
             weight_scope = (
                 fsdp.layer_by_layer_unit(unit, backward=True)
                 if fsdp is not None and unit is not None
                 else contextlib.nullcontext()
             )
             stage = f"transformer.{stage_index - 1}" if stage_index else "embedding"
-            with weight_scope, backward_stage(stage):
-                if stage_index == 0:
-                    # The embedding inputs are token IDs. Weight gradients are
-                    # accumulated jointly, so these ranges close at the stage end.
-                    for mb, output in enumerate(outputs):
-                        trace_microbatch_backward(mb, stage, output)
+            activation_scope = (
+                activation_backward_group(stage_index - 1)
+                if stage_index
+                else contextlib.nullcontext()
+            )
+            # Queue the layer's first activation reload before waiting for its weights.
+            with activation_scope, weight_scope, backward_stage(stage):
                 torch.autograd.backward(outputs, grad_outputs)
+            del outputs, grad_outputs
         if fsdp is not None:
             fsdp.post_backward()
         if config.timers is not None:

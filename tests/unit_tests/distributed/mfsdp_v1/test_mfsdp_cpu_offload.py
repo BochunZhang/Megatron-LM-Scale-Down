@@ -128,6 +128,7 @@ def _train(
     cpu_optimizer=False,
     nvme_path=None,
     schedule=None,
+    activation_offload=False,
 ):
     """Train a small GPT model with Megatron-FSDP and gradient accumulation.
 
@@ -145,6 +146,7 @@ def _train(
         params_dtype=torch.bfloat16,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        layer_by_layer_activation_offload=activation_offload,
     )
     model = GPTModel(
         config=config,
@@ -380,12 +382,21 @@ class TestMegatronFSDPCpuOffload:
         )
         testing.assert_close(actual, reference, rtol=3e-3, atol=3e-4)
 
-    @pytest.mark.parametrize("offload", [pytest.param((), id="gpu"), pytest.param(("weight",), id="cpu")])
-    def test_layer_major_schedule_matches_no_pipeline(self, offload):
+    @pytest.mark.parametrize(
+        "offload,activation_offload",
+        [
+            pytest.param((), False, id="gpu"),
+            pytest.param(("weight",), False, id="cpu-weights"),
+            pytest.param(("weight",), True, id="cpu-weights-and-boundaries"),
+        ],
+    )
+    def test_layer_major_schedule_matches_no_pipeline(self, offload, activation_offload):
         regular = get_forward_backward_func(pp_size=1)
         layer_major = get_forward_backward_func(pp_size=1, layer_by_layer=True)
         reference = _train("optim_grads_params", True, offload, schedule=regular)
-        actual = _train("optim_grads_params", True, offload, schedule=layer_major)
+        actual = _train(
+            "optim_grads_params", True, offload, schedule=layer_major, activation_offload=activation_offload
+        )
         # The layer-major schedule accumulates local microbatch gradients before
         # the collective, so its floating-point addition order differs.
         testing.assert_close(actual, reference, rtol=6e-3, atol=5e-4)

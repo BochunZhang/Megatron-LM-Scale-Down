@@ -2,14 +2,16 @@
 
 import os
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel import fine_grained_activation_offload
 from megatron.core.pipeline_parallel.schedules import (
     forward_backward_no_pipelining,
     get_forward_backward_func,
@@ -83,13 +85,108 @@ def cuda_device():
         yield torch.device("cuda", torch.cuda.current_device())
 
 
-def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device, monkeypatch):
+def test_layer_by_layer_checkpoint_reloads_only_the_current_group(monkeypatch):
+    class Stream:
+        def wait_event(self, event):
+            assert event.recorded
+
+        def wait_stream(self, stream):
+            assert isinstance(stream, Stream)
+
+    class Event:
+        def __init__(self):
+            self.recorded = False
+
+        def record(self, stream):
+            assert isinstance(stream, Stream)
+            self.recorded = True
+
+    class Tensor:
+        is_cuda = True
+        device = torch.device("cuda")
+
+        def __init__(self, value):
+            self.value = value
+
+        def numel(self):
+            return 1
+
+        def detach(self):
+            return self
+
+        def record_stream(self, stream):
+            assert isinstance(stream, Stream)
+
+    hooks = []
+    saved, reloaded = [], []
+
+    def capture_hooks(pack, unpack):
+        hooks.append((pack, unpack))
+        return nullcontext()
+
+    def copy_to_cpu(tensor, *, pin_memory):
+        assert pin_memory
+        saved.append(tensor.value)
+        return tensor.value
+
+    def copy_to_device(device, host, *, non_blocking):
+        assert device.type == "cuda" and non_blocking
+        reloaded.append(host)
+        return Tensor(host)
+
+    manager = SimpleNamespace(d2h_stream=Stream(), h2d_stream=Stream())
+    monkeypatch.setattr(
+        fine_grained_activation_offload.PipelineOffloadManager, "get_instance", lambda: manager
+    )
+    monkeypatch.setattr(fine_grained_activation_offload, "saved_tensors_hooks", capture_hooks)
+    monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_cpu", copy_to_cpu)
+    monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_device", copy_to_device)
+    monkeypatch.setattr(torch.cuda, "current_stream", Stream)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", nullcontext)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
+
+    offload = fine_grained_activation_offload.LayerByLayerActivationOffload()
+    with offload.checkpoint(0, "transformer.0"):
+        pack_decoder, unpack = hooks[-1]
+        decoder_tags = [pack_decoder(Tensor(mb)) for mb in range(3)]
+        assert decoder_tags == [(0, 0, 0), (1, 0, 0), (2, 0, 0)]
+    output_tags = []
+    for mb in range(3):
+        with offload.checkpoint(1, "output", microbatch=mb):
+            pack_output, _ = hooks[-1]
+            output_tags.append(pack_output(Tensor(10 + mb)))
+    assert output_tags == [(0, 1, 0), (1, 1, 0), (2, 1, 0)]
+    assert saved == [0, 1, 2, 10, 11, 12]
+    assert not reloaded
+
+    with offload.backward_group(1):
+        assert reloaded == [10]
+        with pytest.raises(RuntimeError, match="outside its backward"):
+            unpack(decoder_tags[0])
+        assert unpack(output_tags[2]).value == 12
+        assert reloaded == [10, 11, 12]
+        assert [unpack(tag).value for tag in output_tags[:2]] == [10, 11]
+
+    with offload.backward_group(0):
+        assert reloaded == [10, 11, 12, 0]
+        assert unpack(decoder_tags[0]).value == 0
+        assert reloaded == [10, 11, 12, 0, 1]
+        assert [unpack(tag).value for tag in decoder_tags[1:]] == [1, 2]
+    assert reloaded == [10, 11, 12, 0, 1, 2]
+
+
+@pytest.mark.parametrize("activation_offload", [False, True], ids=["gpu-activations", "cpu-activations"])
+def test_layer_by_layer_schedule_matches_no_pipeline_update(
+    cuda_device, monkeypatch, activation_offload
+):
     layer_major = get_forward_backward_func(pp_size=1, layer_by_layer=True)
     microbatch_major = get_forward_backward_func(pp_size=1)
     assert layer_major is layer_by_layer_forward_backward_no_pipelining
     assert microbatch_major is forward_backward_no_pipelining
 
     model = _Model().to(cuda_device)
+    model.config.layer_by_layer_activation_offload = activation_offload
     baseline = _Model().to(cuda_device)
     baseline.load_state_dict(model.state_dict())
     batches = [torch.tensor(ids, device=cuda_device) for ids in ((1, 2), (3, 4, 5))]
@@ -98,8 +195,31 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device, monkeyp
     finalized = []
     accumulations = []
     nvtx_events = []
+    original_boundaries = []
+    restored_boundaries = 0
     for name, param in model.named_parameters():
         param.register_post_accumulate_grad_hook(lambda _, name=name: accumulations.append(name))
+
+    copy_to_cpu = fine_grained_activation_offload._copy_tensor_to_cpu
+    copy_to_device = fine_grained_activation_offload._copy_tensor_to_device
+
+    def track_copy_to_cpu(tensor, *, pin_memory, cpu_tensor_pool=None):
+        packed = copy_to_cpu(tensor, pin_memory=pin_memory, cpu_tensor_pool=cpu_tensor_pool)
+        assert tensor.is_cuda and packed.device.type == "cpu" and packed.is_pinned()
+        assert packed.shape == tensor.shape and packed.dtype == tensor.dtype
+        original_boundaries.append(StorageWeakRef(tensor.untyped_storage()))
+        return packed
+
+    def track_copy_to_device(device, packed, *, non_blocking):
+        nonlocal restored_boundaries
+        assert device.type == "cuda" and packed.is_pinned()
+        if restored_boundaries == 0:
+            assert all(storage.expired() for storage in original_boundaries)
+        restored_boundaries += 1
+        return copy_to_device(device, packed, non_blocking=non_blocking)
+
+    monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_cpu", track_copy_to_cpu)
+    monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_device", track_copy_to_device)
 
     @contextmanager
     def capture_nvtx_range(name):
@@ -144,6 +264,8 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device, monkeyp
 
     losses = run(layer_major, model)
     expected_losses = run(microbatch_major, baseline)
+    expected_boundaries = (len(model.layers) + 1) * len(batches) if activation_offload else 0
+    assert len(original_boundaries) == restored_boundaries == expected_boundaries
     assert finalized == [(model, 5, pg_collection), (baseline, 5, pg_collection)]
     assert model.layer_calls == [
         (0, 0, False),
@@ -189,10 +311,30 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device, monkeyp
             if stage.startswith("transformer."):
                 last_recompute = ("exit", f"recompute.microbatch.{len(batches) - 1}.{stage}")
                 assert nvtx_events.index(last_recompute) < nvtx_events.index(start)
-    assert [event for event in nvtx_events if event[0] in ("enter", "exit")] == expected_nvtx_events
+    stage_events = [
+        event
+        for event in nvtx_events
+        if event[0] in ("enter", "exit") and not event[1].startswith("activation ")
+    ]
+    assert stage_events == expected_nvtx_events
     assert Counter(event for event in nvtx_events if event[0] in ("start", "end")) == Counter(
         expected_microbatch_events
     )
+    expected_transfers = []
+    if activation_offload:
+        for direction, stages in (
+            ("offloading", ("transformer.0", "transformer.1", "output")),
+            ("reloading", ("output", "transformer.1", "transformer.0")),
+        ):
+            for stage in stages:
+                for microbatch in range(len(batches)):
+                    name = f"activation {direction} {stage} microbatch={microbatch}"
+                    expected_transfers.extend((event, name) for event in ("enter", "exit"))
+        for stage in ("transformer.1", "transformer.0"):
+            last_reload = ("exit", f"activation reloading {stage} microbatch={len(batches) - 1}")
+            first_replay = ("enter", f"recompute.microbatch.0.{stage}")
+            assert nvtx_events.index(last_reload) < nvtx_events.index(first_replay)
+    assert [event for event in nvtx_events if event[1].startswith("activation ")] == expected_transfers
     torch.testing.assert_close(losses, expected_losses)
     for param, ref_param in zip(model.parameters(), baseline.parameters(), strict=True):
         torch.testing.assert_close(param.grad, ref_param.grad)

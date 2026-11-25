@@ -518,6 +518,9 @@ class TransformerConfig(ModelParallelConfig):
     layer_by_layer_schedule: bool = False
     """Use layer-major execution with per-layer activation checkpointing in the PP=1 schedule."""
 
+    layer_by_layer_activation_offload: bool = False
+    """Save layer-by-layer checkpoint boundary activations in pinned CPU memory."""
+
     recompute_granularity: Optional[Literal['full', 'selective']] = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where the submodules set in --recompute-modules is checkpointed.
