@@ -81,7 +81,8 @@ class FSDPCPUAdam(torch.optim.AdamW):
             if not getattr(native, "adam_update_releases_gil", False):
                 raise RuntimeError(
                     "Overlapped GraceAdam requires a DeepSpeed CPUAdam build that releases "
-                    "the GIL. Apply src/optimizer/deepspeed-cpu-adam-release-gil.patch."
+                    "the GIL. Run examples/scale-down/01-analyse/02-deepspeed-offload/"
+                    "apply_cpu_adam_gil_patch.sh from the Megatron Bridge repository."
                 )
             logger.info(
                 "Overlapped GraceAdam using CPUAdam with GIL release from %s",
