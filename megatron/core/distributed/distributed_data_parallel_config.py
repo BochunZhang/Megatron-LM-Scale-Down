@@ -267,6 +267,9 @@ class DistributedDataParallelConfig:
     fsdp_nvme_path: str | None = None
     """Local NVMe directory for spilling the CPU-offloaded FSDP buffers."""
 
+    fsdp_nvme_weights_only: bool = False
+    """Synchronously swap only compute weights through host memory to NVMe."""
+
     @property
     def fsdp_cpu_offload_weight(self) -> bool:
         return "weight" in self.fsdp_cpu_offload
@@ -314,6 +317,7 @@ class DistributedDataParallelConfig:
             or self.fsdp_layer_by_layer_cpu_optimizer
             or self.fsdp_layer_by_layer_overlap_cpu_optimizer
             or self.fsdp_nvme_path is not None
+            or self.fsdp_nvme_weights_only
         ) and not self.use_megatron_fsdp:
             raise ValueError("CPU gradient accumulation, CPU AdamW and NVMe require Megatron-FSDP.")
         if self.fsdp_cpu_offload:

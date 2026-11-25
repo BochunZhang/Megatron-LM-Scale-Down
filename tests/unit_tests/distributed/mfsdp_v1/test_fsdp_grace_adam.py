@@ -89,7 +89,8 @@ def test_grace_adam_updates_restored_fsdp_state(monkeypatch):
     torch.testing.assert_close(state["exp_avg_sq"], 1.0 + gradient.square())
 
 
-def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch):
+@pytest.mark.parametrize("nvme_weights", [False, True])
+def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch, nvme_weights):
     params, bucket_params, buckets = [], [], []
     for index, width in enumerate((1, 2, 1, 1)):
         weight = torch.full((width,), 2.0)
@@ -113,18 +114,21 @@ def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch):
         def make_buffer(tensor, *, cpu_offload=False):
             def get_item(item_id, *, only_shard, data=None):
                 assert only_shard
-                return (tensor if data is None else data)[item_id : item_id + 1]
+                return (buffer.data if data is None else data)[item_id : item_id + 1]
 
-            return SimpleNamespace(
+            buffer = SimpleNamespace(
                 bucket_id=index,
-                data=tensor,
+                data=None if cpu_offload else tensor,
                 data_size=tensor.numel(),
+                dtype=tensor.dtype,
+                device=tensor.device,
                 cpu_offload=cpu_offload,
                 nvme=None,
                 param_idx=param_idx,
                 get_item=get_item,
                 read_cpu_data=lambda: tensor,
             )
+            return buffer
 
         params.extend(group_params)
         bucket_params.append(group_params)
@@ -133,7 +137,9 @@ def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch):
                 params=[param.orig_param for param in group_params],
                 nvtx_label=f"transformer.{index}.dense.0.0M",
                 main_weight_buffer=make_buffer(weight, cpu_offload=index > 0),
-                model_weight_buffer=make_buffer(weight.to(torch.bfloat16)),
+                model_weight_buffer=make_buffer(
+                    weight.to(torch.bfloat16), cpu_offload=nvme_weights and index == 0
+                ),
                 main_grad_buffer=make_buffer(gradient),
             )
         )
@@ -173,6 +179,12 @@ def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch):
 
     grace_adam.step = grace_step
     monkeypatch.setattr(fsdp_adam, "_create_grace_adam", lambda: grace_adam)
+    swapped_weights = {}
+
+    def offload_updated_weights(buffer):
+        swapped_weights[buffer.bucket_id] = buffer.data.clone()
+        buffer.data = None
+
     buffers = SimpleNamespace(
         optimizer_named_parameters=[
             ("weight", param) for group_params in reversed(bucket_params) for param in group_params
@@ -184,6 +196,7 @@ def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch):
         },
         parameter_groups=buckets,
         commit_cpu_optimizer_bucket=Mock(),
+        _offload_updated_model_weights=offload_updated_weights,
     )
     chunk = SimpleNamespace(
         param_and_grad_buffer=buffers,
@@ -225,7 +238,13 @@ def test_layer_by_layer_steps_grace_adam_once_per_fsdp_bucket(monkeypatch):
     reference.grad = torch.tensor([0.25])
     torch.optim.AdamW([reference], lr=0.1).step()
     torch.testing.assert_close(params[0], reference)
-    torch.testing.assert_close(buckets[0].model_weight_buffer.data, reference.to(torch.bfloat16))
+    model_weight_buffer = buckets[0].model_weight_buffer
+    if nvme_weights:
+        assert model_weight_buffer.data is None
+        torch.testing.assert_close(swapped_weights[0], reference.to(torch.bfloat16))
+    else:
+        assert not swapped_weights
+        torch.testing.assert_close(model_weight_buffer.data, reference.to(torch.bfloat16))
     assert buffers.commit_cpu_optimizer_bucket.call_count == 3
     for index, param in enumerate(params[1:], start=1):
         grad = 0.25 * (index + 1) * (0.5 / (1.0 + 1.0e-6))

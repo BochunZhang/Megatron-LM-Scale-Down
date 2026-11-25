@@ -399,7 +399,7 @@ class MegatronFSDP(torch.nn.Module):
             not config.fsdp_cpu_optimizer
             or not self.cpu_offload_grad
             or config.fsdp_cpu_grad_accumulation
-            or config.fsdp_nvme_path is not None
+            or (config.fsdp_nvme_path is not None and not config.fsdp_nvme_weights_only)
             or not config.overlap_grad_reduce
             or config.megatron_fsdp_cuda_graph_mode
             or self.mp_policy.main_grads_dtype != torch.float32
@@ -420,6 +420,10 @@ class MegatronFSDP(torch.nn.Module):
             not config.fsdp_nvme_path or not config.fsdp_cpu_optimizer or not self.cpu_offload_weight
         ):
             raise ValueError("FSDP NVMe offload requires a directory, CPU AdamW and weight offload.")
+        if config.fsdp_nvme_weights_only and (
+            not config.fsdp_nvme_path or config.megatron_fsdp_cuda_graph_mode
+        ):
+            raise ValueError("FSDP compute-weight NVMe offload requires a directory and eager mode.")
         if not self.ddp_config.fsdp_cpu_offload:
             return
         if self.data_parallel_sharding_strategy == "no_shard":

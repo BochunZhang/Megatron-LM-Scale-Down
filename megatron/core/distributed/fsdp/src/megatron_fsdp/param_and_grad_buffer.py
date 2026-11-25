@@ -1472,6 +1472,7 @@ class DataParallelBuffer:
 
         The copy waits for the latest D2H copy that wrote cpu_data. The caller
         is responsible for ordering the stream after previous users of dst.
+        The weights-only NVMe mode waits for the H2D copy before returning.
 
         Args:
             dst (torch.Tensor): Destination GPU tensor.
@@ -1492,6 +1493,8 @@ class DataParallelBuffer:
             dst.copy_(src, non_blocking=True)
             event = stream.record_event()
         dst.record_stream(stream)
+        if self.nvme is not None and self.ddp_config.fsdp_nvme_weights_only:
+            event.synchronize()
         return event
 
     def offload_to_cpu(
@@ -2943,7 +2946,7 @@ class ParamAndGradBuffer:
             gpu_update = layer_by_layer_cpu_optimizer and group.fsdp_unit_id == 0
             offload_model_weight = (
                 self.ddp_config.fsdp_cpu_offload_weight
-                and not gpu_update
+                and (not gpu_update or self.ddp_config.fsdp_nvme_weights_only)
                 and (group.fsdp_unit_id is not None or self.ddp_config.fsdp_cpu_optimizer)
                 and should_create_grad_buffer_or_main_weight_buffer
                 and self.mp_policy.main_params_dtype is not None
@@ -3549,27 +3552,25 @@ class ParamAndGradBuffer:
 
     def _init_cpu_offload_data(self):
         """
-        Allocate the pinned CPU copies of all CPU-offloaded model weight and main
-        gradient buffers. Pinned memory allocation is slow, so one pinned Tensor
-        is allocated per dtype and sliced into the buffers.
+        Set the NVMe backing and allocate persistent pinned copies for CPU-backed
+        buffers. Allocate one pinned tensor per dtype and slice it into the buffers.
         """
-        offload_bufs = [
-            buf
-            for group in self.parameter_groups
-            for buf in (group.model_weight_buffer, group.main_weight_buffer, group.main_grad_buffer)
-            if buf is not None and buf.cpu_offload
-        ]
-        if self.nvme is not None:
-            for group in self.parameter_groups:
-                for kind, buf in (
-                    ("weight", group.model_weight_buffer),
-                    ("master", group.main_weight_buffer),
-                    ("gradient", group.main_grad_buffer),
+        offload_bufs = []
+        for group in self.parameter_groups:
+            for kind, buf in (
+                ("weight", group.model_weight_buffer),
+                ("master", group.main_weight_buffer),
+                ("gradient", group.main_grad_buffer),
+            ):
+                if buf is None or not buf.cpu_offload:
+                    continue
+                if self.nvme is not None and (
+                    kind == "weight" or not self.ddp_config.fsdp_nvme_weights_only
                 ):
-                    if buf is not None and buf.cpu_offload:
-                        buf.nvme = self.nvme
-                        buf.nvme_key = f"{kind}-{buf.bucket_id}"
-            return
+                    buf.nvme = self.nvme
+                    buf.nvme_key = f"{kind}-{buf.bucket_id}"
+                else:
+                    offload_bufs.append(buf)
         dtype_sizes = defaultdict(int)
         for buf in offload_bufs:
             dtype_sizes[buf.dtype] += buf.data_size
@@ -3587,7 +3588,7 @@ class ParamAndGradBuffer:
     def _store_optimizer_weights(self, buffers):
         if not buffers:
             return
-        if self.nvme is not None:
+        if self.nvme is not None and not self.ddp_config.fsdp_nvme_weights_only:
             for buf in buffers:
                 cpu_data = buf.new_cpu_data()
                 cpu_data.copy_(buf.data)
@@ -4219,7 +4220,7 @@ class ParamAndGradBuffer:
     def _offload_updated_model_weights(self, wbuf: DataParallelBuffer):
         """
         Write the updated, temporarily GPU-resident model weights of a CPU-offloaded
-        model weight buffer back to its CPU copy, and release the GPU memory.
+        model weight buffer to its CPU or NVMe backing, and release the GPU memory.
         """
         if not wbuf.is_data_distributed and wbuf.dp_world_size > 1:
             # Gather the other ranks' updated shards to keep a complete CPU copy.
@@ -5391,6 +5392,10 @@ class AllGatherPipeline:
         if len(params) == 0:
             return
 
+        synchronous_nvme = self.buffer.ddp_config.fsdp_nvme_weights_only
+        if synchronous_nvme:
+            prefetch = False
+
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         # Buckets added below beyond these are prefetched (named in NVTX labels).
@@ -5524,7 +5529,7 @@ class AllGatherPipeline:
                 bucket_group_to_buckets[group_id] = []
             bucket_group_to_buckets[group_id].append(bucket_id)
 
-        if self.buffer.nvme is not None:
+        if self.buffer.nvme is not None and not synchronous_nvme:
             # Start disk reads for the selected FSDP units before entering NCCL.
             for buckets in bucket_group_to_buckets.values():
                 for bucket_id in buckets:
@@ -5696,6 +5701,13 @@ class AllGatherPipeline:
             # Persistent un-sharded weights stay ready to use until the next reset.
             return
 
+        if buf.nvme is not None and self.buffer.ddp_config.fsdp_nvme_weights_only:
+            # Complete the round trip of this rank's shard before recycling the GPU slot.
+            bucket = buf.fetch_bucket()
+            src = buf.get_shard_from_bucket(bucket) if buf.is_data_distributed else bucket.data
+            d2h_stream = self.buffer.cpu_offload_d2h_stream
+            d2h_stream.wait_stream(torch.cuda.current_stream())
+            buf.offload_to_cpu(src, d2h_stream)
         buf.free_bucket_storage()
         self.bucket_status[bucket_key] = BucketStatus.EMPTY
 

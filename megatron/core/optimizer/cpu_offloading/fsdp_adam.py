@@ -303,10 +303,14 @@ class FSDPCPUAdam(torch.optim.AdamW):
             return
         if on_gpu:
             wbuf = bucket.model_weight_buffer
+            if wbuf.cpu_offload:
+                wbuf.data = torch.zeros(wbuf.data_size, dtype=wbuf.dtype, device=wbuf.device)
             for param in bucket.params:
                 source = master.get_item(master.param_idx[param], only_shard=True)
                 target = wbuf.get_item(wbuf.param_idx[param], only_shard=True)
                 target.copy_(source)
+            if wbuf.cpu_offload:
+                buffers._offload_updated_model_weights(wbuf)
         else:
             if moments is not None:
                 master.nvme.write(f"adam-{master.bucket_id}", moments)

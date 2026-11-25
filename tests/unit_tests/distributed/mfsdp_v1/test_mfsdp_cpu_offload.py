@@ -131,6 +131,7 @@ def _train(
     cpu_grad_accumulation=False,
     cpu_optimizer=False,
     nvme_path=None,
+    nvme_weights_only=False,
     schedule=None,
     activation_offload=False,
 ):
@@ -172,6 +173,7 @@ def _train(
         fsdp_cpu_grad_accumulation=cpu_grad_accumulation,
         fsdp_cpu_optimizer=cpu_optimizer,
         fsdp_nvme_path=nvme_path,
+        fsdp_nvme_weights_only=nvme_weights_only,
     )
     offload_weight = "weight" in offload
     offload_grad = "gradient" in offload
@@ -193,9 +195,11 @@ def _train(
         if group.main_weight_buffer is not None and group.main_weight_buffer.cpu_offload
     ]
     assert bool(master_buffers) == ("optimizer" in offload)
+    nvme_optimizer = nvme_path is not None and not nvme_weights_only
     for buf in master_buffers:
         assert buf.cpu_data_valid
-        if nvme_path:
+        assert (buf.nvme is not None) == nvme_optimizer
+        if nvme_optimizer:
             assert buf.cpu_data is None
         else:
             assert buf.cpu_data.is_pinned()
@@ -206,10 +210,12 @@ def _train(
             wbuf, gbuf = group.model_weight_buffer, group.main_grad_buffer
             if wbuf is not None and wbuf.cpu_offload:
                 assert wbuf.cpu_data_valid and wbuf.data is None
+                assert (wbuf.nvme is not None) == (nvme_path is not None)
                 assert wbuf.cpu_data is None if nvme_path else wbuf.cpu_data.is_pinned()
             if gbuf is not None and gbuf.cpu_offload:
                 assert not gbuf.cpu_data_valid and gbuf.data is None
-                assert gbuf.cpu_data is None if nvme_path else gbuf.cpu_data.is_pinned()
+                assert (gbuf.nvme is not None) == nvme_optimizer
+                assert gbuf.cpu_data is None if nvme_optimizer else gbuf.cpu_data.is_pinned()
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
             optimizer="adam",
@@ -255,6 +261,18 @@ def _train(
             losses.extend(record["lm loss"] for record in records)
         _, grad_norm, _ = optimizer.step()
         grad_norms.append(grad_norm)
+        if nvme_weights_only:
+            for group in buffers.parameter_groups:
+                wbuf, mbuf = group.model_weight_buffer, group.main_weight_buffer
+                if wbuf is None or wbuf.nvme is None:
+                    continue
+                compute = wbuf.read_cpu_data()
+                master = mbuf.read_cpu_data()
+                assert compute.dtype == torch.bfloat16 and master.dtype == torch.float32
+                for param in group.params:
+                    actual = wbuf.get_item(wbuf.param_idx[param], only_shard=True, data=compute)
+                    expected = mbuf.get_item(mbuf.param_idx[param], only_shard=True, data=master)
+                    testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
         if step == 0 and checkpoint_path is not None:
             _round_trip_checkpoint(fsdp_model, optimizer, checkpoint_path)
         for buf in master_buffers:
@@ -266,7 +284,7 @@ def _train(
                 for value in state.values()
                 if isinstance(value, torch.Tensor) and value.ndim > 0
             ]
-            if nvme_path:
+            if nvme_optimizer:
                 assert not tensors  # Adam moments have been written to NVMe.
             elif cpu_optimizer:
                 assert tensors and all(t.device.type == "cpu" for t in tensors)
@@ -292,10 +310,13 @@ def _train(
             if g.main_grad_buffer and g.main_grad_buffer.cpu_offload
         ]
         assert bool(wbufs) == offload_weight and bool(gbufs) == offload_grad
-        staging_alloc = fsdp_model.param_and_grad_buffer.offload_grad_staging_alloc
-        if offload_grad and strategy != "optim":
-            assert staging_alloc is not None
-            assert staging_alloc.size == 2 and not staging_alloc.using_buffer
+        if any(gbuf.is_data_distributed for gbuf in gbufs):
+            if cpu_grad_accumulation:
+                assert buffers.cpu_grad_accumulator is not None
+            else:
+                staging_alloc = buffers.offload_grad_staging_alloc
+                assert staging_alloc is not None
+                assert staging_alloc.size == 2 and not staging_alloc.using_buffer
         for wbuf in wbufs:
             assert wbuf.cpu_data_valid
         for gbuf in gbufs:
@@ -303,8 +324,8 @@ def _train(
         optimizer.zero_grad()
         assert all(not gbuf.cpu_data_valid for gbuf in gbufs)
         for buf in wbufs + gbufs:
-            # Offloaded buffers only keep their persistent data in pinned CPU memory.
-            assert buf.data is None and buf.cpu_data.is_pinned()
+            assert buf.data is None
+            assert buf.cpu_data is None if buf.nvme is not None else buf.cpu_data.is_pinned()
 
     torch.cuda.synchronize()
     del fsdp_model, optimizer, model
@@ -518,7 +539,8 @@ class TestMegatronFSDPCpuOffload:
         fsdp_model.zero_grad_buffer()
         assert all(getattr(p, "_fsdp_cpu_grad", None) is None for _, p in buffers.optimizer_named_parameters)
 
-    def test_nvme_offload_matches_cpu_and_resumes(self, tmp_path):
+    @pytest.mark.parametrize("nvme_weights_only", [False, True], ids=["all-nvme", "weights-only"])
+    def test_nvme_offload_matches_cpu_and_resumes(self, tmp_path, nvme_weights_only):
         nvme_path = os.environ.get("MEGATRON_FSDP_TEST_NVME_PATH")
         if not nvme_path:
             pytest.skip("Set MEGATRON_FSDP_TEST_NVME_PATH to a local NVMe directory with the native AIO extension installed.")
@@ -529,6 +551,12 @@ class TestMegatronFSDPCpuOffload:
         kwargs = dict(cpu_grad_accumulation=True, cpu_optimizer=True)
         reference = _train("optim_grads_params", True, offload, **kwargs)
         actual = _train(
-            "optim_grads_params", True, offload, checkpoint[0], nvme_path=nvme_path, **kwargs
+            "optim_grads_params",
+            True,
+            offload,
+            checkpoint[0],
+            nvme_path=nvme_path,
+            nvme_weights_only=nvme_weights_only,
+            **kwargs,
         )
         testing.assert_close(actual, reference, rtol=0, atol=0)
