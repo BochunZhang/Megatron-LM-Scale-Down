@@ -61,12 +61,15 @@ def _reference_step(
 def _assert_weights(trainer: LayerByLayerTrainer, reference: nn.ModuleList) -> None:
     for unit, reference_unit in zip(trainer.units, reference):
         for bucket in unit.buckets:
-            local = torch.empty(bucket.shard_size, dtype=bucket.key[0], device="cpu")
-            bucket.shard.read_parameter(local)
+            local = bucket.shard.gpu_parameter
+            if local is None:
+                host = torch.empty(bucket.shard_size, dtype=bucket.key[0], device="cpu")
+                bucket.shard.read_parameter(host)
+                local = host.to(trainer.device)
             full = torch.empty(
                 bucket.shard_size * dist.get_world_size(), dtype=local.dtype, device=trainer.device
             )
-            dist.all_gather_into_tensor(full, local.to(trainer.device))
+            dist.all_gather_into_tensor(full, local)
             expected = torch.cat(
                 [
                     param.detach().flatten()
@@ -77,10 +80,28 @@ def _assert_weights(trainer: LayerByLayerTrainer, reference: nn.ModuleList) -> N
             torch.testing.assert_close(full[: expected.numel()], expected, atol=1e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize("tier", ["cpu_param", "nvme_param"])
-@pytest.mark.parametrize("activation_tier", ["gpu_act", "cpu_act", "nvme_act"])
+@pytest.mark.parametrize(
+    ("tier", "activation_tier", "optimizer_tier"),
+    [
+        ("cpu_param", "gpu_act", "nvme"),
+        ("cpu_param", "cpu_act", "cpu"),
+        ("cpu_param", "nvme_act", "nvme"),
+        ("nvme_param", "gpu_act", "nvme"),
+        ("nvme_param", "cpu_act", "nvme"),
+        ("nvme_param", "nvme_act", "nvme"),
+        ("gpu", "gpu", "gpu"),
+        ("gpu", "cpu", "cpu"),
+        ("gpu", "nvme", "nvme"),
+        ("cpu", "gpu", "gpu"),
+        ("nvme", "nvme", "gpu"),
+    ],
+)
 def test_layer_by_layer_matches_unsharded_adamw(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tier: str, activation_tier: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tier: str,
+    activation_tier: str,
+    optimizer_tier: str,
 ) -> None:
     """Compare weights, losses, and activation transfers across storage tiers."""
     Utils.initialize_distributed()
@@ -111,12 +132,20 @@ def test_layer_by_layer_matches_unsharded_adamw(
     directory = tmp_path / f"rank-{dist.get_rank()}"
     write_tensor = layer_by_layer.write_tensor
     activation_writes = []
+    nvtx_range = torch.cuda.nvtx.range
+    forward_ranges = []
 
     def record_activation_write(path: Path, value: torch.Tensor) -> None:
         write_tensor(path, value)
         activation_writes.append(path)
 
+    def record_nvtx(message):
+        if message.startswith("layer_by_layer.forward.iteration_"):
+            forward_ranges.append(message)
+        return nvtx_range(message)
+
     monkeypatch.setattr(layer_by_layer, "write_tensor", record_activation_write)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", record_nvtx)
     with LayerByLayerTrainer(
         modules,
         group=dist.group.WORLD,
@@ -124,10 +153,13 @@ def test_layer_by_layer_matches_unsharded_adamw(
         directory=directory,
         tier=tier,
         activation_tier=activation_tier,
+        optimizer_tier=optimizer_tier,
         betas=betas,
         eps=eps,
         weight_decay=decay,
     ) as trainer:
+        if tier == "gpu":
+            assert not trainer.weights.host and not trainer.weights.local
         for step in range(2):
             batches = [
                 (
@@ -136,19 +168,27 @@ def test_layer_by_layer_matches_unsharded_adamw(
                 )
                 for _ in range(3)
             ]
-            actual_loss = trainer.step(batches, lr=lr)
+            actual_loss = trainer.step(batches, lr=lr, iteration=3 if step == 0 else None)
             expected_loss = _reference_step(reference, batches, optimizer)
             assert actual_loss == pytest.approx(expected_loss, abs=1e-6, rel=1e-5)
             _assert_weights(trainer, reference)
             boundaries = (step + 1) * (len(modules) - 1) * len(batches)
-            d2h = 0 if activation_tier == "gpu_act" else boundaries
+            storage = activation_tier.removesuffix("_act")
+            d2h = 0 if storage == "gpu" else boundaries
             assert trainer.activation_transfer_counts == (d2h, 2 * d2h)
-            assert len(activation_writes) == (boundaries if activation_tier == "nvme_act" else 0)
+            assert len(activation_writes) == (boundaries if storage == "nvme" else 0)
+            assert forward_ranges == [
+                f"layer_by_layer.forward.iteration_{step + 4}.layer_{index}.microbatch_{mb + 1}"
+                for index in range(len(modules))
+                for mb in range(len(batches))
+            ]
+            forward_ranges.clear()
             assert not list(directory.glob("input-*.bin"))
 
 
+@pytest.mark.parametrize("optimizer_tier", ["nvme", "gpu"])
 def test_layer_by_layer_rejects_nonfinite_shard_on_all_ranks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, optimizer_tier: str
 ) -> None:
     """An invalid gradient on one rank must remain visible after the slot is reused."""
     Utils.initialize_distributed()
@@ -182,11 +222,19 @@ def test_layer_by_layer_rejects_nonfinite_shard_on_all_ranks(
         device=device,
         directory=tmp_path / f"rank-{rank}",
         tier="nvme_param",
+        optimizer_tier=optimizer_tier,
         betas=(0.9, 0.95),
         eps=1e-8,
         weight_decay=0.1,
     ) as trainer:
+        bucket = trainer.units[-1].buckets[0]
+        before = torch.empty(bucket.shard_size, dtype=bucket.key[0], device="cpu")
+        bucket.shard.read_parameter(before)
         with pytest.raises(FloatingPointError, match="Non-finite training gradient at unit 3"):
             trainer.step(batches, lr=3e-3)
+        if rank == 0:
+            after = torch.empty_like(before)
+            bucket.shard.read_parameter(after)
+            torch.testing.assert_close(after, before, atol=0, rtol=0)
         with pytest.raises(RuntimeError, match="Discard the trainer"):
             trainer.step(batches, lr=3e-3)

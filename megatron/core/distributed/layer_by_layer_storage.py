@@ -1,11 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
-"""CPU AdamW and NVMe tensor storage for layer-by-layer training."""
+"""Tiered tensor storage and AdamW updates for layer-by-layer training."""
 
 import mmap
 import os
 from pathlib import Path
 from threading import local
+from typing import Literal
 
 import torch
 from torch.optim._functional import adamw
@@ -14,6 +15,9 @@ try:
     import megatron_nvme_aio
 except ImportError:
     megatron_nvme_aio = None
+
+
+StorageTier = Literal["gpu", "cpu", "nvme"]
 
 
 _ALIGNMENT = 4096
@@ -82,7 +86,7 @@ def write_tensor(path: Path, value: torch.Tensor) -> None:
 
 
 class OffloadedShard:
-    """Store one rank's flat compute and optimizer shards across CPU and NVMe.
+    """Store one rank's compute and optimizer shards in independent tiers.
 
     A caller serializes accesses to each shard. It can prefetch the optimizer
     state on one worker, then submit the update to another once the gradient is
@@ -94,37 +98,58 @@ class OffloadedShard:
         initial: torch.Tensor,
         directory: Path,
         *,
-        parameter_tier: str,
-        optimizer_resident: bool,
+        parameter_tier: StorageTier,
+        optimizer_tier: StorageTier,
+        device: torch.device,
         weight_decay: float,
     ) -> None:
-        if parameter_tier not in {"cpu_param", "nvme_param"}:
+        if parameter_tier not in {"gpu", "cpu", "nvme"}:
             raise ValueError(f"Unknown layer-by-layer parameter tier {parameter_tier!r}")
-        if initial.ndim != 1 or initial.dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("Layer-by-layer compute shards must be flat BF16 or FP32 tensors.")
-        _byte_view(initial)
+        if optimizer_tier not in {"gpu", "cpu", "nvme"}:
+            raise ValueError(f"Unknown layer-by-layer optimizer tier {optimizer_tier!r}")
+        if "gpu" in (parameter_tier, optimizer_tier) and device.type != "cuda":
+            raise ValueError("GPU layer-by-layer storage requires a CUDA device.")
+        if (
+            initial.ndim != 1
+            or initial.dtype not in (torch.bfloat16, torch.float32)
+            or not initial.is_contiguous()
+        ):
+            raise ValueError("Layer-by-layer compute shards must be contiguous flat BF16 or FP32 tensors.")
         self.shape = initial.shape
         self.dtype = initial.dtype
         self._weight_decay = weight_decay
-        self._optimizer_resident = optimizer_resident
-        self._state_step = torch.zeros((), dtype=torch.float32, device="cpu")
-        self._optimizer_state = None
-        self._parameter = None
+        self._parameter_tier = parameter_tier
+        self._optimizer_tier = optimizer_tier
+        cpu = torch.device("cpu")
+        parameter_device = device if parameter_tier == "gpu" else cpu
+        optimizer_device = device if optimizer_tier == "gpu" else cpu
+        self._state_step = torch.zeros((), dtype=torch.float32, device=optimizer_device)
+        self._optimizer_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._parameter: torch.Tensor | None = None
         self._parameter_path = directory / "parameter"
         self._state_paths = (directory / "master", directory / "exp_avg", directory / "exp_avg_sq")
         self._has_moments = False
-        directory.mkdir(parents=True)
+        if "nvme" in (parameter_tier, optimizer_tier):
+            directory.mkdir(parents=True)
 
-        source = initial.detach()
-        if parameter_tier == "cpu_param":
-            self._parameter = source.clone()
+        initial = initial.detach()
+        parameter = initial.to(device=parameter_device, copy=parameter_tier != "nvme")
+        if parameter_tier == "nvme":
+            write_tensor(self._parameter_path, parameter)
         else:
-            write_tensor(self._parameter_path, source)
-        master = source.to(dtype=torch.float32, copy=True)
-        if optimizer_resident:
-            self._optimizer_state = master, torch.zeros_like(master), torch.zeros_like(master)
-        else:
+            self._parameter = parameter
+        if parameter_device == optimizer_device:
+            initial = parameter
+        master = initial.to(device=optimizer_device, dtype=torch.float32, copy=True)
+        if optimizer_tier == "nvme":
             write_tensor(self._state_paths[0], master)
+        else:
+            self._optimizer_state = master, torch.zeros_like(master), torch.zeros_like(master)
+
+    @property
+    def gpu_parameter(self) -> torch.Tensor | None:
+        """Return the resident GPU parameter shard for direct all-gather."""
+        return self._parameter if self._parameter_tier == "gpu" else None
 
     def read_parameter(self, out: torch.Tensor) -> None:
         """Stage the current compute-weight shard in caller-provided CPU memory."""
@@ -137,7 +162,7 @@ class OffloadedShard:
             out.copy_(self._parameter)
 
     def prefetch_optimizer(self) -> None:
-        """Read this shard's FP32 master weight and moments into CPU memory."""
+        """Stage NVMe optimizer tensors in CPU memory before the update."""
         if self._optimizer_state is not None:
             return
         master = torch.empty(self.shape, dtype=torch.float32, device="cpu")
@@ -154,21 +179,31 @@ class OffloadedShard:
 
     def discard_prefetched_optimizer(self) -> None:
         """Release the staged NVMe state without applying an update."""
-        if not self._optimizer_resident:
+        if self._optimizer_tier == "nvme":
             self._optimizer_state = None
 
     @torch.no_grad()
     def step(
-        self, gradient: torch.Tensor, *, lr: float, betas: tuple[float, float], eps: float
+        self,
+        gradient: torch.Tensor,
+        *,
+        lr: float,
+        betas: tuple[float, float],
+        eps: float,
+        found_inf: torch.Tensor | None = None,
     ) -> None:
-        """Apply one AdamW update to a prefetched shard and publish its weights."""
-        if gradient.device.type != "cpu" or gradient.dtype != torch.float32:
-            raise ValueError("Layer-by-layer AdamW expects an FP32 CPU gradient.")
+        """Apply AdamW to a prefetched shard and publish its weights.
+
+        A CUDA caller can supply the fused optimizer's nonfinite flag to skip
+        the update on-device.
+        """
         if gradient.shape != self.shape or not gradient.is_contiguous():
             raise ValueError("Gradient tensor does not match its layer-by-layer shard.")
         if self._optimizer_state is None:
             raise RuntimeError("Layer-by-layer AdamW step requires a prefetched shard.")
         master, average, square_average = self._optimizer_state
+        if gradient.device != master.device or gradient.dtype != torch.float32:
+            raise ValueError(f"Layer-by-layer AdamW expects an FP32 gradient on {master.device}.")
         adamw(
             [master],
             [gradient],
@@ -177,6 +212,7 @@ class OffloadedShard:
             [],
             [self._state_step],
             fused=True,
+            found_inf=found_inf,
             amsgrad=False,
             beta1=betas[0],
             beta2=betas[1],
@@ -185,12 +221,12 @@ class OffloadedShard:
             eps=eps,
             maximize=False,
         )
-        if not self._optimizer_resident:
+        if self._optimizer_tier == "nvme":
             for path, state in zip(self._state_paths, self._optimizer_state):
                 write_tensor(path, state)
             self._has_moments = True
             self._optimizer_state = None
         if self._parameter is None:
-            write_tensor(self._parameter_path, master.to(dtype=self.dtype))
+            write_tensor(self._parameter_path, master.to(device="cpu", dtype=self.dtype))
         else:
             self._parameter.copy_(master)

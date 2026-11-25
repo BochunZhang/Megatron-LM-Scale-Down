@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Layer-major training with sharded weights, gradients, and CPU AdamW."""
+"""Layer-major training with sharded weights, gradients, and CPU or GPU AdamW."""
 
 import math
 from collections.abc import Iterable, Sequence
@@ -29,13 +29,16 @@ class _Bucket:
     shard: OffloadedShard
 
     @classmethod
-    def create(cls, key, params, directory, *, rank, world, tier, resident, weight_decay):
+    def create(
+        cls, key, params, directory, *, rank, world, tier, optimizer_tier, device, weight_decay
+    ):
         shapes = [param.shape for param in params]
         sizes = [param.numel() for param in params]
         shard_size = (sum(sizes) + world - 1) // world
         start = rank * shard_size
         end = start + shard_size
-        initial = torch.zeros(shard_size, dtype=key[0], device="cpu")
+        shard_device = device if "gpu" in (tier, optimizer_tier) else "cpu"
+        initial = torch.zeros(shard_size, dtype=key[0], device=shard_device)
         offset = 0
         for param, size in zip(params, sizes):
             lo = max(start, offset)
@@ -49,7 +52,8 @@ class _Bucket:
             initial,
             directory,
             parameter_tier=tier,
-            optimizer_resident=resident,
+            optimizer_tier=optimizer_tier,
+            device=device,
             weight_decay=weight_decay if key[1] else 0.0,
         )
         return cls(key, params, shapes, sizes, shard_size, shard)
@@ -80,26 +84,30 @@ class _Unit:
 
 
 class _WeightSlots:
-    def __init__(self, units, device, group, reader):
+    def __init__(self, units, device, group, reader, *, parameter_tier, initialized):
         self.group = group
         self.reader = reader
+        self.gpu_parameters = parameter_tier == "gpu"
         self.stream = torch.cuda.Stream(device=device)
+        self.stream.wait_event(initialized)
         world = group.size()
         sizes: dict[_GroupKey, int] = {}
         for unit in units:
             for bucket in unit.buckets:
                 sizes[bucket.key] = max(sizes.get(bucket.key, 0), bucket.shard_size)
-        self.host = [
-            {
-                key: torch.empty(n, dtype=key[0], device="cpu", pin_memory=True)
-                for key, n in sizes.items()
-            }
-            for _ in range(2)
-        ]
-        self.local = [
-            {key: torch.empty(n, dtype=key[0], device=device) for key, n in sizes.items()}
-            for _ in range(2)
-        ]
+        self.host = []
+        self.local = []
+        if not self.gpu_parameters:
+            for _ in range(2):
+                self.host.append(
+                    {
+                        key: torch.empty(n, dtype=key[0], device="cpu", pin_memory=True)
+                        for key, n in sizes.items()
+                    }
+                )
+                self.local.append(
+                    {key: torch.empty(n, dtype=key[0], device=device) for key, n in sizes.items()}
+                )
         self.full = [
             {key: torch.empty(n * world, dtype=key[0], device=device) for key, n in sizes.items()}
             for _ in range(2)
@@ -109,9 +117,14 @@ class _WeightSlots:
         self.released: list[torch.cuda.Event | None] = [None, None]
         self.ready: list[torch.cuda.Event | None] = [None, None]
         self.pending: tuple[int, _Unit, Future | None] | None = None
+        self.stream.wait_stream(torch.cuda.current_stream(device))
 
     def prefetch(self, index: int, unit: _Unit) -> None:
         slot = index % 2
+        assert self.pending is None
+        if self.gpu_parameters:
+            self.pending = (slot, unit, None)
+            return
         copied = self.copied[slot]
 
         def read() -> None:
@@ -120,7 +133,6 @@ class _WeightSlots:
             for bucket in unit.buckets:
                 bucket.shard.read_parameter(self.host[slot][bucket.key][: bucket.shard_size])
 
-        assert self.pending is None
         self.pending = (slot, unit, self.reader.submit(read))
 
     def stage(self, *, block: bool = False) -> None:
@@ -152,9 +164,12 @@ class _WeightSlots:
                 self.stream.wait_event(self.released[slot])
             for bucket in unit.buckets:
                 size = bucket.shard_size
+                source = bucket.shard.gpu_parameter
+                if source is None:
+                    source = self.local[slot][bucket.key][:size]
                 dist.all_gather_into_tensor(
                     self.full[slot][bucket.key][: size * self.group.size()],
-                    self.local[slot][bucket.key][:size],
+                    source,
                     group=self.group,
                 )
             self.ready[slot] = self.stream.record_event()
@@ -301,6 +316,20 @@ class _GpuActivations:
         pass
 
 
+def _reduce_gradients(
+    unit: _Unit, main_grads: list[Tensor], group: dist.ProcessGroup
+) -> list[Tensor]:
+    stream = torch.cuda.current_stream()
+    reduced_grads = []
+    for bucket, full in zip(unit.buckets, main_grads):
+        reduced = torch.empty(bucket.shard_size, dtype=torch.float32, device=full.device)
+        dist.reduce_scatter_tensor(reduced, full, group=group)
+        full.record_stream(stream)
+        reduced.div_(group.size())
+        reduced_grads.append(reduced)
+    return reduced_grads
+
+
 class _CpuUpdates:
     def __init__(self, units, device, group, reader, updater, *, betas, eps):
         self.group = group
@@ -336,15 +365,9 @@ class _CpuUpdates:
         n = sum(bucket.shard_size for bucket in unit.buckets)
         host_grads = self.host[slot][:n].split([bucket.shard_size for bucket in unit.buckets])
         compute = torch.cuda.current_stream()
-        reduced_grads = []
         with torch.cuda.stream(self.stream):
             self.stream.wait_stream(compute)
-            for bucket, full in zip(unit.buckets, main_grads):
-                reduced = torch.empty(bucket.shard_size, dtype=torch.float32, device=full.device)
-                dist.reduce_scatter_tensor(reduced, full, group=self.group)
-                full.record_stream(self.stream)
-                reduced.div_(self.group.size())
-                reduced_grads.append(reduced)
+            reduced_grads = _reduce_gradients(unit, main_grads, self.group)
 
         # The previous update must finish reading this pinned slot before D2H.
         reuse = self.updates[slot]
@@ -384,6 +407,51 @@ class _CpuUpdates:
             raise FloatingPointError(f"Non-finite training gradient at unit {self.invalid_unit}")
 
 
+class _GpuUpdates:
+    def __init__(self, device, group, *, betas, eps, initialized):
+        self.group = group
+        self.device = device
+        self.betas = betas
+        self.eps = eps
+        self.stream = torch.cuda.Stream(device=device)
+        self.stream.wait_event(initialized)
+        with torch.cuda.stream(self.stream):
+            self.invalid = torch.full((), -1, dtype=torch.int64, device=device)
+        self.invalid_unit = -1
+
+    def prefetch(self, _index: int, _unit: _Unit) -> None:
+        pass
+
+    def submit(
+        self, index: int, unit: _Unit, main_grads: list[Tensor], _prefetched: None, *, lr: float
+    ) -> None:
+        compute = torch.cuda.current_stream()
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_stream(compute)
+            reduced_grads = _reduce_gradients(unit, main_grads, self.group)
+            finite = [
+                torch.isfinite(torch.stack(grad.aminmax())).all()
+                for grad in reduced_grads
+                if grad.numel()
+            ]
+            if not finite:
+                return
+            found_inf = torch.stack(finite).all().logical_not().to(torch.float32)
+            torch.maximum(
+                self.invalid, found_inf.to(torch.int64) * (index + 1) - 1, out=self.invalid
+            )
+            for bucket, grad in zip(unit.buckets, reduced_grads):
+                bucket.shard.step(grad, lr=lr, betas=self.betas, eps=self.eps, found_inf=found_inf)
+
+    def finish(self) -> None:
+        # Do not start the next step's all-gathers before the parameters are published.
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        dist.all_reduce(self.invalid, op=dist.ReduceOp.MAX, group=self.group)
+        self.invalid_unit = self.invalid.item()
+        if self.invalid_unit >= 0:
+            raise FloatingPointError(f"Non-finite training gradient at unit {self.invalid_unit}")
+
+
 class LayerByLayerTrainer:
     """Train an untied, dropout-free sequence of embedding, decoder and loss units.
 
@@ -404,14 +472,24 @@ class LayerByLayerTrainer:
         betas: tuple[float, float],
         eps: float,
         weight_decay: float,
-        activation_tier: str = "nvme_act",
+        activation_tier: str = "nvme",
+        optimizer_tier: str = "nvme",
     ):
-        if activation_tier not in {"gpu_act", "cpu_act", "nvme_act"}:
-            raise ValueError(f"Unknown layer-by-layer activation tier {activation_tier!r}")
+        tier = tier.removesuffix("_param")
+        activation_tier = activation_tier.removesuffix("_act")
+        for component, storage in (
+            ("parameter", tier),
+            ("activation", activation_tier),
+            ("optimizer", optimizer_tier),
+        ):
+            if storage not in {"gpu", "cpu", "nvme"}:
+                raise ValueError(f"Unknown layer-by-layer {component} tier {storage!r}")
         self.group = group
         self.device = device
         self.directory = directory
+        self.parameter_tier = tier
         self.activation_tier = activation_tier
+        self.optimizer_tier = optimizer_tier
         self.param_count = 0
         self.units = []
         self.activations: _Activations | _GpuActivations | None = None
@@ -440,7 +518,8 @@ class LayerByLayerTrainer:
                     rank=group.rank(),
                     world=group.size(),
                     tier=tier,
-                    resident=index == 1,
+                    optimizer_tier=optimizer_tier,
+                    device=device,
                     weight_decay=weight_decay,
                 )
                 bucket.unbind(torch.empty(0, dtype=key[0], device=device))
@@ -450,6 +529,8 @@ class LayerByLayerTrainer:
             raise ValueError("Layer-by-layer training requires embedding, decoder and loss units")
         self.betas = betas
         self.eps = eps
+        self._initialized = torch.cuda.current_stream(device).record_event()
+        self._iteration = 0
 
     def __enter__(self):
         with ExitStack() as stack:
@@ -463,11 +544,32 @@ class LayerByLayerTrainer:
                     "adam-update",
                 )
             ]
-            self.weights = _WeightSlots(self.units, self.device, self.group, readers[0])
-            self.activation_reader, self.activation_writer = readers[1:3]
-            self.updates = _CpuUpdates(
-                self.units, self.device, self.group, *readers[3:], betas=self.betas, eps=self.eps
+            self.weights = _WeightSlots(
+                self.units,
+                self.device,
+                self.group,
+                readers[0],
+                parameter_tier=self.parameter_tier,
+                initialized=self._initialized,
             )
+            self.activation_reader, self.activation_writer = readers[1:3]
+            if self.optimizer_tier == "gpu":
+                self.updates = _GpuUpdates(
+                    self.device,
+                    self.group,
+                    betas=self.betas,
+                    eps=self.eps,
+                    initialized=self._initialized,
+                )
+            else:
+                self.updates = _CpuUpdates(
+                    self.units,
+                    self.device,
+                    self.group,
+                    *readers[3:],
+                    betas=self.betas,
+                    eps=self.eps,
+                )
             self.workers = stack.pop_all()
         return self
 
@@ -499,7 +601,7 @@ class LayerByLayerTrainer:
             current = upcoming
 
     @torch.no_grad()
-    def _forward(self, batches):
+    def _forward(self, batches, *, iteration):
         self.weights.prefetch(0, self.units[0])
         last = len(self.units) - 1
         losses = []
@@ -509,12 +611,16 @@ class LayerByLayerTrainer:
                 self.weights.prefetch(index + 1, self.units[index + 1])
             with torch.cuda.nvtx.range(f"layer_by_layer.forward.{index}"):
                 for mb, value, labels in self._inputs(index, batches, backward=False):
-                    result = unit.module(value, labels)
+                    with torch.cuda.nvtx.range(
+                        f"layer_by_layer.forward.iteration_{iteration + 1}."
+                        f"layer_{index}.microbatch_{mb + 1}"
+                    ):
+                        result = unit.module(value, labels)
                     if index == last:
                         losses.append(result.detach())
                     else:
                         if self.activations is None:
-                            if self.activation_tier == "gpu_act":
+                            if self.activation_tier == "gpu":
                                 self.activations = _GpuActivations()
                             else:
                                 self.activations = _Activations(
@@ -522,7 +628,7 @@ class LayerByLayerTrainer:
                                     self.directory,
                                     self.activation_reader,
                                     self.activation_writer,
-                                    nvme=self.activation_tier == "nvme_act",
+                                    nvme=self.activation_tier == "nvme",
                                 )
                         self.activations.store(index + 1, mb, result)
                     self.weights.progress()
@@ -573,15 +679,22 @@ class LayerByLayerTrainer:
             self.weights.release(index, unit)
             self.updates.submit(index, unit, main_grads, optimizer, lr=lr)
 
-    def step(self, batches: Sequence[tuple[Tensor, Tensor]], *, lr: float) -> float:
-        """Run a complete optimization step and return the DP mean loss."""
+    def step(
+        self, batches: Sequence[tuple[Tensor, Tensor]], *, lr: float, iteration: int | None = None
+    ) -> float:
+        """Return the DP mean loss. The optional NVTX iteration is zero-based."""
         if not batches:
             raise ValueError("Layer-by-layer training requires at least one micro-batch")
         if self.updates.invalid_unit >= 0:
             raise RuntimeError("Discard the trainer after a non-finite gradient")
-        loss = self._forward(batches)
+        if iteration is None:
+            iteration = self._iteration
+        elif type(iteration) is not int or iteration < 0:
+            raise ValueError("Layer-by-layer iteration must be a nonnegative integer")
+        loss = self._forward(batches, iteration=iteration)
         if not math.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss: {loss}")
         self._backward(batches, lr=lr)
         self.updates.finish()
+        self._iteration = iteration + 1
         return loss

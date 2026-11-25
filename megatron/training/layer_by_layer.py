@@ -7,22 +7,34 @@ import json
 import logging
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
-from typing import Literal
+from typing import cast
 
 import torch
 from torch import distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.distributed.layer_by_layer import LayerByLayerTrainer
+from megatron.core.distributed.layer_by_layer_storage import StorageTier
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.layer_by_layer_workload import Qwen35DenseWorkload
 
 _LOG = logging.getLogger(__name__)
+_STORAGE_TIERS: tuple[StorageTier, ...] = ("gpu", "cpu", "nvme")
+_PARAMETER_ALIASES = {f"{tier}_param": tier for tier in _STORAGE_TIERS}
+_ACTIVATION_ALIASES = {f"{tier}_act": tier for tier in _STORAGE_TIERS}
+
+
+def _normalize_tier(value: str, *, flag: str, aliases: dict[str, StorageTier]) -> StorageTier:
+    tier = aliases.get(value, value)
+    if tier not in _STORAGE_TIERS:
+        raise ValueError(f"--{flag} must be gpu, cpu or nvme")
+    return cast(StorageTier, tier)
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -39,8 +51,9 @@ class LayerByLayerConfig:
     micro_batch_size: int = 1
     microbatches: int = 4
     steps: int = 3
-    parameter_tier: Literal["cpu_param", "nvme_param"] = "nvme_param"
-    activation_tier: Literal["gpu_act", "cpu_act", "nvme_act"] = "nvme_act"
+    parameter_tier: StorageTier = "nvme"
+    activation_tier: StorageTier = "nvme"
+    optimizer_tier: StorageTier = "nvme"
     learning_rate: float = 1e-4
     cpu_threads: int = 8
     seed: int = 1234
@@ -70,10 +83,18 @@ class LayerByLayerConfig:
                 raise ValueError(f"--{name.replace('_', '-')} must be a positive integer")
         if not Path(self.nvme_dir).is_dir():
             raise ValueError("--nvme-dir must be an existing directory")
-        if self.parameter_tier not in ("cpu_param", "nvme_param"):
-            raise ValueError("--parameter-tier must be cpu_param or nvme_param")
-        if self.activation_tier not in ("gpu_act", "cpu_act", "nvme_act"):
-            raise ValueError("--activation-tier must be gpu_act, cpu_act or nvme_act")
+        object.__setattr__(
+            self,
+            "parameter_tier",
+            _normalize_tier(self.parameter_tier, flag="parameter-tier", aliases=_PARAMETER_ALIASES),
+        )
+        object.__setattr__(
+            self,
+            "activation_tier",
+            _normalize_tier(self.activation_tier, flag="activation-tier", aliases=_ACTIVATION_ALIASES),
+        )
+        if self.optimizer_tier not in _STORAGE_TIERS:
+            raise ValueError("--optimizer-tier must be gpu, cpu or nvme")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("--learning-rate must be finite and positive")
         if len(self.betas) != 2 or any(not 0 <= beta < 1 for beta in self.betas):
@@ -123,8 +144,9 @@ def _args() -> LayerByLayerConfig:
     parser.add_argument("--micro-batch-size", type=_positive)
     parser.add_argument("--microbatches", type=_positive)
     parser.add_argument("--steps", type=_positive)
-    parser.add_argument("--parameter-tier", choices=("cpu_param", "nvme_param"))
-    parser.add_argument("--activation-tier", choices=("gpu_act", "cpu_act", "nvme_act"))
+    parser.add_argument("--parameter-tier", choices=(*_STORAGE_TIERS, *_PARAMETER_ALIASES))
+    parser.add_argument("--activation-tier", choices=(*_STORAGE_TIERS, *_ACTIVATION_ALIASES))
+    parser.add_argument("--optimizer-tier", choices=_STORAGE_TIERS)
     parser.add_argument("--nvme-dir", required=True, type=Path)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--cpu-threads", type=_positive)
@@ -156,14 +178,21 @@ def _train(args: LayerByLayerConfig, device: torch.device, group: dist.ProcessGr
     elapsed = []
     if rank == 0:
         _LOG.info(
-            "Initializing %d layers | sharding %d | %s | %s | %d micro-batches per rank",
+            "Initializing %d layers | sharding %d | parameter=%s | activation=%s | optimizer=%s "
+            "| %d micro-batches per rank",
             args.num_layers,
             group.size(),
             args.parameter_tier,
             args.activation_tier,
+            args.optimizer_tier,
             args.microbatches,
         )
-    with TemporaryDirectory(prefix=f"rank-{rank}-", dir=args.nvme_dir) as scratch:
+    scratch_dir = (
+        TemporaryDirectory(prefix=f"rank-{rank}-", dir=args.nvme_dir)
+        if "nvme" in (args.parameter_tier, args.activation_tier, args.optimizer_tier)
+        else nullcontext(args.nvme_dir)
+    )
+    with scratch_dir as scratch:
         with LayerByLayerTrainer(
             workload.make_units(),
             group=group,
@@ -171,6 +200,7 @@ def _train(args: LayerByLayerConfig, device: torch.device, group: dist.ProcessGr
             directory=Path(scratch),
             tier=args.parameter_tier,
             activation_tier=args.activation_tier,
+            optimizer_tier=args.optimizer_tier,
             betas=args.betas,
             eps=args.eps,
             weight_decay=args.weight_decay,
@@ -182,7 +212,7 @@ def _train(args: LayerByLayerConfig, device: torch.device, group: dist.ProcessGr
                 if step == args.profile_start:
                     torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 start = perf_counter()
-                loss = trainer.step(batches, lr=args.learning_rate)
+                loss = trainer.step(batches, lr=args.learning_rate, iteration=step)
                 torch.cuda.synchronize(device)
                 elapsed.append(perf_counter() - start)
                 if step + 1 == args.profile_end:
@@ -213,7 +243,7 @@ def _train(args: LayerByLayerConfig, device: torch.device, group: dist.ProcessGr
     transfers_by_rank = transfers.view(group.size(), 2).tolist()
     expected_d2h = (
         0
-        if args.activation_tier == "gpu_act"
+        if args.activation_tier == "gpu"
         else (args.num_layers + 1) * args.microbatches * args.steps
     )
     expected_transfers = [expected_d2h, 2 * expected_d2h]
@@ -228,6 +258,7 @@ def _train(args: LayerByLayerConfig, device: torch.device, group: dist.ProcessGr
         "parameter_count": model_parameters,
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
+        "optimizer_tier": args.optimizer_tier,
         "activation_d2h_completed_by_rank": [counts[0] for counts in transfers_by_rank],
         "activation_h2d_completed_by_rank": [counts[1] for counts in transfers_by_rank],
         "loss": loss,
