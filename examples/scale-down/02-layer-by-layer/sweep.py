@@ -16,18 +16,27 @@ import sys
 import tempfile
 from pathlib import Path
 
+from launch_network import resolve_network
+
 _LOG = logging.getLogger(__name__)
 _REPO = Path(__file__).resolve().parents[3]
 _WORLD_SIZE = 4
+_NSYS_VERSION = "2026.6.1"
+_GPU_METRICS_HZ = 20000
+_EXAMPLE_DIR = "examples/scale-down/02-layer-by-layer"
 _SOURCE_FILES = (
-    "examples/scale-down/06-layer-by-layer/run_sweep.sh",
-    "examples/scale-down/06-layer-by-layer/sweep.py",
+    f"{_EXAMPLE_DIR}/run_sweep.sh",
+    f"{_EXAMPLE_DIR}/sweep.py",
+    f"{_EXAMPLE_DIR}/launch_network.py",
     "megatron/core/distributed/layer_by_layer.py",
     "megatron/core/distributed/layer_by_layer_storage.py",
     "megatron/training/layer_by_layer.py",
     "megatron/training/layer_by_layer_workload.py",
 )
-_SINGLE_CASE_SCRIPT = "examples/scale-down/06-layer-by-layer/01-baseline/01_cpu_activation.sh"
+_CASE_SCRIPTS = tuple(
+    f"{_EXAMPLE_DIR}/01-baseline/{name}"
+    for name in ("01_cpu_offload.sh", "02_nvme_offload.sh", "offload_common.sh")
+)
 _RESULT_PREFIX = "LAYER_BY_LAYER_RESULT "
 _RESOURCE_ERRORS = {
     "gpu_oom": re.compile(
@@ -63,7 +72,7 @@ def _positive(value: str) -> int:
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--nvme-dir", type=Path, required=True, help="existing directory on local NVMe"
+        "--nvme-dir", "--nvme", type=Path, required=True, help="existing directory on local NVMe"
     )
     parser.add_argument(
         "--results-dir",
@@ -87,6 +96,9 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--cpu-threads", type=_positive)
+    parser.add_argument("--profile", choices=("none", "nsys"), default="none")
+    parser.add_argument("--profile-start", type=int, help="first profiled step, zero-based")
+    parser.add_argument("--profile-end", type=int, help="exclusive end of the capture")
     parser.add_argument("--tiny", action="store_true", help="use the small smoke model")
     parser.add_argument(
         "--single-case-layout", action="store_true", help="use node-level files for one depth"
@@ -99,10 +111,44 @@ def _arguments() -> argparse.Namespace:
         parser.error("--layers must contain distinct values")
     if args.single_case_layout and (len(args.layers) != 1 or args.results_dir is None):
         parser.error("--single-case-layout requires exactly one depth and --results-dir")
+    if args.profile == "nsys":
+        if args.profile_start is None:
+            args.profile_start = min(7, args.steps - 1)
+        if args.profile_end is None:
+            args.profile_end = args.profile_start + 1
+        if not 0 <= args.profile_start < args.profile_end <= args.steps:
+            parser.error("profiling requires 0 <= profile-start < profile-end <= steps")
+    elif args.profile_start is not None or args.profile_end is not None:
+        parser.error("--profile-start and --profile-end require --profile nsys")
     return args
 
 
-def _command(args: argparse.Namespace, layers: int, scratch: Path) -> list[str]:
+def _nsys_binary() -> str:
+    return os.environ.get("NSYS_BIN") or str(_REPO / f"NsightSystems-{_NSYS_VERSION}/bin/nsys")
+
+
+def _check_nsys_version() -> str:
+    binary = _nsys_binary()
+    try:
+        version = subprocess.check_output(
+            [binary, "--version"], cwd=_REPO, stderr=subprocess.STDOUT, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            f"Cannot run {binary}. Set NSYS_BIN to Nsight Systems {_NSYS_VERSION}."
+        ) from exc
+    if not re.match(
+        rf"^NVIDIA Nsight Systems version {re.escape(_NSYS_VERSION)}([.\s-]|$)", version
+    ):
+        raise RuntimeError(f"Expected Nsight Systems {_NSYS_VERSION} at {binary}. Got {version!r}.")
+    return version
+
+
+def _profile_report(args: argparse.Namespace, layers: int, results: Path) -> Path:
+    return results / ("train.nsys-rep" if args.single_case_layout else f"layers-{layers}.nsys-rep")
+
+
+def _command(args: argparse.Namespace, layers: int, scratch: Path, report: Path) -> list[str]:
     command = [
         sys.executable,
         "-m",
@@ -135,6 +181,24 @@ def _command(args: argparse.Namespace, layers: int, scratch: Path) -> list[str]:
         command.extend(("--learning-rate", str(args.learning_rate)))
     if args.cpu_threads is not None:
         command.extend(("--cpu-threads", str(args.cpu_threads)))
+    if args.profile == "nsys":
+        command.extend(
+            ("--profile-start", str(args.profile_start), "--profile-end", str(args.profile_end))
+        )
+        devices = "cuda-visible" if "CUDA_VISIBLE_DEVICES" in os.environ else "all"
+        command = [
+            _nsys_binary(),
+            "profile",
+            "--trace=cuda,nvtx",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--capture-range=cudaProfilerApi",
+            "--capture-range-end=stop",
+            f"--output={report.with_suffix('')}",
+            f"--gpu-metrics-devices={devices}",
+            f"--gpu-metrics-frequency={_GPU_METRICS_HZ}",
+            *command,
+        ]
     return command
 
 
@@ -205,7 +269,13 @@ def _read_result(
     return result
 
 
-def _write_launch(args: argparse.Namespace, results: Path, nvme_dir: Path) -> None:
+def _write_launch(
+    args: argparse.Namespace,
+    results: Path,
+    nvme_dir: Path,
+    worker_overrides: dict[str, str],
+    nsys_version: str | None,
+) -> None:
     launch = {
         "model": "Qwen/Qwen3.5-27B",
         "dtype": "bf16",
@@ -227,22 +297,42 @@ def _write_launch(args: argparse.Namespace, results: Path, nvme_dir: Path) -> No
         "parameter_tier": args.parameter_tier,
         "activation_tier": args.activation_tier,
         "nvme_path": str(nvme_dir),
-        "profile": "none",
+        "profile": args.profile,
+        "profile_start": args.profile_start,
+        "profile_end": args.profile_end,
+        "nsys_version": nsys_version,
+        "gpu_metrics_hz": _GPU_METRICS_HZ if nsys_version else None,
+        "gloo_socket_ifname": worker_overrides["GLOO_SOCKET_IFNAME"],
+        "nccl_socket_ifname": worker_overrides["NCCL_SOCKET_IFNAME"],
         "cuda_graph": "off",
     }
     (results / "launch.json").write_text(json.dumps(launch, indent=2) + "\n", encoding="utf-8")
 
 
-def _run_case(args: argparse.Namespace, layers: int, results: Path, nvme_dir: Path) -> dict:
+def _run_case(
+    args: argparse.Namespace,
+    layers: int,
+    results: Path,
+    nvme_dir: Path,
+    worker_overrides: dict[str, str],
+) -> dict:
     log_name, command_name = (
         ("train.log", "command.txt")
         if args.single_case_layout
         else (f"layers-{layers}.log", f"layers-{layers}.command.txt")
     )
     log_path = results / log_name
+    report = _profile_report(args, layers, results)
     with tempfile.TemporaryDirectory(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir) as scratch:
-        command = _command(args, layers, Path(scratch))
-        (results / command_name).write_text(shlex.join(command) + "\n", encoding="utf-8")
+        command = _command(args, layers, Path(scratch), report)
+        rendered = command
+        if worker_overrides:
+            rendered = [
+                "env",
+                *(f"{key}={value}" for key, value in worker_overrides.items()),
+                *command,
+            ]
+        (results / command_name).write_text(shlex.join(rendered) + "\n", encoding="utf-8")
         _LOG.info("Running %d layers. Log at %s", layers, log_path)
         with log_path.open("w", encoding="utf-8") as log:
             returncode = subprocess.run(
@@ -250,10 +340,10 @@ def _run_case(args: argparse.Namespace, layers: int, results: Path, nvme_dir: Pa
                 cwd=_REPO,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                env=dict(os.environ, PYTHONUNBUFFERED="1"),
+                env=dict(os.environ, PYTHONUNBUFFERED="1", **worker_overrides),
                 check=False,
             ).returncode
-    return _read_result(
+    case = _read_result(
         log_path,
         returncode,
         layers,
@@ -261,25 +351,49 @@ def _run_case(args: argparse.Namespace, layers: int, results: Path, nvme_dir: Pa
         microbatches=args.microbatches,
         activation_tier=args.activation_tier,
     )
+    if args.profile == "nsys" and case["status"] == "passed":
+        if not report.is_file() or report.stat().st_size == 0:
+            _LOG.error("Missing or empty Nsight Systems report: %s", report)
+            case["status"] = "invalid_profile"
+    return case
 
 
 def main() -> int:
     """Run selected depths and report the largest completed case."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = _arguments()
-    nvme_dir = args.nvme_dir.resolve()
+    nvme_dir = args.nvme_dir.absolute()
     if args.dry_run:
+        results = args.results_dir or Path("results/02-layer-by-layer-<unique>")
         for layers in args.layers:
             scratch = nvme_dir / f"layer-by-layer-{layers}-<unique>"
-            _LOG.info("%s", shlex.join(_command(args, layers, scratch)))
+            report = _profile_report(args, layers, results.absolute())
+            _LOG.info("%s", shlex.join(_command(args, layers, scratch, report)))
         return 0
     if not nvme_dir.is_dir():
         _LOG.error("NVMe directory does not exist: %s", nvme_dir)
         return 2
+    try:
+        nsys_version = _check_nsys_version() if args.profile == "nsys" else None
+        worker_overrides = (
+            resolve_network(os.environ) if args.single_case_layout or nsys_version else {}
+        )
+    except RuntimeError as exc:
+        _LOG.error("%s", exc)
+        return 2
+    if worker_overrides:
+        _LOG.info(
+            "Socket interfaces | Gloo %s | NCCL %s",
+            worker_overrides["GLOO_SOCKET_IFNAME"],
+            worker_overrides["NCCL_SOCKET_IFNAME"],
+        )
+    if nsys_version:
+        _LOG.info("%s", nsys_version)
+        worker_overrides["NCCL_NVTX_DISABLE"] = "0"
     if args.results_dir is None:
         root = Path("results").resolve()
         root.mkdir(parents=True, exist_ok=True)
-        results = Path(tempfile.mkdtemp(prefix="06-layer-by-layer-", dir=root))
+        results = Path(tempfile.mkdtemp(prefix="02-layer-by-layer-", dir=root))
     else:
         results = args.results_dir.resolve()
         results.mkdir(parents=True, exist_ok=False)
@@ -288,8 +402,8 @@ def main() -> int:
     (results / "revision.txt").write_text(revision + "\n", encoding="utf-8")
     source_files = _SOURCE_FILES
     if args.single_case_layout:
-        _write_launch(args, results, nvme_dir)
-        source_files += (_SINGLE_CASE_SCRIPT,)
+        _write_launch(args, results, nvme_dir, worker_overrides, nsys_version)
+        source_files += _CASE_SCRIPTS
     source_hashes = {
         path: hashlib.sha256((_REPO / path).read_bytes()).hexdigest() for path in source_files
     }
@@ -302,15 +416,21 @@ def main() -> int:
         writer = csv.DictWriter(summary, fieldnames=_RESULT_COLUMNS)
         writer.writeheader()
         for layers in args.layers:
-            case = _run_case(args, layers, results, nvme_dir)
+            case = _run_case(args, layers, results, nvme_dir, worker_overrides)
             writer.writerow(case)
             summary.flush()
             if args.single_case_layout:
                 status = 0 if case["status"] == "passed" else case["returncode"] or 1
-                (results / "run_info.txt").write_text(
-                    f"case_status={case['status']}\nreturncode={case['returncode']}\nstatus={status}\n",
-                    encoding="utf-8",
-                )
+                info = [
+                    f"case_status={case['status']}",
+                    f"returncode={case['returncode']}",
+                    f"gloo_socket_ifname={worker_overrides['GLOO_SOCKET_IFNAME']}",
+                    f"nccl_socket_ifname={worker_overrides['NCCL_SOCKET_IFNAME']}",
+                ]
+                if nsys_version:
+                    info.append(f"nsys_version={nsys_version}")
+                info.append(f"status={status}")
+                (results / "run_info.txt").write_text("\n".join(info) + "\n", encoding="utf-8")
             _LOG.info("%d layers: %s", layers, case["status"])
             if case["status"] == "passed":
                 largest = layers if largest is None else max(largest, layers)

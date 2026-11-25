@@ -2,24 +2,31 @@
 
 Run on one GB200 node with four GPUs available to the same CUDA/NCCL environment. The sweep uses four-way full sharding with TP, PP and CP each set to 1. It keeps the Qwen3.5-27B dense text-model widths and varies decoder depth. The full model has 64 decoder layers. Training uses BF16, randomly initialized weights, and synthetic token batches.
 
-## 32-layer CPU activation case
+## 32-layer offload cases
 
-Run the numbered baseline from the repository root. It uses the Qwen3.5-27B text attention mix, sequence length 4096, MBS 1, GBS 16, four micro-batches per rank, `cpu_param`, and `cpu_act`. The default is 10 optimizer steps with profiling disabled. Use `--train-iters 3` for a shorter run.
+Run the numbered cases from the repository root. Both use the Qwen3.5-27B text attention mix, 32 decoder layers, sequence length 4096, MBS 1, GBS 16, four micro-batches per rank, and 10 optimizer steps.
 
 ```bash
-case_script=examples/scale-down/06-layer-by-layer/01-baseline/01_cpu_activation.sh
-bash "$case_script" --dry-run
-bash "$case_script" --nvme-path /path/to/local/nvme
+study=examples/scale-down/02-layer-by-layer/01-baseline
+bash "$study/01_cpu_offload.sh" --dry-run
+bash "$study/01_cpu_offload.sh" --nvme /tmp
+bash "$study/02_nvme_offload.sh" --nvme /tmp
 ```
 
-The default result root is `results/06-layer-by-layer/01-baseline/01-cpu-activation/`. A case is named `model_.../node0/` and contains `launch.json`, `command.txt`, `run_info.txt`, `train.log`, `summary.csv`, and source provenance. Use `--print-result-dir` to resolve the full path and `--output-dir` to run another repeat in a fresh output root.
+`01_cpu_offload.sh` uses `cpu_param + cpu_act`. `02_nvme_offload.sh` uses `nvme_param + nvme_act`. Both create private scratch directories under `/tmp` by default. Set `--nvme DIR` or `NVME_PATH` if the node's local NVMe is mounted elsewhere.
 
-The CPU activation case passes when `run_info.txt` reports `status=0` and all four ranks complete 1320 D2H and 2640 H2D activation copies at the default 10 steps. A three-step run expects 396 and 792 copies per rank.
+Both cases use Nsight Systems **2026.6.1** to capture CUDA, NVTX, and GPU metrics at 20 kHz. The default window is iteration 8 (step 7, zero-based). With `--train-iters 3`, capture covers iteration 3. The launcher checks the version at `NsightSystems-2026.6.1/bin/nsys` under the repository root, or at the executable set through `NSYS_BIN`. Use `--profile none` for an unprofiled run. [Nsight Systems CLI reference](https://docs.nvidia.com/nsight-systems/UserGuide/)
+
+On each node the launcher checks IPv4 addresses on up interfaces. It honors valid `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` values. Automatic selection tries `eth0`, then `bond1`, then an IPv4 default-route interface. NCCL uses an exact interface name. The selected interfaces and Nsight version are recorded in `run_info.txt`.
+
+Results land under `results/02-layer-by-layer/01-baseline/<case>/model_.../node0/`. The directory contains `launch.json`, `command.txt`, `run_info.txt`, `train.log`, `summary.csv`, source provenance, and `train.nsys-rep` when profiling is enabled. Use `--print-result-dir` to resolve the path or `--output-dir` for a fresh repeat.
+
+A pass requires `status=0`, a nonempty report when profiling, and **1320 D2H / 2640 H2D** transfers per rank for 10 steps. A three-step run expects 396 and 792 copies per rank.
 
 ## Capacity sweep
 
 ```bash
-bash examples/scale-down/06-layer-by-layer/run_sweep.sh \
+bash examples/scale-down/02-layer-by-layer/run_sweep.sh \
   --nvme-dir /path/to/local/nvme --layers 16 32 64
 ```
 

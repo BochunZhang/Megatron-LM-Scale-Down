@@ -47,11 +47,20 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--cpu-threads", type=_positive, default=8)
     parser.add_argument("--seed", type=_positive, default=1234)
     parser.add_argument("--tiny", action="store_true")
+    parser.add_argument("--profile-start", type=int, help="first profiled step, starting at zero")
+    parser.add_argument("--profile-end", type=int, help="first step after the profiled window")
     args = parser.parse_args()
     if not args.nvme_dir.is_dir():
         parser.error("--nvme-dir must be an existing directory")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         parser.error("--learning-rate must be finite and positive")
+    if (args.profile_start is None) != (args.profile_end is None):
+        parser.error("--profile-start and --profile-end must be supplied together")
+    if (
+        args.profile_start is not None
+        and not 0 <= args.profile_start < args.profile_end <= args.steps
+    ):
+        parser.error("profiling requires 0 <= --profile-start < --profile-end <= --steps")
     return args
 
 
@@ -92,10 +101,16 @@ def _train(args: argparse.Namespace, device: torch.device, group: dist.ProcessGr
                 batches = [workload.make_batch(step, mb, rank) for mb in range(args.microbatches)]
                 torch.cuda.synchronize(device)
                 dist.barrier(group=group, device_ids=[device.index])
+                if step == args.profile_start:
+                    torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 start = perf_counter()
                 loss = trainer.step(batches, lr=args.learning_rate)
                 torch.cuda.synchronize(device)
                 elapsed.append(perf_counter() - start)
+                if step + 1 == args.profile_end:
+                    # The first rank to stop the capture must wait for every rank's step.
+                    dist.barrier(group=group, device_ids=[device.index])
+                    torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
                 if rank == 0:
                     _LOG.info(
                         "Step %d/%d | loss %.8f | %.3f s", step + 1, args.steps, loss, elapsed[-1]
