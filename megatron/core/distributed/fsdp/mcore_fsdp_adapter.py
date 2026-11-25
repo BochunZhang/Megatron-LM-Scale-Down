@@ -127,6 +127,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.num_moe_experts = getattr(config, "num_moe_experts", None)
 
         self.ddp_config = ddp_config
+        if ddp_config.fsdp_layer_by_layer_cpu_optimizer and not config.layer_by_layer_schedule:
+            raise ValueError("FSDP layer-by-layer CPU optimizer requires the layer-by-layer schedule.")
         log_single_rank(
             logger,
             logging.INFO,

@@ -341,6 +341,7 @@ class MegatronFSDP(torch.nn.Module):
         self.cpu_offload_weight = self.ddp_config.fsdp_cpu_offload_weight
         self.cpu_offload_grad = self.ddp_config.fsdp_cpu_offload_grad
         self.cpu_offload_optimizer = "optimizer" in self.ddp_config.fsdp_cpu_offload
+        self.defer_layer_by_layer_grad_reduce = self.ddp_config.fsdp_layer_by_layer_cpu_optimizer
         self._check_cpu_offload_config()
         if self.cpu_offload_grad and self.data_parallel_sharding_strategy == "optim":
             # A backward outside no_sync() must reduce its gradients.
@@ -380,7 +381,7 @@ class MegatronFSDP(torch.nn.Module):
             raise ValueError("CPU gradient accumulation requires eager FSDP2/3 gradient offload.")
         if config.fsdp_cpu_optimizer and (
             not self.cpu_offload_optimizer
-            or not config.fsdp_cpu_grad_accumulation
+            or not (config.fsdp_cpu_grad_accumulation or self.defer_layer_by_layer_grad_reduce)
             or self.data_parallel_sharding_strategy != "optim_grads_params"
             or config.fp8_param_gather
             or self.mp_policy.main_params_dtype != torch.float32
@@ -388,6 +389,19 @@ class MegatronFSDP(torch.nn.Module):
             raise ValueError(
                 "FSDP CPU AdamW requires eager FSDP3, optimizer and gradient offload, "
                 "FP32 master weights, and non-FP8 compute weights."
+            )
+        if self.defer_layer_by_layer_grad_reduce and (
+            not config.fsdp_cpu_optimizer
+            or self.cpu_offload_grad
+            or config.fsdp_nvme_path is not None
+            or not config.overlap_grad_reduce
+            or config.megatron_fsdp_cuda_graph_mode
+            or self.mp_policy.main_grads_dtype != torch.float32
+            or self.mp_policy.grad_comm_dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "FSDP layer-by-layer CPU AdamW requires eager gradient reduction with "
+                "BF16 communication and FP32 gradient shards on GPU."
             )
         if config.fsdp_nvme_path is not None and (
             not config.fsdp_nvme_path or not config.fsdp_cpu_optimizer or not self.cpu_offload_weight
@@ -485,6 +499,7 @@ class MegatronFSDP(torch.nn.Module):
         self.side_stream_for_cpu_offload_d2h = None
         if self.cpu_offload_weight or self.cpu_offload_grad:
             self.side_stream_for_cpu_offload_h2d = torch.cuda.Stream()
+        if self.cpu_offload_weight or self.cpu_offload_grad or self.defer_layer_by_layer_grad_reduce:
             self.side_stream_for_cpu_offload_d2h = torch.cuda.Stream()
 
         # Initialize the param and grad buffer.
@@ -610,10 +625,12 @@ class MegatronFSDP(torch.nn.Module):
             # This setting is needed to have this attribute present after every
             # un-shard of the FSDP params.
             param.__fsdp_param__ = True
-            # Unsharded gradients already contain the previous microbatch sum.
-            # Sharded gradients produce a fresh contribution before reduce-scatter.
+            # Unsharded and deferred gradients hold the previous microbatch sum.
+            # Other sharded gradients produce a fresh contribution before reduce-scatter.
             gbuf = getattr(param, "_gbuf", None)
-            param.overwrite_main_grad = gbuf is None or gbuf.is_data_distributed
+            param.overwrite_main_grad = not self.defer_layer_by_layer_grad_reduce and (
+                gbuf is None or gbuf.is_data_distributed
+            )
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
@@ -759,11 +776,14 @@ class MegatronFSDP(torch.nn.Module):
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
                             _check_nan_in_grad(to_local_if_dtensor(param.grad))
-                        # Copy the gradient into the allocated main gradient bucket.
-                        # It will be reduce-scattered and accumulated into gbuf.
-                        param.main_grad.copy_(to_local_if_dtensor(param.grad))
+                        local_grad = to_local_if_dtensor(param.grad)
+                        if self.defer_layer_by_layer_grad_reduce:
+                            param.main_grad.add_(local_grad)
+                        else:
+                            # This microbatch is reduce-scattered and accumulated into gbuf.
+                            param.main_grad.copy_(local_grad)
                         del param.grad
-                    else:
+                    elif not self.defer_layer_by_layer_grad_reduce:
                         param.main_grad.zero_()
             # Unsharded Gradient Buffer
             else:
@@ -858,6 +878,12 @@ class MegatronFSDP(torch.nn.Module):
 
             for param in param_list:
                 _grad_acc(param)
+
+            if self.defer_layer_by_layer_grad_reduce:
+                # The schedule calls the root hook after every layer and microbatch
+                # has completed backward. Keep full gradient buckets until then.
+                self._params_require_handle_grad.difference_update(param_list)
+                return
 
             grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [
                 "optim_grads",
@@ -971,6 +997,16 @@ class MegatronFSDP(torch.nn.Module):
             )
             for param in ordered_params:
                 _grad_acc(param)
+
+            if self.defer_layer_by_layer_grad_reduce:
+                # Launch in bucket order on every rank, including buckets whose
+                # gradients were already accumulated by the per-parameter hook.
+                ordered_params = [
+                    param
+                    for group in self.param_and_grad_buffer.parameter_groups
+                    if group.requires_grad
+                    for param in group.params
+                ]
 
             # Reduce the remaining gradients.
             grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [

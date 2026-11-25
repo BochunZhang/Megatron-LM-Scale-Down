@@ -257,6 +257,9 @@ class DistributedDataParallelConfig:
     fsdp_cpu_optimizer: bool = False
     """Update FSDP-owned master weights with CPU AdamW."""
 
+    fsdp_layer_by_layer_cpu_optimizer: bool = False
+    """Defer layer-by-layer gradient reduction and update decoder layer 0 on the GPU."""
+
     fsdp_nvme_path: str | None = None
     """Local NVMe directory for spilling the CPU-offloaded FSDP buffers."""
 
@@ -302,7 +305,10 @@ class DistributedDataParallelConfig:
         if set(self.fsdp_cpu_offload) - {"optimizer", "weight", "gradient"}:
             raise ValueError("fsdp_cpu_offload accepts optimizer, weight, and gradient.")
         if (
-            self.fsdp_cpu_grad_accumulation or self.fsdp_cpu_optimizer or self.fsdp_nvme_path is not None
+            self.fsdp_cpu_grad_accumulation
+            or self.fsdp_cpu_optimizer
+            or self.fsdp_layer_by_layer_cpu_optimizer
+            or self.fsdp_nvme_path is not None
         ) and not self.use_megatron_fsdp:
             raise ValueError("CPU gradient accumulation, CPU AdamW and NVMe require Megatron-FSDP.")
         if self.fsdp_cpu_offload:

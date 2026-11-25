@@ -2790,6 +2790,7 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
         cpu_offload = self.ddp_config.fsdp_cpu_offload_weight or self.ddp_config.fsdp_cpu_offload_grad
+        layer_by_layer_cpu_optimizer = self.ddp_config.fsdp_layer_by_layer_cpu_optimizer
         pool_kwargs = {"memory_buffer": GlobalMemoryBuffer()} if cpu_offload else {}
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
@@ -2822,16 +2823,20 @@ class ParamAndGradBuffer:
                 grad_dtype_fn = lambda pg: grad_comm_dtype  # noqa: E731
             else:
                 grad_dtype_fn = operator.attrgetter("grad_dtype")
-            self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
-                name="fsdp_grads",
-                fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
-                dtype_fn=grad_dtype_fn,
-                fallback_to_persistent_buffer=(
-                    self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
-                ),
-                **pool_kwargs,
-            )
+            # The deferred schedule retains each full BF16 gradient until all
+            # backward stages complete. Only the weight buckets can reuse slots.
+            self.main_grad_alloc = None
+            if not layer_by_layer_cpu_optimizer:
+                self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
+                    name="fsdp_grads",
+                    fsdp_param_groups=self.parameter_groups,
+                    size=UB_BUFFER_NUM,
+                    dtype_fn=grad_dtype_fn,
+                    fallback_to_persistent_buffer=(
+                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                    ),
+                    **pool_kwargs,
+                )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
                 # to leverage NCCL UBR for high-precision gradient reduction with
@@ -2923,8 +2928,11 @@ class ParamAndGradBuffer:
 
             # CPU offloading only applies to FSDP unit modules. Model weights are only
             # offloaded when the main weight buffer holds the optimizer copy of the weights.
+            # In the dense layer-by-layer schedule, decoder layer 0 is the first FSDP unit.
+            gpu_update = layer_by_layer_cpu_optimizer and group.fsdp_unit_id == 0
             offload_model_weight = (
                 self.ddp_config.fsdp_cpu_offload_weight
+                and not gpu_update
                 and (group.fsdp_unit_id is not None or self.ddp_config.fsdp_cpu_optimizer)
                 and should_create_grad_buffer_or_main_weight_buffer
                 and self.mp_policy.main_params_dtype is not None
@@ -2995,7 +3003,7 @@ class ParamAndGradBuffer:
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
-                    cpu_offload="optimizer" in self.ddp_config.fsdp_cpu_offload,
+                    cpu_offload="optimizer" in self.ddp_config.fsdp_cpu_offload and not gpu_update,
                     **main_buf_extra_kwargs,
                 )
 
@@ -3132,13 +3140,14 @@ class ParamAndGradBuffer:
                     if group.model_weight_buffer is not None
                 }
             )
-            self.main_grad_alloc.reserve_slots(
-                {
-                    i: group.main_grad_buffer.bucket_index.size
-                    for i, group in enumerate(self.parameter_groups)
-                    if group.main_grad_buffer is not None
-                }
-            )
+            if self.main_grad_alloc is not None:
+                self.main_grad_alloc.reserve_slots(
+                    {
+                        i: group.main_grad_buffer.bucket_index.size
+                        for i, group in enumerate(self.parameter_groups)
+                        if group.main_grad_buffer is not None
+                    }
+                )
             staging_sizes = {
                 i: group.main_grad_buffer.data_size
                 for i, group in enumerate(self.parameter_groups)
@@ -3494,7 +3503,12 @@ class ParamAndGradBuffer:
                             self.mp_policy.grad_comm_dtype if p._gbuf.is_data_distributed else None
                         )
                     )
-                    if gbuf.cpu_offload and not gbuf.slot_filled:
+                    if (
+                        self.ddp_config.fsdp_layer_by_layer_cpu_optimizer and not gbuf.slot_filled
+                    ):
+                        bucket.data.zero_()
+                        gbuf.slot_filled = True
+                    elif gbuf.cpu_offload and not gbuf.slot_filled:
                         if gbuf.is_data_distributed:
                             # Fused wgrad may accumulate into its output. Start
                             # each microbatch with a clean communication bucket.

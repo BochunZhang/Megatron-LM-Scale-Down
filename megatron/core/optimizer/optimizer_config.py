@@ -350,6 +350,9 @@ class OptimizerConfig:
     use_torch_optimizer_for_cpu_offload: bool = False
     """If True, use torch.optim.Optimizer for CPU offload."""
 
+    fsdp_cpu_optimizer_backend: str = field(default="torch", kw_only=True)
+    """Backend for ddp.fsdp_cpu_optimizer: PyTorch AdamW or "grace_adam"."""
+
     overlap_cpu_optimizer_d2h_h2d: bool = False
     """
     When set to `True`, this flag enables overlapping of the CPU optimizer
@@ -394,6 +397,9 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.fsdp_cpu_optimizer_backend not in ("torch", "grace_adam"):
+            raise ValueError("fsdp_cpu_optimizer_backend must be 'torch' or 'grace_adam'.")
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are

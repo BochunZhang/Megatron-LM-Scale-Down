@@ -504,6 +504,8 @@ def _get_megatron_optimizer_based_on_param_groups(
         getattr(getattr(chunk, "ddp_config", None), "fsdp_cpu_optimizer", False)
         for chunk in model_chunks
     )
+    if config.fsdp_cpu_optimizer_backend == "grace_adam" and not fsdp_cpu_optimizer:
+        raise ValueError("GraceAdam requires ddp.fsdp_cpu_optimizer.")
     if fsdp_cpu_optimizer and (
         config.optimizer != "adam"
         or not config.decoupled_weight_decay
@@ -524,6 +526,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             optimizer = FSDPCPUAdam(
                 param_groups,
                 model_chunks,
+                backend=config.fsdp_cpu_optimizer_backend,
                 lr=config.lr,
                 weight_decay=config.weight_decay,
                 betas=(config.adam_beta1, config.adam_beta2),

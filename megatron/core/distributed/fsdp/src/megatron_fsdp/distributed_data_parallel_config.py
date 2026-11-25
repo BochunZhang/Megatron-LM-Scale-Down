@@ -197,6 +197,9 @@ class DistributedDataParallelConfig:
     fsdp_cpu_optimizer: bool = False
     """Update FSDP-owned master weights with CPU AdamW."""
 
+    fsdp_layer_by_layer_cpu_optimizer: bool = False
+    """Defer layer-by-layer gradient reduction and update decoder layer 0 on the GPU."""
+
     fsdp_nvme_path: str | None = None
     """Local NVMe directory for spilling the CPU-offloaded FSDP buffers."""
 

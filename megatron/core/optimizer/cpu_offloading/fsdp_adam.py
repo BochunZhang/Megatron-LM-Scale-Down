@@ -1,8 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
-"""CPU AdamW updates for Megatron-FSDP master weight shards."""
+"""CPU AdamW with optional GPU layer-zero updates for Megatron-FSDP shards."""
 
+import platform
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -13,11 +15,53 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import nvtx_range
 _MOMENTS = ("exp_avg", "exp_avg_sq")
 
 
-class FSDPCPUAdam(torch.optim.AdamW):
-    """Keep FSDP's logical parameter groups while updating local CPU shards."""
+def _create_grace_adam() -> torch.optim.Optimizer:
+    if platform.system() != "Linux" or platform.machine().lower() not in {"aarch64", "arm64"}:
+        raise RuntimeError("FSDP GraceAdam requires Linux AArch64 with SVE.")
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+    except OSError as exc:
+        raise RuntimeError("FSDP GraceAdam could not check CPU support for SVE.") from exc
+    if not any(
+        line.startswith("Features") and "sve" in line.split() for line in cpuinfo.splitlines()
+    ):
+        raise RuntimeError("FSDP GraceAdam requires Linux AArch64 with SVE.")
 
-    def __init__(self, params: list[dict], model_chunks: list, **kwargs):
+    requirement = "FSDP GraceAdam requires DeepSpeed v0.20.1 or a compatible SVE build."
+    try:
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(requirement) from exc
+
+    if not hasattr(DeepSpeedCPUAdam, "copy_supported") or not hasattr(
+        DeepSpeedCPUAdam, "grad_scale_supported"
+    ):
+        raise RuntimeError(requirement)
+    try:
+        optimizer = DeepSpeedCPUAdam([{"params": []}], adamw_mode=True, fp32_optimizer_states=True)
+        # On AArch64, the SVE kernel supports gradient scaling and lacks a fused BF16 store.
+        supports_sve = not optimizer.copy_supported() and optimizer.grad_scale_supported()
+    except (ImportError, OSError, RuntimeError, AttributeError) as exc:
+        raise RuntimeError(requirement) from exc
+    if not supports_sve:
+        raise RuntimeError(requirement)
+    return optimizer
+
+
+class FSDPCPUAdam(torch.optim.AdamW):
+    """Keep FSDP's logical parameter groups while updating their local shards."""
+
+    def __init__(
+        self, params: list[dict], model_chunks: list, *, backend: str = "torch", **kwargs
+    ) -> None:
         super().__init__(params, foreach=True, **kwargs)
+        self._grace_adam = _create_grace_adam() if backend == "grace_adam" else None
+        self._layer_by_layer = any(
+            getattr(getattr(chunk, "ddp_config", None), "fsdp_layer_by_layer_cpu_optimizer", False)
+            for chunk in model_chunks
+        )
+        if self._layer_by_layer and backend != "grace_adam":
+            raise ValueError("The layer-by-layer hybrid optimizer requires GraceAdam.")
         self.buckets = []
         for chunk in model_chunks:
             buffers = chunk.param_and_grad_buffer
@@ -42,12 +86,44 @@ class FSDPCPUAdam(torch.optim.AdamW):
             master.get_item(item_id, only_shard=True, data=plane).view(shape) for plane in moments
         ]
 
-    @torch.no_grad()
-    def step(self, closure=None) -> None:
-        """Apply AdamW to one FSDP bucket at a time and publish its compute weights."""
-        if closure is not None:
-            raise ValueError("FSDP CPU AdamW does not take a closure.")
-        groups = {param: group for group in self.param_groups for param in group["params"]}
+    @staticmethod
+    def _step_grace_adam(
+        optimizer, group, weights, grads, averages, squares, steps, *, bucket_id=None
+    ) -> None:
+        native_group = optimizer.param_groups[0]
+        native_group.update(
+            params=weights,
+            lr=group["lr"],
+            betas=group["betas"],
+            eps=group["eps"],
+            weight_decay=group["weight_decay"],
+        )
+        try:
+            # DeepSpeed borrows the CPU shards while FSDP retains the checkpoint state.
+            for weight, grad, average, square, step in zip(
+                weights, grads, averages, squares, steps
+            ):
+                weight.grad = grad
+                optimizer.state[weight] = {
+                    "step": int(step.item()),
+                    "exp_avg": average,
+                    "exp_avg_sq": square,
+                }
+            if bucket_id is None:
+                optimizer.step()
+            else:
+                # The native call waits for its OpenMP team before returning.
+                with nvtx_range(lambda: f"GraceAdam bucket={bucket_id}"):
+                    optimizer.step()
+            for weight, step in zip(weights, steps):
+                step.fill_(optimizer.state[weight]["step"])
+        finally:
+            for weight in weights:
+                weight.grad = None
+            native_group["params"] = []
+            optimizer.state.clear()
+
+    def _active_bucket_groups(self, groups):
         for buffers, bucket, params in self.buckets:
             by_group = defaultdict(list)
             for param in params:
@@ -57,9 +133,152 @@ class FSDPCPUAdam(torch.optim.AdamW):
                         state.setdefault("step", torch.zeros((), device="cpu")).add_(1)
                     elif param.grad is not None:
                         by_group[id(groups[param])].append(param)
-            if not by_group:
-                continue
+            if by_group:
+                yield buffers, bucket, params, by_group
 
+    def _update_bucket(self, groups, buffers, bucket, params, by_group, weight_data, cpu_grad):
+        master = bucket.main_weight_buffer
+        gbuf = bucket.main_grad_buffer
+        on_gpu = cpu_grad is None
+        moments = self._moments(
+            master, load=any(p._local_tensor.numel() and p in self.state for p in params)
+        )
+        range_name = "fsdp.layer_by_layer.GPUAdamW" if on_gpu else "fsdp.cpu_optimizer.adamw"
+        with nvtx_range(lambda: f"{range_name} bucket={master.bucket_id}"):
+            for active_params in by_group.values():
+                group = groups[active_params[0]]
+                weights, grads, averages, squares, steps = [], [], [], [], []
+                for param in active_params:
+                    original = params[param]
+                    item = master.param_idx[original]
+                    weight = master.get_item(item, only_shard=True, data=weight_data)
+                    if on_gpu:
+                        grad = param.grad._local_tensor.view_as(weight)
+                    else:
+                        grad = gbuf.get_item(
+                            gbuf.param_idx[original], only_shard=True, data=cpu_grad
+                        )
+                    state = self.state[param]
+                    if "step" not in state:
+                        state["step"] = torch.zeros((), device="cpu")
+                        if moments is None:
+                            state.update({key: torch.zeros_like(weight) for key in _MOMENTS})
+                    if moments is None:
+                        avg, sq = (state[key] for key in _MOMENTS)
+                    else:
+                        avg, sq = self._views(master, moments, item, weight.shape)
+                    weights.append(weight)
+                    grads.append(grad)
+                    averages.append(avg)
+                    squares.append(sq)
+                    steps.append(state["step"])
+                if self._grace_adam is not None and not on_gpu:
+                    self._step_grace_adam(
+                        self._grace_adam,
+                        group,
+                        weights,
+                        grads,
+                        averages,
+                        squares,
+                        steps,
+                        bucket_id=master.bucket_id if self._layer_by_layer else None,
+                    )
+                    continue
+                beta1, beta2 = group["betas"]
+                adamw(
+                    weights,
+                    grads,
+                    averages,
+                    squares,
+                    [],
+                    steps,
+                    foreach=True,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group["lr"],
+                    weight_decay=group["weight_decay"],
+                    eps=group["eps"],
+                    maximize=False,
+                )
+        if on_gpu:
+            wbuf = bucket.model_weight_buffer
+            for param in bucket.params:
+                source = master.get_item(master.param_idx[param], only_shard=True)
+                target = wbuf.get_item(wbuf.param_idx[param], only_shard=True)
+                target.copy_(source)
+        else:
+            if moments is not None:
+                master.nvme.write(f"adam-{master.bucket_id}", moments)
+            buffers.commit_cpu_optimizer_bucket(bucket, weight_data)
+
+    def _step_layer_by_layer(self, groups):
+        cpu_buckets = []
+        gpu_buckets = []
+        for active in self._active_bucket_groups(groups):
+            _, bucket, _, _ = active
+            if bucket.main_weight_buffer.cpu_offload:
+                cpu_buckets.append(active)
+            else:
+                gpu_buckets.append(active)
+
+        # Finalization and global gradient clipping have queued all writes to the
+        # FP32 shards on the training stream. One bucket of lookahead allows GPU
+        # copies to run during the synchronous multithreaded CPU optimizer call.
+        d2h_streams = {buffers.cpu_offload_d2h_stream for buffers, *_ in cpu_buckets}
+        for stream in d2h_streams:
+            stream.wait_stream(torch.cuda.current_stream(stream.device))
+
+        def stage(active, slot):
+            buffers, bucket, _, _ = active
+            gbuf = bucket.main_grad_buffer
+            stream = buffers.cpu_offload_d2h_stream
+            with (
+                torch.cuda.stream(stream),
+                nvtx_range(lambda: f"fsdp.layer_by_layer.gradient_d2h bucket={gbuf.bucket_id}"),
+            ):
+                host_grad = slot[: gbuf.data_size]
+                host_grad.copy_(gbuf.data, non_blocking=True)
+                return host_grad, stream.record_event()
+
+        for buffers, bucket, params, by_group in gpu_buckets:
+            self._update_bucket(
+                groups, buffers, bucket, params, by_group, bucket.main_weight_buffer.data, None
+            )
+        if not cpu_buckets:
+            return
+
+        size = max(bucket.main_grad_buffer.data_size for _, bucket, _, _ in cpu_buckets)
+        slots = [
+            torch.empty(size, dtype=torch.float32, device="cpu", pin_memory=True)
+            for _ in range(min(2, len(cpu_buckets)))
+        ]
+        try:
+            staged = stage(cpu_buckets[0], slots[0])
+            for index, active in enumerate(cpu_buckets):
+                cpu_grad, ready = staged
+                if index + 1 < len(cpu_buckets):
+                    staged = stage(cpu_buckets[index + 1], slots[(index + 1) % 2])
+                ready.synchronize()
+                _, bucket, _, _ = active
+                cpu_master = bucket.main_weight_buffer.read_cpu_data()
+                self._update_bucket(groups, *active, cpu_master, cpu_grad)
+        except Exception:
+            # Keep pinned buffers alive until any outstanding transfer finishes.
+            for stream in d2h_streams:
+                stream.synchronize()
+            raise
+
+    @torch.no_grad()
+    def step(self, closure=None) -> None:
+        """Apply AdamW to one FSDP bucket at a time and publish its compute weights."""
+        if closure is not None:
+            raise ValueError("FSDP CPU AdamW does not take a closure.")
+        groups = {param: group for group in self.param_groups for param in group["params"]}
+        if self._layer_by_layer:
+            self._step_layer_by_layer(groups)
+            return
+        for buffers, bucket, params, by_group in self._active_bucket_groups(groups):
             master = bucket.main_weight_buffer
             gbuf = bucket.main_grad_buffer
             cpu_master = master.read_cpu_data()
@@ -81,54 +300,7 @@ class FSDPCPUAdam(torch.optim.AdamW):
                             target = gbuf.get_item(item_id, only_shard=True, data=cpu_grad)
                             target.copy_(param.grad._local_tensor.view(-1), non_blocking=True)
                     torch.cuda.current_stream(gbuf.device).synchronize()
-            moments = self._moments(
-                master, load=any(p._local_tensor.numel() and p in self.state for p in params)
-            )
-            with nvtx_range(lambda: f"fsdp.cpu_optimizer.adamw bucket={master.bucket_id}"):
-                for active_params in by_group.values():
-                    group = groups[active_params[0]]
-                    weights, grads, averages, squares, steps = [], [], [], [], []
-                    for param in active_params:
-                        original = params[param]
-                        item = master.param_idx[original]
-                        weight = master.get_item(item, only_shard=True, data=cpu_master)
-                        grad = gbuf.get_item(
-                            gbuf.param_idx[original], only_shard=True, data=cpu_grad
-                        )
-                        state = self.state[param]
-                        if "step" not in state:
-                            state["step"] = torch.zeros((), device="cpu")
-                            if moments is None:
-                                state.update({key: torch.zeros_like(weight) for key in _MOMENTS})
-                        if moments is None:
-                            avg, sq = (state[key] for key in _MOMENTS)
-                        else:
-                            avg, sq = self._views(master, moments, item, weight.shape)
-                        weights.append(weight)
-                        grads.append(grad)
-                        averages.append(avg)
-                        squares.append(sq)
-                        steps.append(state["step"])
-                    beta1, beta2 = group["betas"]
-                    adamw(
-                        weights,
-                        grads,
-                        averages,
-                        squares,
-                        [],
-                        steps,
-                        foreach=True,
-                        amsgrad=False,
-                        beta1=beta1,
-                        beta2=beta2,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                        maximize=False,
-                    )
-            if moments is not None:
-                master.nvme.write(f"adam-{master.bucket_id}", moments)
-            buffers.commit_cpu_optimizer_bucket(bucket, cpu_master)
+            self._update_bucket(groups, buffers, bucket, params, by_group, cpu_master, cpu_grad)
 
     def checkpoint_state(self, *, is_loading: bool) -> dict:
         """Expose moments as FSDP DTensors for the distributed checkpoint planner."""
@@ -166,7 +338,7 @@ class FSDPCPUAdam(torch.optim.AdamW):
         return result
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Restore CPU AdamW state from its distributed checkpoint."""
+        """Restore AdamW moments to their local optimizer device."""
         super().load_state_dict(state_dict)
         for _, bucket, params in self.buckets:
             master = bucket.main_weight_buffer
@@ -180,8 +352,16 @@ class FSDPCPUAdam(torch.optim.AdamW):
                 values = [state[key] for key in _MOMENTS]
                 values = [v._local_tensor if isinstance(v, DTensor) else v for v in values]
                 if moments is None:
+                    device = (
+                        param._local_tensor.device
+                        if self._layer_by_layer and not master.cpu_offload
+                        else "cpu"
+                    )
                     state.update(
-                        {key: value.cpu().flatten() for key, value in zip(_MOMENTS, values)}
+                        {
+                            key: value.to(device=device).flatten()
+                            for key, value in zip(_MOMENTS, values)
+                        }
                     )
                 else:
                     item = master.param_idx[params[param]]
