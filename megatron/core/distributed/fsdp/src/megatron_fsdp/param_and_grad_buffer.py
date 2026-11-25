@@ -5392,9 +5392,7 @@ class AllGatherPipeline:
         if len(params) == 0:
             return
 
-        synchronous_nvme = self.buffer.ddp_config.fsdp_nvme_weights_only
-        if synchronous_nvme:
-            prefetch = False
+        nvme_weights_only = self.buffer.ddp_config.fsdp_nvme_weights_only
 
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
@@ -5520,6 +5518,13 @@ class AllGatherPipeline:
         if len(ag_buckets) == 0:
             return
 
+        nvme_read_ahead_buckets = []
+        if nvme_weights_only:
+            # Prefetch successors into host memory. Their H2D and all-gather run on demand
+            # so the current layer can run while the next disk read is in flight.
+            nvme_read_ahead_buckets = [b for b in ag_buckets if b not in requested_buckets]
+            ag_buckets = [b for b in ag_buckets if b in requested_buckets]
+
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
         bucket_group_to_buckets = {}
@@ -5529,7 +5534,7 @@ class AllGatherPipeline:
                 bucket_group_to_buckets[group_id] = []
             bucket_group_to_buckets[group_id].append(bucket_id)
 
-        if self.buffer.nvme is not None and not synchronous_nvme:
+        if self.buffer.nvme is not None and not nvme_weights_only:
             # Start disk reads for the selected FSDP units before entering NCCL.
             for buckets in bucket_group_to_buckets.values():
                 for bucket_id in buckets:
@@ -5621,9 +5626,14 @@ class AllGatherPipeline:
                     mark_bucket_ready_to_use,
                 )
 
+        # Queue the lookahead after dispatching the requested buckets. On backward
+        # the successor can have a lower bucket ID and must not delay the demand read.
+        for bucket_id in nvme_read_ahead_buckets:
+            self.get_fsdp_buffer(bucket_id, bwd).prefetch_cpu_data()
+
         # Wait for all-gather to finish
         if not async_param_gather:
-            for bucket_id in buckets:
+            for bucket_id in ag_buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
 
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
@@ -5701,13 +5711,6 @@ class AllGatherPipeline:
             # Persistent un-sharded weights stay ready to use until the next reset.
             return
 
-        if buf.nvme is not None and self.buffer.ddp_config.fsdp_nvme_weights_only:
-            # Complete the round trip of this rank's shard before recycling the GPU slot.
-            bucket = buf.fetch_bucket()
-            src = buf.get_shard_from_bucket(bucket) if buf.is_data_distributed else bucket.data
-            d2h_stream = self.buffer.cpu_offload_d2h_stream
-            d2h_stream.wait_stream(torch.cuda.current_stream())
-            buf.offload_to_cpu(src, d2h_stream)
         buf.free_bucket_storage()
         self.bucket_status[bucket_key] = BucketStatus.EMPTY
 

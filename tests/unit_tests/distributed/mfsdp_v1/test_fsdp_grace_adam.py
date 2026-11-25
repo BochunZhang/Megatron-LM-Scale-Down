@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -8,6 +8,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+    DataParallelBuffer,
+    ParamAndGradBuffer,
+)
 from megatron.core.optimizer import clip_grads
 from megatron.core.optimizer.cpu_offloading import fsdp_adam
 
@@ -281,10 +285,34 @@ def test_fsdp_gradient_norm_combines_cpu_and_gpu_before_collective(monkeypatch):
 
 def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
     weights = [torch.tensor([2.0]), torch.tensor([3.0])]
-    gradients = [torch.tensor([0.5]), torch.tensor([1.0])]
-    compute_weights = [weight.to(torch.bfloat16) for weight in weights]
+    gradients = [torch.tensor([0.3]), torch.tensor([1.0])]
+    swap_files = {f"weight-{i}": weight.to(torch.bfloat16) for i, weight in enumerate(weights)}
+    transfer_order = []
     params = [torch.nn.Parameter(weight) for weight in weights]
     buckets = []
+
+    def write(key, tensor):
+        assert tensor.dtype == torch.bfloat16
+        swap_files[key] = tensor.clone()
+        transfer_order.append(f"write {key}")
+
+    def read(key, tensor):
+        tensor.copy_(swap_files[key])
+        transfer_order.append(f"read {key}")
+        return tensor
+
+    nvme = SimpleNamespace(write=write, read=read)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    h2d_done = SimpleNamespace(synchronize=lambda: transfer_order.append("wait H2D"))
+    h2d_stream = SimpleNamespace(record_event=lambda: h2d_done)
+    compute_weight = torch.empty(1, dtype=torch.bfloat16)
+
+    def copy_to_gpu(staging, *, non_blocking):
+        assert non_blocking
+        compute_weight.copy_(staging)
+        transfer_order.append("H2D")
+
+    destination = SimpleNamespace(copy_=copy_to_gpu, record_stream=Mock())
 
     for bucket_id, param in enumerate(params):
         param.orig_param = object()
@@ -304,7 +332,20 @@ def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
             param_idx=param_idx,
             get_item=get_item,
             read_cpu_data=Mock(return_value=weight),
+            store_cpu_data=Mock(),
         )
+        compute = DataParallelBuffer.__new__(DataParallelBuffer)
+        compute.cpu_offload = True
+        compute.cpu_data = None
+        compute.cpu_ready_event = None
+        compute.cpu_data_valid = True
+        compute.nvme = nvme
+        compute.nvme_key = f"weight-{bucket_id}"
+        compute.nvme_prefetch = None
+        compute.param_idx = param_idx
+        compute.get_item = get_item
+        compute.new_cpu_data = lambda: torch.empty(1, dtype=torch.bfloat16)
+        compute.ddp_config = SimpleNamespace(fsdp_nvme_weights_only=True)
         grad_buffer = SimpleNamespace(
             bucket_id=bucket_id,
             cpu_offload=True,
@@ -317,13 +358,14 @@ def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
             SimpleNamespace(
                 params=[param.orig_param],
                 main_weight_buffer=master,
+                model_weight_buffer=compute,
                 main_grad_buffer=grad_buffer,
                 nvtx_label=f"transformer.{bucket_id}.dense.0.0M",
             )
         )
 
     def publish(bucket, master):
-        compute_weights[bucket.main_weight_buffer.bucket_id].copy_(master)
+        ParamAndGradBuffer.commit_cpu_optimizer_bucket(buffers, bucket, master)
 
     buffers = SimpleNamespace(
         optimizer_named_parameters=list(zip(("early", "tail"), params)),
@@ -360,6 +402,7 @@ def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
     optimizer = fsdp_adam.FSDPCPUAdam([{"params": params}], [chunk], lr=0.25, backend="grace_adam")
 
     for iteration in range(2):
+        transfer_order.clear()
         offload_waiting = Event()
         offload_ready = Event()
         early_updated.clear()
@@ -372,6 +415,15 @@ def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
 
         offload_event = SimpleNamespace(synchronize=synchronize_offload)
         buffers.submit_cpu_optimizer_bucket(0, offload_event)
+        task = optimizer._pending_cpu_buckets[id(buckets[0])]
+        wait_for_task = task.result
+
+        def join():
+            result = wait_for_task()
+            transfer_order.append("join optimizer")
+            return result
+
+        monkeypatch.setattr(task, "result", join)
         try:
             assert offload_waiting.wait(timeout=5)
             early_gradient.assert_not_called()
@@ -380,11 +432,12 @@ def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
             offload_ready.set()
 
         assert early_updated.wait(timeout=5)
-        torch.testing.assert_close(weights[0], torch.tensor([2.0 - 0.125 * (iteration + 1)]))
+        torch.testing.assert_close(weights[0], torch.tensor([2.0 - 0.075 * (iteration + 1)]))
         torch.testing.assert_close(
-            compute_weights[0], torch.tensor([2.0 - 0.125 * iteration], dtype=torch.bfloat16)
+            swap_files["weight-0"], torch.tensor([2.0 - 0.075 * iteration], dtype=torch.bfloat16)
         )
         assert buffers.commit_cpu_optimizer_bucket.call_count == iteration * 2
+        assert not transfer_order
 
         # Finalization attaches both gradient views, including the late bucket.
         for param, grad in zip(params, gradients):
@@ -393,9 +446,13 @@ def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
 
         assert grace_adam.step.call_count == (iteration + 1) * 2
         assert buffers.commit_cpu_optimizer_bucket.call_count == (iteration + 1) * 2
-        torch.testing.assert_close(compute_weights[0], weights[0].to(torch.bfloat16))
+        assert transfer_order == ["join optimizer", "write weight-0", "write weight-1"]
+        assert buckets[0].model_weight_buffer.reload_from_cpu(destination, h2d_stream) is h2d_done
+        destination.record_stream.assert_called_with(h2d_stream)
+        assert transfer_order[3:] == ["read weight-0", "H2D", "wait H2D"]
+        torch.testing.assert_close(compute_weight, weights[0].to(torch.bfloat16))
         torch.testing.assert_close(weights[1], torch.tensor([3.0 - 0.25 * (iteration + 1)]))
-        torch.testing.assert_close(compute_weights[1], weights[1].to(torch.bfloat16))
+        torch.testing.assert_close(swap_files["weight-1"], weights[1].to(torch.bfloat16))
         for param, grad in zip(params, gradients):
             assert optimizer.state[param]["step"].item() == iteration + 1
             torch.testing.assert_close(optimizer.state[param]["exp_avg"], grad * (iteration + 1))

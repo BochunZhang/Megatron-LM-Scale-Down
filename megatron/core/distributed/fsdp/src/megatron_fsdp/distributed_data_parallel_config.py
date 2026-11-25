@@ -208,7 +208,7 @@ class DistributedDataParallelConfig:
     """Local NVMe directory for spilling the CPU-offloaded FSDP buffers."""
 
     fsdp_nvme_weights_only: bool = False
-    """Synchronously swap only compute weights through host memory to NVMe."""
+    """Store only compute weights on NVMe, with host staging for training."""
 
     @property
     def fsdp_cpu_offload_weight(self) -> bool:
