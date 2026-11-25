@@ -9,6 +9,7 @@ from torch.autograd.variable import Variable
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -933,6 +934,47 @@ def layer_by_layer_forward_backward_no_pipelining(
     if pg_collection.pp.size() != 1 or pg_collection.cp.size() != 1:
         raise ValueError("Layer-by-layer scheduling requires PP=CP=1.")
     config = get_model_config(model)
+    fsdp = find_megatron_fsdp(model)
+    if fsdp is not None:
+        # The layer plans call inner modules directly, bypassing MegatronFSDP.forward.
+        fsdp._replace_param_with_raw_if_needed()
+    cuda_nvtx = torch.cuda.nvtx if torch.cuda.is_available() else None
+    nvtx_range = cuda_nvtx.range if cuda_nvtx is not None else contextlib.nullcontext
+    # Autograd can interleave microbatches, so track process-range IDs instead of
+    # pushing and popping a thread-local NVTX stack from gradient hooks.
+    backward_microbatch_ranges: dict[int, int] = {}
+
+    def trace_microbatch_backward(
+        microbatch: int, stage: str, output: torch.Tensor, stage_input: torch.Tensor | None = None
+    ) -> None:
+        if cuda_nvtx is None:
+            return
+
+        def start_range(_grad):
+            backward_microbatch_ranges[microbatch] = cuda_nvtx.range_start(
+                f"bwd.microbatch.{microbatch}.{stage}"
+            )
+
+        def end_range(_grad):
+            range_id = backward_microbatch_ranges.pop(microbatch, None)
+            if range_id is not None:
+                cuda_nvtx.range_end(range_id)
+
+        output.register_hook(start_range)
+        if stage_input is not None:
+            stage_input.register_hook(end_range)
+
+    @contextlib.contextmanager
+    def backward_stage(stage: str) -> Iterator[None]:
+        with nvtx_range(f"backward.{stage}"):
+            try:
+                yield
+            finally:
+                if cuda_nvtx is not None:
+                    for range_id in backward_microbatch_ranges.values():
+                        cuda_nvtx.range_end(range_id)
+                    backward_microbatch_ranges.clear()
+
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
         config.timers('forward-compute', log_level=2).start()
@@ -955,29 +997,54 @@ def layer_by_layer_forward_backward_no_pipelining(
                 for _ in range(num_microbatches)
             )
         )
-        hidden_states = tuple(plan.preprocess() for plan in plans)
+        embedding_outputs = []
+        with nvtx_range("forward.embedding"):
+            for mb, plan in enumerate(plans):
+                with nvtx_range(f"fwd.microbatch.{mb}.embedding"):
+                    embedding_outputs.append(plan.preprocess())
+        hidden_states = tuple(embedding_outputs)
+        del embedding_outputs
 
     def forward_layer(layer_index: int, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # The reentrant checkpoint first runs without gradients and then replays
+        # with autograd enabled. Attach backward tracing only to the replay graph.
+        is_recompute = not forward_only and torch.is_grad_enabled()
+        phase = "recompute" if is_recompute else "fwd"
+        stage = f"transformer.{layer_index}"
+        outputs = []
         with autocast():
-            return tuple(
-                plan.forward_layer(layer_index, value)
-                for plan, value in zip(plans, inputs, strict=True)
-            )
+            for mb, (plan, value) in enumerate(zip(plans, inputs, strict=True)):
+                with nvtx_range(f"{phase}.microbatch.{mb}.{stage}"):
+                    output = plan.forward_layer(layer_index, value)
+                if is_recompute:
+                    trace_microbatch_backward(mb, stage, output, value)
+                outputs.append(output)
+        return tuple(outputs)
 
     # One checkpoint per layer keeps its boundary activations and groups all
     # microbatches in the checkpoint's inner backward. DDP sees one accumulated
     # gradient per parameter when its AccumulateGrad hook fires.
     stages = []
     inputs: tuple[torch.Tensor, ...] = ()
-    for layer_index in range(plans[0].num_layers()):
-        if forward_only:
-            hidden_states = forward_layer(layer_index, *hidden_states)
-        else:
-            stages.append((inputs, hidden_states))
-            inputs = tuple(value.detach().requires_grad_() for value in hidden_states)
-            hidden_states = tensor_parallel.checkpoint(
-                partial(forward_layer, layer_index), False, *inputs
-            )
+    unit = None
+    num_layers = plans[0].num_layers()
+    for layer_index in range(num_layers):
+        if not forward_only:
+            stages.append((layer_index, unit, inputs, hidden_states))
+        unit = plans[0].layer_module(layer_index) if fsdp is not None else None
+        weight_scope = (
+            fsdp.layer_by_layer_unit(unit, backward=False)
+            if fsdp is not None
+            else contextlib.nullcontext()
+        )
+        with weight_scope, nvtx_range(f"forward.transformer.{layer_index}"):
+            if forward_only:
+                hidden_states = forward_layer(layer_index, *hidden_states)
+            else:
+                inputs = tuple(value.detach().requires_grad_() for value in hidden_states)
+                hidden_states = tensor_parallel.checkpoint(
+                    partial(forward_layer, layer_index), False, *inputs
+                )
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
@@ -985,48 +1052,72 @@ def layer_by_layer_forward_backward_no_pipelining(
     if forward_only:
         head_inputs = hidden_states
     else:
-        stages.append((inputs, hidden_states))
+        stages.append((num_layers, unit, inputs, hidden_states))
         head_inputs = tuple(value.detach().requires_grad_() for value in hidden_states)
 
     forward_data_store = []
     losses = []
     total_num_tokens = torch.zeros([], dtype=torch.int, device=head_inputs[0].device)
-    for plan, loss_func, value in zip(plans, loss_funcs, head_inputs, strict=True):
-        if config.timers is not None:
-            config.timers('forward-compute', log_level=2).start()
-        with autocast():
-            if forward_only:
-                output = plan.postprocess(value)
-            else:
-                # Keep large vocabulary projections out of the retained graphs.
-                output = checkpoint(plan.postprocess, value, use_reentrant=False)
-        loss, num_tokens = forward_step_calc_loss(
-            model,
-            output,
-            loss_func,
-            config,
-            None,
-            collect_non_loss_data,
-            num_microbatches,
-            forward_data_store,
-            pg_collection.cp.size(),
-            is_last_stage=True,
-        )
-        total_num_tokens += num_tokens
-        if not forward_only:
-            if config.grad_scale_func is not None:
-                loss = config.grad_scale_func(loss)
-            losses.append(loss)
+    with nvtx_range("forward.output"):
+        for mb, (plan, loss_func, value) in enumerate(
+            zip(plans, loss_funcs, head_inputs, strict=True)
+        ):
+            if config.timers is not None:
+                config.timers('forward-compute', log_level=2).start()
+            with nvtx_range(f"fwd.microbatch.{mb}.output"), autocast():
+                if forward_only:
+                    output = plan.postprocess(value)
+                else:
+                    # Keep large vocabulary projections out of the retained graphs.
+                    output = checkpoint(plan.postprocess, value, use_reentrant=False)
+            loss, num_tokens = forward_step_calc_loss(
+                model,
+                output,
+                loss_func,
+                config,
+                None,
+                collect_non_loss_data,
+                num_microbatches,
+                forward_data_store,
+                pg_collection.cp.size(),
+                is_last_stage=True,
+            )
+            total_num_tokens += num_tokens
+            if not forward_only:
+                if config.grad_scale_func is not None:
+                    loss = config.grad_scale_func(loss)
+                losses.append(loss)
 
     if not forward_only:
         if config.timers is not None:
             config.timers('backward-compute', log_level=2).start()
-        torch.autograd.backward(losses)
+        if fsdp is not None:
+            # Each stage builds its own autograd graph; there is one root
+            # FSDP backward lifecycle for the entire microbatch group.
+            fsdp.pre_backward()
+        with backward_stage("output"):
+            for mb, (loss, value) in enumerate(zip(losses, head_inputs, strict=True)):
+                trace_microbatch_backward(mb, "output", loss, value)
+            torch.autograd.backward(losses)
         inputs = head_inputs
         while stages:
             grad_outputs = tuple(value.grad for value in inputs)
-            inputs, outputs = stages.pop()
-            torch.autograd.backward(outputs, grad_outputs)
+            stage_index, unit, inputs, outputs = stages.pop()
+            weight_scope = (
+                fsdp.layer_by_layer_unit(unit, backward=True)
+                if fsdp is not None and unit is not None
+                else contextlib.nullcontext()
+            )
+            stage = f"transformer.{stage_index - 1}" if stage_index else "embedding"
+            with weight_scope, backward_stage(stage):
+                if stage_index == 0:
+                    # The embedding inputs are token IDs. Weight gradients are
+                    # accumulated jointly, so these ranges close at the stage end.
+                    for mb, output in enumerate(outputs):
+                        trace_microbatch_backward(mb, stage, output)
+                torch.autograd.backward(outputs, grad_outputs)
+        if fsdp is not None:
+            fsdp.post_backward()
         if config.timers is not None:
             config.timers('backward-compute').stop()
         if config.finalize_model_grads_func is not None:
@@ -1036,6 +1127,8 @@ def layer_by_layer_forward_backward_no_pipelining(
                 pg_collection=pg_collection,
                 force_all_reduce=force_all_reduce,
             )
+    elif fsdp is not None:
+        fsdp.synchronize_param_gather()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

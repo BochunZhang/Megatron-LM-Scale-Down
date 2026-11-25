@@ -2,6 +2,7 @@
 
 import os
 from collections import Counter
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -82,7 +83,7 @@ def cuda_device():
         yield torch.device("cuda", torch.cuda.current_device())
 
 
-def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device):
+def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device, monkeypatch):
     layer_major = get_forward_backward_func(pp_size=1, layer_by_layer=True)
     microbatch_major = get_forward_backward_func(pp_size=1)
     assert layer_major is layer_by_layer_forward_backward_no_pipelining
@@ -96,8 +97,31 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device):
     pg_collection = SimpleNamespace(tp=None, pp=single_rank_group, cp=single_rank_group)
     finalized = []
     accumulations = []
+    nvtx_events = []
     for name, param in model.named_parameters():
         param.register_post_accumulate_grad_hook(lambda _, name=name: accumulations.append(name))
+
+    @contextmanager
+    def capture_nvtx_range(name):
+        nvtx_events.append(("enter", name))
+        try:
+            yield
+        finally:
+            nvtx_events.append(("exit", name))
+
+    def capture_nvtx_start(name):
+        range_id = len(nvtx_events)
+        nvtx_events.append(("start", name))
+        return range_id
+
+    def capture_nvtx_end(range_id):
+        event, name = nvtx_events[range_id]
+        assert event == "start"
+        nvtx_events.append(("end", name))
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range", capture_nvtx_range)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_start", capture_nvtx_start)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_end", capture_nvtx_end)
 
     def finalize(models, num_tokens, *, pg_collection, force_all_reduce):
         assert force_all_reduce
@@ -132,6 +156,43 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(cuda_device):
         (0, 1, True),
     ]
     assert Counter(accumulations) == {name: 1 for name, _ in model.named_parameters()}
+    expected_nvtx_events = []
+    for name in ("embedding", "transformer.0", "transformer.1", "output"):
+        expected_nvtx_events.append(("enter", f"forward.{name}"))
+        for microbatch in range(len(batches)):
+            expected_nvtx_events.extend(
+                (event, f"fwd.microbatch.{microbatch}.{name}") for event in ("enter", "exit")
+            )
+        expected_nvtx_events.append(("exit", f"forward.{name}"))
+    expected_microbatch_events = []
+    for stage in ("output", "transformer.1", "transformer.0", "embedding"):
+        stage_begin = ("enter", f"backward.{stage}")
+        stage_end = ("exit", f"backward.{stage}")
+        expected_nvtx_events.append(stage_begin)
+        if stage.startswith("transformer."):
+            for microbatch in range(len(batches)):
+                expected_nvtx_events.extend(
+                    (event, f"recompute.microbatch.{microbatch}.{stage}")
+                    for event in ("enter", "exit")
+                )
+        expected_nvtx_events.append(stage_end)
+        for microbatch in range(len(batches)):
+            name = f"bwd.microbatch.{microbatch}.{stage}"
+            start, end = ("start", name), ("end", name)
+            expected_microbatch_events.extend((start, end))
+            assert (
+                nvtx_events.index(stage_begin)
+                < nvtx_events.index(start)
+                < nvtx_events.index(end)
+                < nvtx_events.index(stage_end)
+            )
+            if stage.startswith("transformer."):
+                last_recompute = ("exit", f"recompute.microbatch.{len(batches) - 1}.{stage}")
+                assert nvtx_events.index(last_recompute) < nvtx_events.index(start)
+    assert [event for event in nvtx_events if event[0] in ("enter", "exit")] == expected_nvtx_events
+    assert Counter(event for event in nvtx_events if event[0] in ("start", "end")) == Counter(
+        expected_microbatch_events
+    )
     torch.testing.assert_close(losses, expected_losses)
     for param, ref_param in zip(model.parameters(), baseline.parameters(), strict=True):
         torch.testing.assert_close(param.grad, ref_param.grad)

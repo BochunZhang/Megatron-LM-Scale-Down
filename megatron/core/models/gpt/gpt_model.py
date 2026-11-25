@@ -65,6 +65,10 @@ class _GPTLayerByLayerSchedulePlan:
     def num_layers(self) -> int:
         return len(self.model.decoder.layers)
 
+    def layer_module(self, index: int) -> torch.nn.Module:
+        """Return the FSDP unit executed at this decoder stage."""
+        return self.model.decoder.layers[index]
+
     def preprocess(self) -> Tensor:
         hidden_states, self.rotary_pos_emb, *_ = self.model._preprocess(
             input_ids=self.input_ids,
@@ -74,7 +78,7 @@ class _GPTLayerByLayerSchedulePlan:
         return hidden_states
 
     def forward_layer(self, index: int, hidden_states: Tensor) -> Tensor:
-        hidden_states, _ = self.model.decoder.layers[index](
+        hidden_states, _ = self.layer_module(index)(
             hidden_states=hidden_states,
             attention_mask=self.attention_mask,
             rotary_pos_emb=self.rotary_pos_emb,

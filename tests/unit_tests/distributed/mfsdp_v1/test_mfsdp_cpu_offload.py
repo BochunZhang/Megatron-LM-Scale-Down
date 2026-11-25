@@ -17,12 +17,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import get_attr_wrapped_model, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 NUM_LAYERS = 4
@@ -55,6 +56,22 @@ def _forward(fsdp_model, tokens, labels):
     position_ids = torch.arange(SEQ_LENGTH, device="cuda").unsqueeze(0).expand_as(tokens)
     output = fsdp_model(tokens.cuda(), position_ids, None, labels=labels.cuda())
     return output.float().mean()
+
+
+def _schedule_forward_step(data_iterator, model, *, return_schedule_plan=False):
+    tokens, labels = (tensor.cuda() for tensor in next(data_iterator))
+    positions = torch.arange(SEQ_LENGTH, device=tokens.device).unsqueeze(0).expand_as(tokens)
+    if return_schedule_plan:
+        build_plan = get_attr_wrapped_model(model, "build_layer_by_layer_schedule_plan")
+        output = build_plan(tokens, positions, None, labels)
+    else:
+        output = model(tokens, positions, None, labels=labels)
+
+    def loss_func(values):
+        loss = values.float().mean()
+        return loss, {"lm loss": loss.detach().clone()}
+
+    return output, loss_func
 
 
 def _round_trip_checkpoint(model, optimizer, path):
@@ -110,6 +127,7 @@ def _train(
     cpu_grad_accumulation=False,
     cpu_optimizer=False,
     nvme_path=None,
+    schedule=None,
 ):
     """Train a small GPT model with Megatron-FSDP and gradient accumulation.
 
@@ -199,21 +217,36 @@ def _train(
     )
     if strategy == "optim_grads_params" and offload == ("gradient",):
         fsdp_model.start_param_sync(force_sync=True)
+    if schedule is not None:
+        config.no_sync_func = fsdp_model.no_sync
+        config.finalize_model_grads_func = finalize_model_grads
+        config.grad_scale_func = optimizer.scale_loss
 
     batches = _make_batches()
     losses, grad_norms = [], []
     for step in range(NUM_STEPS):
         optimizer.zero_grad()
-        for microbatch_idx, (tokens, labels) in enumerate(batches[step]):
-            if microbatch_idx < NUM_MICROBATCHES - 1:
-                with fsdp_model.no_sync():
+        if schedule is None:
+            for microbatch_idx, (tokens, labels) in enumerate(batches[step]):
+                if microbatch_idx < NUM_MICROBATCHES - 1:
+                    with fsdp_model.no_sync():
+                        loss = _forward(fsdp_model, tokens, labels)
+                        loss.backward()
+                else:
                     loss = _forward(fsdp_model, tokens, labels)
                     loss.backward()
-            else:
-                loss = _forward(fsdp_model, tokens, labels)
-                loss.backward()
-            losses.append(loss.detach())
-        finalize_model_grads([fsdp_model])
+                losses.append(loss.detach())
+            finalize_model_grads([fsdp_model])
+        else:
+            records = schedule(
+                forward_step_func=_schedule_forward_step,
+                data_iterator=iter(batches[step]),
+                model=[fsdp_model],
+                num_microbatches=NUM_MICROBATCHES,
+                seq_length=SEQ_LENGTH,
+                micro_batch_size=MICRO_BATCH_SIZE,
+            )
+            losses.extend(record["lm loss"] for record in records)
         _, grad_norm, _ = optimizer.step()
         grad_norms.append(grad_norm)
         if step == 0 and checkpoint_path is not None:
@@ -346,6 +379,16 @@ class TestMegatronFSDPCpuOffload:
             "optim_grads_params", True, offload, cpu_grad_accumulation=True, cpu_optimizer=True
         )
         testing.assert_close(actual, reference, rtol=3e-3, atol=3e-4)
+
+    @pytest.mark.parametrize("offload", [pytest.param((), id="gpu"), pytest.param(("weight",), id="cpu")])
+    def test_layer_major_schedule_matches_no_pipeline(self, offload):
+        regular = get_forward_backward_func(pp_size=1)
+        layer_major = get_forward_backward_func(pp_size=1, layer_by_layer=True)
+        reference = _train("optim_grads_params", True, offload, schedule=regular)
+        actual = _train("optim_grads_params", True, offload, schedule=layer_major)
+        # The layer-major schedule accumulates local microbatch gradients before
+        # the collective, so its floating-point addition order differs.
+        testing.assert_close(actual, reference, rtol=6e-3, atol=5e-4)
 
     def test_nvme_offload_matches_cpu_and_resumes(self, tmp_path):
         nvme_path = os.environ.get("MEGATRON_FSDP_TEST_NVME_PATH")

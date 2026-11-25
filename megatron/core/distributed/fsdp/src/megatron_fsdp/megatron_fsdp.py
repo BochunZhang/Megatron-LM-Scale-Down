@@ -646,6 +646,7 @@ class MegatronFSDP(torch.nn.Module):
         self.forward_hooks = {}
         self.backward_pre_hooks = {}
         self.grad_acc_hooks = {}
+        self._active_layer_by_layer_unit = None
 
         """
         An FSDP unit is a module designed to manage the lifecycle of model parameters
@@ -889,6 +890,8 @@ class MegatronFSDP(torch.nn.Module):
 
         @torch.compiler.disable
         def _pre_forward_param_unshard(module: nn.Module, *unused):
+            if self._active_layer_by_layer_unit is module:
+                return None
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -922,7 +925,7 @@ class MegatronFSDP(torch.nn.Module):
             since such operations can trigger an autograd error that
             "the output is a view and is being modified in-place".
             """
-            if not torch.is_grad_enabled():
+            if self._active_layer_by_layer_unit is module or not torch.is_grad_enabled():
                 # No gradients / backward pass, don't attach the post-backward hook.
                 return args, kwargs
 
@@ -1072,6 +1075,8 @@ class MegatronFSDP(torch.nn.Module):
 
         @torch.compiler.disable
         def _post_forward(module: nn.Module, input: Any, output: Any):
+            if self._active_layer_by_layer_unit is module:
+                return output
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
             # after the forward pass. In this case, the resharding is performed lazily.
@@ -1106,6 +1111,8 @@ class MegatronFSDP(torch.nn.Module):
 
             @torch.compiler.disable
             def forward_hook(_module, inputs, output):
+                if self._active_layer_by_layer_unit is _module:
+                    return output
                 # Replace the output to avoid the output tensor being the same as
                 # the input tensor, which makes it impossible to identify which
                 # layer's output it is. Using view_as to make it does not cause
@@ -1164,6 +1171,35 @@ class MegatronFSDP(torch.nn.Module):
         self.post_backward_release_module = _post_backward_release_module
         self.pre_backward = partial(_root_pre_backward, module=None, skip_backward_hook=True)
         self.post_backward = _root_post_backward
+
+        @contextmanager
+        def layer_by_layer_unit(module: nn.Module, *, backward: bool):
+            """Hold one FSDP unit through a layer-major phase for all microbatches."""
+            if (
+                self.data_parallel_sharding_strategy != "optim_grads_params"
+                or self.enable_fine_grained_param_gather_hook
+                or self.enable_fine_grained_param_gather_backward_hook
+                or self.ddp_config.fp8_param_gather
+                or not isinstance(module, tuple(fsdp_unit_modules))
+            ):
+                raise ValueError("Layer-by-layer scheduling requires a whole-layer FSDP3 unit.")
+            assert self._active_layer_by_layer_unit is None
+            if backward:
+                _pre_backward_param_unshard(module)
+            else:
+                _pre_forward_param_unshard(module)
+
+            self._active_layer_by_layer_unit = module
+            try:
+                yield
+            finally:
+                self._active_layer_by_layer_unit = None
+                if backward:
+                    _post_backward_release_module(module)
+                else:
+                    _post_forward(module, None, None)
+
+        self.layer_by_layer_unit = layer_by_layer_unit
 
         fsdp_modules = []
         for name, module in root_module.named_modules():
