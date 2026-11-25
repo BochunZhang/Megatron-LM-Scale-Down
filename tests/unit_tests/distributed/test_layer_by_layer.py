@@ -2,6 +2,8 @@
 
 """Numerical regression tests for layer-by-layer training."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
@@ -133,16 +135,23 @@ def test_layer_by_layer_matches_unsharded_adamw(
     write_tensor = layer_by_layer.write_tensor
     activation_writes = []
     nvtx_range = torch.cuda.nvtx.range
+    active_ranges = []
     forward_ranges = []
 
     def record_activation_write(path: Path, value: torch.Tensor) -> None:
         write_tensor(path, value)
         activation_writes.append(path)
 
-    def record_nvtx(message):
-        if message.startswith("layer_by_layer.forward.iteration_"):
-            forward_ranges.append(message)
-        return nvtx_range(message)
+    @contextmanager
+    def record_nvtx(message: str) -> Iterator[None]:
+        with nvtx_range(message):
+            active_ranges.append(message)
+            try:
+                if message.startswith(("forward.", "fwd.microbatch.", "layer_by_layer.forward.")):
+                    forward_ranges.append(tuple(active_ranges))
+                yield
+            finally:
+                active_ranges.pop()
 
     monkeypatch.setattr(layer_by_layer, "write_tensor", record_activation_write)
     monkeypatch.setattr(torch.cuda.nvtx, "range", record_nvtx)
@@ -177,11 +186,14 @@ def test_layer_by_layer_matches_unsharded_adamw(
             d2h = 0 if storage == "gpu" else boundaries
             assert trainer.activation_transfer_counts == (d2h, 2 * d2h)
             assert len(activation_writes) == (boundaries if storage == "nvme" else 0)
-            assert forward_ranges == [
-                f"layer_by_layer.forward.iteration_{step + 4}.layer_{index}.microbatch_{mb + 1}"
-                for index in range(len(modules))
-                for mb in range(len(batches))
-            ]
+            expected_forward_ranges = []
+            for layer_name in ("embedding", "transformer.0", "transformer.1", "output"):
+                layer_range = f"forward.{layer_name}"
+                expected_forward_ranges.append((layer_range,))
+                expected_forward_ranges.extend(
+                    (layer_range, f"fwd.microbatch.{mb}.{layer_name}") for mb in range(len(batches))
+                )
+            assert forward_ranges == expected_forward_ranges
             forward_ranges.clear()
             assert not list(directory.glob("input-*.bin"))
 

@@ -530,7 +530,6 @@ class LayerByLayerTrainer:
         self.betas = betas
         self.eps = eps
         self._initialized = torch.cuda.current_stream(device).record_event()
-        self._iteration = 0
 
     def __enter__(self):
         with ExitStack() as stack:
@@ -601,7 +600,7 @@ class LayerByLayerTrainer:
             current = upcoming
 
     @torch.no_grad()
-    def _forward(self, batches, *, iteration):
+    def _forward(self, batches):
         self.weights.prefetch(0, self.units[0])
         last = len(self.units) - 1
         losses = []
@@ -609,12 +608,15 @@ class LayerByLayerTrainer:
             self.weights.bind(index, unit)
             if index < last:
                 self.weights.prefetch(index + 1, self.units[index + 1])
-            with torch.cuda.nvtx.range(f"layer_by_layer.forward.{index}"):
+            if index == 0:
+                layer_name = "embedding"
+            elif index == last:
+                layer_name = "output"
+            else:
+                layer_name = f"transformer.{index - 1}"
+            with torch.cuda.nvtx.range(f"forward.{layer_name}"):
                 for mb, value, labels in self._inputs(index, batches, backward=False):
-                    with torch.cuda.nvtx.range(
-                        f"layer_by_layer.forward.iteration_{iteration + 1}."
-                        f"layer_{index}.microbatch_{mb + 1}"
-                    ):
+                    with torch.cuda.nvtx.range(f"fwd.microbatch.{mb}.{layer_name}"):
                         result = unit.module(value, labels)
                     if index == last:
                         losses.append(result.detach())
@@ -682,19 +684,16 @@ class LayerByLayerTrainer:
     def step(
         self, batches: Sequence[tuple[Tensor, Tensor]], *, lr: float, iteration: int | None = None
     ) -> float:
-        """Return the DP mean loss. The optional NVTX iteration is zero-based."""
+        """Return the DP mean loss. Accept an optional zero-based iteration for compatibility."""
         if not batches:
             raise ValueError("Layer-by-layer training requires at least one micro-batch")
         if self.updates.invalid_unit >= 0:
             raise RuntimeError("Discard the trainer after a non-finite gradient")
-        if iteration is None:
-            iteration = self._iteration
-        elif type(iteration) is not int or iteration < 0:
+        if iteration is not None and (type(iteration) is not int or iteration < 0):
             raise ValueError("Layer-by-layer iteration must be a nonnegative integer")
-        loss = self._forward(batches, iteration=iteration)
+        loss = self._forward(batches)
         if not math.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss: {loss}")
         self._backward(batches, lr=lr)
         self.updates.finish()
-        self._iteration = iteration + 1
         return loss
