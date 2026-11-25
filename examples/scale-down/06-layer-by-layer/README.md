@@ -2,6 +2,22 @@
 
 Run on one GB200 node with four GPUs available to the same CUDA/NCCL environment. The sweep uses four-way full sharding with TP, PP and CP each set to 1. It keeps the Qwen3.5-27B dense text-model widths and varies decoder depth. The full model has 64 decoder layers. Training uses BF16, randomly initialized weights, and synthetic token batches.
 
+## 32-layer CPU activation case
+
+Run the numbered baseline from the repository root. It uses the Qwen3.5-27B text attention mix, sequence length 4096, MBS 1, GBS 16, four micro-batches per rank, `cpu_param`, and `cpu_act`. The default is 10 optimizer steps with profiling disabled. Use `--train-iters 3` for a shorter run.
+
+```bash
+case_script=examples/scale-down/06-layer-by-layer/01-baseline/01_cpu_activation.sh
+bash "$case_script" --dry-run
+bash "$case_script" --nvme-path /path/to/local/nvme
+```
+
+The default result root is `results/06-layer-by-layer/01-baseline/01-cpu-activation/`. A case is named `model_.../node0/` and contains `launch.json`, `command.txt`, `run_info.txt`, `train.log`, `summary.csv`, and source provenance. Use `--print-result-dir` to resolve the full path and `--output-dir` to run another repeat in a fresh output root.
+
+The CPU activation case passes when `run_info.txt` reports `status=0` and all four ranks complete 1320 D2H and 2640 H2D activation copies at the default 10 steps. A three-step run expects 396 and 792 copies per rank.
+
+## Capacity sweep
+
 ```bash
 bash examples/scale-down/06-layer-by-layer/run_sweep.sh \
   --nvme-dir /path/to/local/nvme --layers 16 32 64

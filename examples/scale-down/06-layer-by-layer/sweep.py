@@ -27,6 +27,7 @@ _SOURCE_FILES = (
     "megatron/training/layer_by_layer.py",
     "megatron/training/layer_by_layer_workload.py",
 )
+_SINGLE_CASE_SCRIPT = "examples/scale-down/06-layer-by-layer/01-baseline/01_cpu_activation.sh"
 _RESULT_PREFIX = "LAYER_BY_LAYER_RESULT "
 _RESOURCE_ERRORS = {
     "gpu_oom": re.compile(
@@ -88,11 +89,16 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--cpu-threads", type=_positive)
     parser.add_argument("--tiny", action="store_true", help="use the small smoke model")
     parser.add_argument(
+        "--single-case-layout", action="store_true", help="use node-level files for one depth"
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="show commands without writing or launching"
     )
     args = parser.parse_args()
     if len(set(args.layers)) != len(args.layers):
         parser.error("--layers must contain distinct values")
+    if args.single_case_layout and (len(args.layers) != 1 or args.results_dir is None):
+        parser.error("--single-case-layout requires exactly one depth and --results-dir")
     return args
 
 
@@ -199,13 +205,44 @@ def _read_result(
     return result
 
 
+def _write_launch(args: argparse.Namespace, results: Path, nvme_dir: Path) -> None:
+    launch = {
+        "model": "Qwen/Qwen3.5-27B",
+        "dtype": "bf16",
+        "num_layers": args.layers[0],
+        "tiny": args.tiny,
+        "fully_sharded": True,
+        "data_parallel_size": _WORLD_SIZE,
+        "pipeline_model_parallel_size": 1,
+        "tensor_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "seq_length": args.seq_length,
+        "micro_batch_size": args.micro_batch_size,
+        "global_batch_size": args.micro_batch_size * args.microbatches * _WORLD_SIZE,
+        "num_microbatches": args.microbatches,
+        "train_iters": args.steps,
+        "gpu_count": _WORLD_SIZE,
+        "nnodes": 1,
+        "node_rank": 0,
+        "parameter_tier": args.parameter_tier,
+        "activation_tier": args.activation_tier,
+        "nvme_path": str(nvme_dir),
+        "profile": "none",
+        "cuda_graph": "off",
+    }
+    (results / "launch.json").write_text(json.dumps(launch, indent=2) + "\n", encoding="utf-8")
+
+
 def _run_case(args: argparse.Namespace, layers: int, results: Path, nvme_dir: Path) -> dict:
-    log_path = results / f"layers-{layers}.log"
+    log_name, command_name = (
+        ("train.log", "command.txt")
+        if args.single_case_layout
+        else (f"layers-{layers}.log", f"layers-{layers}.command.txt")
+    )
+    log_path = results / log_name
     with tempfile.TemporaryDirectory(prefix=f"layer-by-layer-{layers}-", dir=nvme_dir) as scratch:
         command = _command(args, layers, Path(scratch))
-        (results / f"layers-{layers}.command.txt").write_text(
-            shlex.join(command) + "\n", encoding="utf-8"
-        )
+        (results / command_name).write_text(shlex.join(command) + "\n", encoding="utf-8")
         _LOG.info("Running %d layers. Log at %s", layers, log_path)
         with log_path.open("w", encoding="utf-8") as log:
             returncode = subprocess.run(
@@ -249,8 +286,12 @@ def main() -> int:
 
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_REPO, text=True).strip()
     (results / "revision.txt").write_text(revision + "\n", encoding="utf-8")
+    source_files = _SOURCE_FILES
+    if args.single_case_layout:
+        _write_launch(args, results, nvme_dir)
+        source_files += (_SINGLE_CASE_SCRIPT,)
     source_hashes = {
-        path: hashlib.sha256((_REPO / path).read_bytes()).hexdigest() for path in _SOURCE_FILES
+        path: hashlib.sha256((_REPO / path).read_bytes()).hexdigest() for path in source_files
     }
     (results / "source_sha256.json").write_text(
         json.dumps(source_hashes, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -264,6 +305,12 @@ def main() -> int:
             case = _run_case(args, layers, results, nvme_dir)
             writer.writerow(case)
             summary.flush()
+            if args.single_case_layout:
+                status = 0 if case["status"] == "passed" else case["returncode"] or 1
+                (results / "run_info.txt").write_text(
+                    f"case_status={case['status']}\nreturncode={case['returncode']}\nstatus={status}\n",
+                    encoding="utf-8",
+                )
             _LOG.info("%d layers: %s", layers, case["status"])
             if case["status"] == "passed":
                 largest = layers if largest is None else max(largest, layers)
