@@ -1,12 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+from collections import deque
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
@@ -957,7 +958,7 @@ def layer_by_layer_forward_backward_no_pipelining(
     )
     activation_offload = LayerByLayerActivationOffload() if offload_activations else None
 
-    def activation_checkpoint(group_id: int, name: str, *, microbatch: int | None = None):
+    def activation_checkpoint(group_id: int, name: str, *, microbatch: int):
         if activation_offload is not None:
             return activation_offload.checkpoint(group_id, name, microbatch=microbatch)
         return contextlib.nullcontext()
@@ -1089,9 +1090,27 @@ def layer_by_layer_forward_backward_no_pipelining(
                 outputs.append(output)
         return tuple(outputs)
 
-    # One checkpoint per layer keeps its boundary activations and groups all
-    # microbatches in the checkpoint's inner backward. DDP sees one accumulated
-    # gradient per parameter when its AccumulateGrad hook fires.
+    def decoder_checkpoint_contexts(microbatch: int, stage: str):
+        # PyTorch preserves the default CPU/CUDA RNG. Megatron also uses a
+        # tracker for model-parallel random operations inside the layer.
+        tracker = tensor_parallel.get_cuda_rng_tracker()
+        forward_states = tracker.get_states()
+
+        @contextlib.contextmanager
+        def recompute():
+            current_states = tracker.get_states()
+            tracker.set_states(forward_states.copy())
+            try:
+                with nvtx_range(f"recompute.microbatch.{microbatch}.{stage}"):
+                    yield
+            finally:
+                tracker.set_states(current_states)
+
+        return nvtx_range(f"fwd.microbatch.{microbatch}.{stage}"), recompute()
+
+    # The layer still has one grouped backward, so AccumulateGrad sees the
+    # sum over microbatches. Non-reentrant checkpoints allow that backward to
+    # restore each offloaded input and recompute its microbatch on demand.
     stages = []
     input_gradients: Callable[[], tuple[torch.Tensor | None, ...]] = tuple
     unit = None
@@ -1108,13 +1127,41 @@ def layer_by_layer_forward_backward_no_pipelining(
         with weight_scope, nvtx_range(f"forward.transformer.{layer_index}"):
             if forward_only:
                 hidden_states = forward_layer(layer_index, *hidden_states)
+            elif not offload_activations:
+                inputs, input_gradients = stage_inputs(hidden_states)
+                hidden_states = tensor_parallel.checkpoint(
+                    partial(forward_layer, layer_index), False, *inputs
+                )
+                del inputs
             else:
                 inputs, input_gradients = stage_inputs(hidden_states)
-                with activation_checkpoint(layer_index, f"transformer.{layer_index}"):
-                    hidden_states = tensor_parallel.checkpoint(
-                        partial(forward_layer, layer_index), False, *inputs
-                    )
-                del inputs
+                pending_inputs = deque(inputs)
+                del inputs, hidden_states
+                outputs = []
+                stage = f"transformer.{layer_index}"
+                with autocast(), set_checkpoint_early_stop(False):
+                    for mb, plan in enumerate(plans):
+                        value = pending_inputs.popleft()
+                        # The first decoder microbatch in backward can replay
+                        # directly from its resident input.
+                        keep_input = layer_index == num_layers - 1 and mb == num_microbatches - 1
+                        offload_scope = (
+                            contextlib.nullcontext()
+                            if keep_input
+                            else activation_checkpoint(layer_index, stage, microbatch=mb)
+                        )
+                        with offload_scope:
+                            output = checkpoint(
+                                partial(plan.forward_layer, layer_index),
+                                value,
+                                use_reentrant=False,
+                                context_fn=partial(decoder_checkpoint_contexts, mb, stage),
+                            )
+                        trace_microbatch_backward(mb, stage, output, value)
+                        outputs.append(output)
+                        del value
+                hidden_states = tuple(outputs)
+                del outputs, output
 
     if config.timers is not None:
         config.timers('forward-compute').stop()

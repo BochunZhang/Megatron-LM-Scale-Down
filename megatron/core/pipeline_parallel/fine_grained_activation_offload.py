@@ -860,50 +860,40 @@ class LayerByLayerActivationOffload:
 
     @contextmanager
     def checkpoint(
-        self, group_id: int, name: str, *, microbatch: int | None = None
+        self, group_id: int, name: str, *, microbatch: int
     ) -> Iterator[None]:
-        """Collect and offload the input tensors saved by a checkpoint.
-
-        A grouped decoder checkpoint saves one boundary per microbatch in order.
-        An output checkpoint supplies its microbatch explicitly and can save a
-        dummy CPU tensor, which stays on its original device.
-        """
-        groups: dict[int, OffloadTensorGroup] = {}
-        next_microbatch = 0
+        """Offload a microbatch's saved checkpoint inputs after its forward."""
+        group = None
 
         def pack(tensor: torch.Tensor) -> torch.Tensor | tuple[int, int, int]:
-            nonlocal next_microbatch
-            mb = next_microbatch if microbatch is None else microbatch
-            next_microbatch += 1
+            nonlocal group
             if not tensor.is_cuda or not tensor.numel():
                 return tensor.detach()
-            if mb not in groups:
-                groups[mb] = OffloadTensorGroup(f"{name} microbatch={mb}")
-            group = groups[mb]
-            tag = (mb, group_id, len(group._tensors))
+            if group is None:
+                group = OffloadTensorGroup(f"{name} microbatch={microbatch}")
+            tag = (microbatch, group_id, len(group._tensors))
             group.push_tensor(tag, tensor.detach())
             return tag
 
         with saved_tensors_hooks(pack, self._unpack):
             yield
-        if not groups:
+        if group is None:
             return
 
         stage = self._groups.setdefault(group_id, {})
-        if stage.keys() & groups.keys():
+        if microbatch in stage:
             raise RuntimeError(f"Activation checkpoints for group {group_id} overlap.")
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
-        for mb, group in groups.items():
-            with (
-                torch.cuda.nvtx.range(f"activation offloading {group._name}"),
-                torch.cuda.stream(self.d2h_stream),
-            ):
-                for tag, tensor in group._tensors.items():
-                    host = _copy_tensor_to_cpu(tensor, pin_memory=True)
-                    tensor.record_stream(self.d2h_stream)
-                    group.push_tensor(tag, (tensor.device, host))
-                group.record_offload_event(self.d2h_stream)
-            stage[mb] = group
+        with (
+            torch.cuda.nvtx.range(f"activation offloading {group._name}"),
+            torch.cuda.stream(self.d2h_stream),
+        ):
+            for tag, tensor in group._tensors.items():
+                host = _copy_tensor_to_cpu(tensor, pin_memory=True)
+                tensor.record_stream(self.d2h_stream)
+                group.push_tensor(tag, (tensor.device, host))
+            group.record_offload_event(self.d2h_stream)
+        stage[microbatch] = group
 
     @contextmanager
     def backward_group(self, group_id: int) -> Iterator[None]:
@@ -912,7 +902,7 @@ class LayerByLayerActivationOffload:
             raise RuntimeError("Activation backward groups cannot overlap.")
         stage = self._groups.get(group_id, {})
         self._active_group = group_id
-        self._pending = deque(sorted(stage))
+        self._pending = deque(sorted(stage, reverse=True))
         try:
             if self._pending:
                 # The preceding layer's backward must complete before this
@@ -930,7 +920,7 @@ class LayerByLayerActivationOffload:
     def _reload_through(self, microbatch: int) -> None:
         assert self._active_group is not None
         stage = self._groups[self._active_group]
-        while self._pending and self._pending[0] <= microbatch:
+        while self._pending and self._pending[0] >= microbatch:
             group = stage[self._pending.popleft()]
             with (
                 torch.cuda.nvtx.range(f"activation reloading {group._name}"),
@@ -950,9 +940,9 @@ class LayerByLayerActivationOffload:
             raise RuntimeError(
                 f"Attempted to reload activation group {group_id} outside its backward."
             )
-        # The output graph may request microbatches out of order. Dispatch
-        # the missing prefix and one lookahead for the current stage only.
-        self._reload_through(mb + 1)
+        # Stage the preceding microbatch while this one runs. An out-of-order
+        # request also stages the intervening microbatches in descending order.
+        self._reload_through(mb - 1)
         group = self._groups[group_id][mb]
         compute_stream = torch.cuda.current_stream()
         group.wait_reload_event(compute_stream)
