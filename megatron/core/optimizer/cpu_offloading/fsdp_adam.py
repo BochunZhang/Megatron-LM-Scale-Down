@@ -131,7 +131,9 @@ class FSDPCPUAdam(torch.optim.AdamW):
                     if not param._local_tensor.numel():
                         state = self.state[param]
                         state.setdefault("step", torch.zeros((), device="cpu")).add_(1)
-                    elif param.grad is not None:
+                    elif (
+                        param.grad is not None or getattr(param, "_fsdp_cpu_grad", None) is not None
+                    ):
                         by_group[id(groups[param])].append(param)
             if by_group:
                 yield buffers, bucket, params, by_group
@@ -139,7 +141,7 @@ class FSDPCPUAdam(torch.optim.AdamW):
     def _update_bucket(self, groups, buffers, bucket, params, by_group, weight_data, cpu_grad):
         master = bucket.main_weight_buffer
         gbuf = bucket.main_grad_buffer
-        on_gpu = cpu_grad is None
+        on_gpu = self._layer_by_layer and not master.cpu_offload
         moments = self._moments(
             master, load=any(p._local_tensor.numel() and p in self.state for p in params)
         )
@@ -154,6 +156,8 @@ class FSDPCPUAdam(torch.optim.AdamW):
                     weight = master.get_item(item, only_shard=True, data=weight_data)
                     if on_gpu:
                         grad = param.grad._local_tensor.view_as(weight)
+                    elif self._layer_by_layer:
+                        grad = param._fsdp_cpu_grad.view_as(weight)
                     else:
                         grad = gbuf.get_item(
                             gbuf.param_idx[original], only_shard=True, data=cpu_grad
@@ -222,52 +226,15 @@ class FSDPCPUAdam(torch.optim.AdamW):
             else:
                 gpu_buckets.append(active)
 
-        # Finalization and global gradient clipping have queued all writes to the
-        # FP32 shards on the training stream. One bucket of lookahead allows GPU
-        # copies to run during the synchronous multithreaded CPU optimizer call.
-        d2h_streams = {buffers.cpu_offload_d2h_stream for buffers, *_ in cpu_buckets}
-        for stream in d2h_streams:
-            stream.wait_stream(torch.cuda.current_stream(stream.device))
-
-        def stage(active, slot):
-            buffers, bucket, _, _ = active
-            gbuf = bucket.main_grad_buffer
-            stream = buffers.cpu_offload_d2h_stream
-            with (
-                torch.cuda.stream(stream),
-                nvtx_range(lambda: f"fsdp.layer_by_layer.gradient_d2h bucket={gbuf.bucket_id}"),
-            ):
-                host_grad = slot[: gbuf.data_size]
-                host_grad.copy_(gbuf.data, non_blocking=True)
-                return host_grad, stream.record_event()
-
         for buffers, bucket, params, by_group in gpu_buckets:
             self._update_bucket(
                 groups, buffers, bucket, params, by_group, bucket.main_weight_buffer.data, None
             )
-        if not cpu_buckets:
-            return
 
-        size = max(bucket.main_grad_buffer.data_size for _, bucket, _, _ in cpu_buckets)
-        slots = [
-            torch.empty(size, dtype=torch.float32, device="cpu", pin_memory=True)
-            for _ in range(min(2, len(cpu_buckets)))
-        ]
-        try:
-            staged = stage(cpu_buckets[0], slots[0])
-            for index, active in enumerate(cpu_buckets):
-                cpu_grad, ready = staged
-                if index + 1 < len(cpu_buckets):
-                    staged = stage(cpu_buckets[index + 1], slots[(index + 1) % 2])
-                ready.synchronize()
-                _, bucket, _, _ = active
-                cpu_master = bucket.main_weight_buffer.read_cpu_data()
-                self._update_bucket(groups, *active, cpu_master, cpu_grad)
-        except Exception:
-            # Keep pinned buffers alive until any outstanding transfer finishes.
-            for stream in d2h_streams:
-                stream.synchronize()
-            raise
+        # The CPU grad views already reference the accumulated and clipped FP32 shards.
+        for active in cpu_buckets:
+            _, bucket, _, _ = active
+            self._update_bucket(groups, *active, bucket.main_weight_buffer.read_cpu_data(), None)
 
     @torch.no_grad()
     def step(self, closure=None) -> None:

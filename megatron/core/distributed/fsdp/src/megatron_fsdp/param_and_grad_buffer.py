@@ -2823,20 +2823,14 @@ class ParamAndGradBuffer:
                 grad_dtype_fn = lambda pg: grad_comm_dtype  # noqa: E731
             else:
                 grad_dtype_fn = operator.attrgetter("grad_dtype")
-            # The deferred schedule retains each full BF16 gradient until all
-            # backward stages complete. Only the weight buckets can reuse slots.
-            self.main_grad_alloc = None
-            if not layer_by_layer_cpu_optimizer:
-                self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
-                    name="fsdp_grads",
-                    fsdp_param_groups=self.parameter_groups,
-                    size=UB_BUFFER_NUM,
-                    dtype_fn=grad_dtype_fn,
-                    fallback_to_persistent_buffer=(
-                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
-                    ),
-                    **pool_kwargs,
-                )
+            self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
+                name="fsdp_grads",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
+                dtype_fn=grad_dtype_fn,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                **pool_kwargs,
+            )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
                 # to leverage NCCL UBR for high-precision gradient reduction with
@@ -2939,6 +2933,7 @@ class ParamAndGradBuffer:
             )
             offload_main_grad = (
                 self.ddp_config.fsdp_cpu_offload_grad
+                and not gpu_update
                 and (group.fsdp_unit_id is not None or self.ddp_config.fsdp_cpu_optimizer)
                 and group.requires_grad
             )
@@ -3159,9 +3154,13 @@ class ParamAndGradBuffer:
                 sizes = defaultdict(int)
                 for i, size in staging_sizes.items():
                     gbuf = self.parameter_groups[i].main_grad_buffer
-                    dtype = self.mp_policy.grad_comm_dtype or gbuf.dtype
+                    dtype = gbuf.dtype
+                    if not layer_by_layer_cpu_optimizer:
+                        dtype = self.mp_policy.grad_comm_dtype or dtype
                     sizes[dtype] = max(sizes[dtype], size)
-                self.cpu_grad_accumulator = CPUGradientAccumulator(sizes)
+                self.cpu_grad_accumulator = CPUGradientAccumulator(
+                    sizes, zero_then_add=layer_by_layer_cpu_optimizer
+                )
             elif staging_sizes:
                 self.offload_grad_staging_alloc = MaxPoolAllocator(
                     name="fsdp_offload_grad_shards",
@@ -3668,14 +3667,22 @@ class ParamAndGradBuffer:
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
+        host_scaling_factor = (
+            float(scaling_factor) if self.ddp_config.fsdp_layer_by_layer_cpu_optimizer else None
+        )
         for group in self.parameter_groups:
-            if group.main_grad_buffer is None:
+            gbuf = group.main_grad_buffer
+            if gbuf is None:
                 continue
-            assert group.main_grad_buffer.data is not None, (
+            if host_scaling_factor is not None and gbuf.cpu_offload:
+                if gbuf.cpu_data_valid:
+                    gbuf.read_cpu_data().mul_(host_scaling_factor)
+                continue
+            assert gbuf.data is not None, (
                 "CPU-offloaded main gradients are only resident on GPU between "
                 "finish_grad_sync() and zero_grad_buffer()."
             )
-            group.main_grad_buffer.data *= scaling_factor
+            gbuf.data *= scaling_factor
         self.update_main_grads()
 
     def zero_grad(self):
@@ -3702,6 +3709,8 @@ class ParamAndGradBuffer:
                 param.grad = None
                 if hasattr(param, "decoupled_grad"):
                     param.decoupled_grad = None
+                if hasattr(param, "_fsdp_cpu_grad"):
+                    param._fsdp_cpu_grad = None
                 if name in self.dist_main_grad:
                     self.dist_main_grad[name]._local_tensor = None
 
@@ -3930,10 +3939,17 @@ class ParamAndGradBuffer:
             )
 
             # Retrieve the gradient from the gradient buffer.
-            item_id = group.main_grad_buffer.param_idx[orig_param]
-            optimizer_grad = group.main_grad_buffer.get_item(
-                item_id, only_shard=sharded_optimizer_state
-            )
+            item_id = gbuf.param_idx[orig_param]
+            if self.ddp_config.fsdp_layer_by_layer_cpu_optimizer and gbuf.cpu_offload:
+                # A CUDA-mesh DTensor would move the local tensor back to the GPU.
+                grad = (
+                    gbuf.get_item(item_id, only_shard=True, data=gbuf.read_cpu_data())
+                    if gbuf.cpu_data_valid
+                    else None
+                )
+                param._fsdp_cpu_grad = grad if grad is not None and grad.numel() else None
+                continue
+            optimizer_grad = gbuf.get_item(item_id, only_shard=sharded_optimizer_state)
             if group.main_weight_buffer is not None and not self.use_decoupled_grad:
                 # Convert the gradient to the main weight data-type for optimization.
                 # Not needed for decoupled gradients, because the precision-aware
@@ -4906,6 +4922,10 @@ class GradReducePipeline:
             grad_d2h_tasks = []
             for gbuf, reduced_grad in grad_offload_closure:
                 if self.buffer.cpu_grad_accumulator is not None:
+                    if ddp_config.fsdp_layer_by_layer_cpu_optimizer:
+                        # Promote the BF16 RS output on GPU, before the D2H stream
+                        # transports it to the FP32 accumulator's pinned slot.
+                        reduced_grad = reduced_grad.to(dtype=gbuf.dtype)
                     grad_d2h_tasks.append((gbuf, reduced_grad, None))
                 elif gbuf.is_data_distributed:
                     # Same accumulation as `local_grad += reduced_grad` above, where the
@@ -4940,9 +4960,11 @@ class GradReducePipeline:
                 gbuf.cpu_data_reduced = True
                 if not gbuf.is_data_distributed:
                     unsharded_offload_event = offload_event
-            # Keep both the full bucket and its staging slot assigned until
-            # the last D2H finishes, so the two pools advance together.
-            reduce_scatter_view_out_event = offload_event
+            if not ddp_config.fsdp_layer_by_layer_cpu_optimizer:
+                # The D2H source can alias the full bucket or its staging slot.
+                # Layer-major D2H instead reads the separately allocated FP32 cast,
+                # whose recorded D2H stream keeps it alive until the copy completes.
+                reduce_scatter_view_out_event = offload_event
 
         # DP-Outer Gradient Reduction
         if outer_fsdp_group_grad_reduce:

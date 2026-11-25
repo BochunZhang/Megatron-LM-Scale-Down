@@ -2726,6 +2726,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Note: this should be equivalent to the float-16 optimizer's method,
         but written differently, so the two should be combined.
         """
+        if self.ddp_config.fsdp_layer_by_layer_cpu_optimizer:
+            grads = []
+            for param in self.get_parameters():
+                cpu_grad = getattr(param, "_fsdp_cpu_grad", None)
+                if cpu_grad is not None:
+                    grads.append(cpu_grad)
+                elif param.grad is not None:
+                    grads.append(param.grad._local_tensor)
+            return grads
+
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return [
                 param.decoupled_grad.data

@@ -247,7 +247,10 @@ class MegatronOptimizer(ABC):
         for param in params:
             if param_filter is not None and not param_filter(param):
                 continue
-            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
+            cpu_grad = getattr(param, "_fsdp_cpu_grad", None)
+            if cpu_grad is not None:
+                grad = cpu_grad
+            elif self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
                 # Megatron-FSDP always uses decoupled_grad with FusedAdam.
                 self.config.use_precision_aware_optimizer
                 and getattr(param, "__fsdp_param__", False)
@@ -720,10 +723,21 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         self.found_inf.fill_(0.0)
 
         if not self.is_stub_optimizer:
+            cpu_grads = [grad for grad in main_grads if grad.device.type == 'cpu']
+            if cpu_grads:
+                main_grads = [grad for grad in main_grads if grad.device.type != 'cpu']
             # Unscale and set found inf/nan
             torch._amp_foreach_non_finite_check_and_unscale_(
                 main_grads, self.found_inf, self.grad_scaler.inv_scale
             )
+            if cpu_grads:
+                cpu_found_inf = torch.zeros_like(self.found_inf, device='cpu')
+                torch._amp_foreach_non_finite_check_and_unscale_(
+                    cpu_grads, cpu_found_inf, self.grad_scaler.inv_scale.cpu()
+                )
+                torch.maximum(
+                    self.found_inf, cpu_found_inf.to(self.found_inf.device), out=self.found_inf
+                )
 
         # Update across all model parallel instances.
         torch.distributed.all_reduce(

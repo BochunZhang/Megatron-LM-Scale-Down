@@ -1218,6 +1218,8 @@ def layer_by_layer_forward_backward_no_pipelining(
             fsdp.pre_backward()
         with activation_backward_group(num_layers), backward_stage("output"):
             torch.autograd.backward(losses)
+        if fsdp is not None and fsdp.layer_by_layer_cpu_optimizer:
+            fsdp.reduce_completed_stage_gradients(plans[0].output_parameters())
         del losses
         while stages:
             grad_outputs = input_gradients()

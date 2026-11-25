@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import gc
 import os
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -11,6 +14,9 @@ from torch.distributed.tensor import DTensor
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.offload import (
+    CPUGradientAccumulator,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
@@ -309,6 +315,33 @@ def _train(
     return losses, grad_norms, main_weights, eval_loss
 
 
+def test_layer_by_layer_cpu_accumulator_adds_first_shard(monkeypatch):
+    accumulator = CPUGradientAccumulator({}, zero_then_add=True)
+    main_grad = torch.tensor([111.0, -222.0])
+    shard = torch.tensor([3.0, 5.0])
+    event = Mock()
+    buffer = SimpleNamespace(
+        bucket_id=0,
+        read_cpu_data=lambda: main_grad,
+        new_cpu_data=lambda: main_grad,
+        store_cpu_data=Mock(),
+    )
+    before_add = []
+    add = torch.Tensor.add_
+
+    def track_add(target, *args, **kwargs):
+        before_add.append(target.clone())
+        return add(target, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "add_", track_add)
+    accumulator._accumulate(shard, buffer, event, False)
+    accumulator._accumulate(shard, buffer, event, True)
+    assert event.synchronize.call_count == 2
+    assert buffer.store_cpu_data.call_count == 2
+    testing.assert_close(before_add, [torch.zeros_like(shard), shard])
+    testing.assert_close(main_grad, 2 * shard)
+
+
 class TestMegatronFSDPCpuOffload:
     """Megatron-FSDP CPU offloading of model weights / main gradients must reproduce the
     training results of the non-offloaded baseline bitwise."""
@@ -400,6 +433,107 @@ class TestMegatronFSDPCpuOffload:
         # The layer-major schedule accumulates local microbatch gradients before
         # the collective, so its floating-point addition order differs.
         testing.assert_close(actual, reference, rtol=6e-3, atol=5e-4)
+
+    def test_layer_major_reduces_before_next_backward_and_keeps_fp32_host_gradients(self, monkeypatch):
+        torch.manual_seed(SEED)
+        model_parallel_cuda_manual_seed(SEED)
+        config = TransformerConfig(
+            num_layers=NUM_LAYERS,
+            hidden_size=HIDDEN_SIZE,
+            num_attention_heads=NUM_ATTENTION_HEADS,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            layer_by_layer_schedule=True,
+            finalize_model_grads_func=finalize_model_grads,
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_local_spec(),
+            vocab_size=VOCAB_SIZE,
+            max_sequence_length=SEQ_LENGTH,
+        ).cuda()
+        ddp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            bucket_size=1000,
+            overlap_grad_reduce=True,
+            use_distributed_optimizer=True,
+            use_megatron_fsdp=True,
+            megatron_fsdp_use_decoupled_grad=False,
+            megatron_fsdp_main_grads_dtype=torch.float32,
+            megatron_fsdp_grad_comm_dtype=torch.bfloat16,
+            fsdp_cpu_offload=("weight", "gradient", "optimizer"),
+            fsdp_cpu_grad_accumulation=True,
+            fsdp_cpu_optimizer=True,
+            fsdp_layer_by_layer_cpu_optimizer=True,
+        )
+        fsdp_model = FullyShardedDataParallel(config, ddp_config, Float16Module(config, model))
+        buffers = fsdp_model.param_and_grad_buffer
+        fsdp = fsdp_model.module
+        pipeline = fsdp.grad_reduce_pipeline
+        accumulator = buffers.cpu_grad_accumulator
+        reduce_group = pipeline._bucket_group_gradient_reduce
+        stage = fsdp.layer_by_layer_unit
+        submit = accumulator.submit
+        reduced_buckets = []
+        staged_buckets = []
+        output_buckets = {
+            buffers.param_to_param_group[p]
+            for module in (model.decoder.final_layernorm, model.output_layer)
+            for p in module.parameters()
+        }
+
+        def track_reduce(bucket_ids, *args, **kwargs):
+            reduced_buckets.extend(bucket_ids)
+            return reduce_group(bucket_ids, *args, **kwargs)
+
+        @contextmanager
+        def track_stage(module, *, backward):
+            if backward:
+                assert output_buckets <= set(reduced_buckets)
+            with stage(module, backward=backward):
+                yield
+            if backward:
+                expected = {buffers.param_to_param_group[p] for p in module.parameters() if p.requires_grad}
+                assert expected <= set(reduced_buckets)
+
+        def track_submit(grad, buffer, stream):
+            assert grad.is_cuda and grad.dtype == torch.float32
+            staged_buckets.append(buffer.bucket_id)
+            return submit(grad, buffer, stream)
+
+        monkeypatch.setattr(pipeline, "_bucket_group_gradient_reduce", track_reduce)
+        monkeypatch.setattr(fsdp, "layer_by_layer_unit", track_stage)
+        monkeypatch.setattr(accumulator, "submit", track_submit)
+        schedule = get_forward_backward_func(pp_size=1, layer_by_layer=True)
+        schedule(
+            forward_step_func=_schedule_forward_step,
+            data_iterator=iter(_make_batches()[0]),
+            model=[fsdp_model],
+            num_microbatches=NUM_MICROBATCHES,
+            seq_length=SEQ_LENGTH,
+            micro_batch_size=MICRO_BATCH_SIZE,
+        )
+
+        assert len(reduced_buckets) == len(set(reduced_buckets))
+        for group in buffers.parameter_groups:
+            gbuf = group.main_grad_buffer
+            if gbuf is None:
+                continue
+            assert gbuf.bucket_id in reduced_buckets
+            if group.fsdp_unit_id == 0:
+                assert not gbuf.cpu_offload and gbuf.data.is_cuda
+                assert gbuf.bucket_id not in staged_buckets
+            else:
+                assert gbuf.bucket_id in staged_buckets
+                assert gbuf.cpu_data_valid and gbuf.cpu_data.is_pinned()
+                assert gbuf.cpu_data.dtype == torch.float32 and gbuf.data is None
+        for _, param in buffers.optimizer_named_parameters:
+            gbuf = buffers.parameter_groups[buffers.param_to_param_group[param.orig_param]].main_grad_buffer
+            if gbuf.cpu_offload and param._local_tensor.numel():
+                assert param.grad is None and param._fsdp_cpu_grad.is_pinned()
+        fsdp_model.zero_grad_buffer()
+        assert all(getattr(p, "_fsdp_cpu_grad", None) is None for _, p in buffers.optimizer_named_parameters)
 
     def test_nvme_offload_matches_cpu_and_resumes(self, tmp_path):
         nvme_path = os.environ.get("MEGATRON_FSDP_TEST_NVME_PATH")

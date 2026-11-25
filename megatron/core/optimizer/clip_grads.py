@@ -85,6 +85,9 @@ def get_grad_norm_fp32(
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
 
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
+    cpu_grads = [grad for grad in grads_for_norm if grad.device.type == 'cpu']
+    if cpu_grads:
+        grads_for_norm = [grad for grad in grads_for_norm if grad.device.type != 'cpu']
 
     # Norm parameters.
     norm_type = float(norm_type)
@@ -94,6 +97,9 @@ def get_grad_norm_fp32(
     if norm_type == inf:
         total_norm = max((grad.abs().max() for grad in grads_for_norm), default=torch.tensor(0.0))
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
+        if cpu_grads:
+            cpu_norm = torch.stack(torch._foreach_norm(cpu_grads, inf)).max()
+            total_norm_cuda = torch.maximum(total_norm_cuda, cpu_norm.to(total_norm_cuda.device))
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
             torch.distributed.all_reduce(
@@ -123,6 +129,11 @@ def get_grad_norm_fp32(
             for grad in grads_for_norm:
                 grad_norm = torch.norm(grad, norm_type)
                 total_norm += grad_norm**norm_type
+
+        if cpu_grads:
+            # Reduce locally and send just the partial norm to the NCCL collective.
+            cpu_norm = torch.stack(torch._foreach_norm(cpu_grads, norm_type)).pow(norm_type).sum()
+            total_norm.add_(cpu_norm.to(total_norm.device))
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
@@ -161,25 +172,35 @@ def clip_grad_by_total_norm_fp32(
             Defaults to False.
     """
     # Grads.
-    params = []
     grads = []
+    cpu_grads = []
     for param in parameters:
-        if use_decoupled_grad:
+        cpu_grad = getattr(param, "_fsdp_cpu_grad", None)
+        if cpu_grad is not None:
+            assert cpu_grad.dtype == torch.float32
+            cpu_grads.append(cpu_grad.detach())
+        elif use_decoupled_grad:
             if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
                 assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
-                params.append(param)
                 grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
         else:
             if param.grad is not None:
                 assert param.grad.type() == 'torch.cuda.FloatTensor'
-                params.append(param)
                 grads.append(to_local_if_dtensor(param.grad).detach())
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
-    dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
     if isinstance(clip_coeff, torch.Tensor):
         clip_coeff.clamp_max_(1.0)
+    if cpu_grads:
+        cpu_clip_coeff = float(clip_coeff)
+        if cpu_clip_coeff < 1.0 or (isinstance(clip_coeff, torch.Tensor) and cpu_clip_coeff != 1.0):
+            torch._foreach_mul_(cpu_grads, cpu_clip_coeff)
+    if not grads:
+        return
+
+    dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    if isinstance(clip_coeff, torch.Tensor):
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
@@ -229,9 +250,16 @@ def count_zeros_fp32(
     #   - should not be a replica due to tensor model parallelism
     #   - should not be a replica due to (expert) generalized tensor parallelism
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
+    cpu_num_zeros = None
     data_parallel_group = None
     use_megatron_fsdp = False
     for param in parameters:
+        cpu_grad = getattr(param, "_fsdp_cpu_grad", None)
+        if cpu_grad is not None:
+            use_megatron_fsdp = True
+            num_zeros = cpu_grad.numel() - torch.count_nonzero(cpu_grad)
+            cpu_num_zeros = num_zeros if cpu_num_zeros is None else cpu_num_zeros + num_zeros
+            continue
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
         if getattr(param, "__fsdp_param__", False) and grad_not_none:
@@ -253,6 +281,9 @@ def count_zeros_fp32(
             grad = to_local_if_dtensor(grad_obj).detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros = num_zeros + total_num_zeros
+
+    if cpu_num_zeros is not None:
+        total_num_zeros.add_(cpu_num_zeros.to(total_num_zeros.device))
 
     if use_megatron_fsdp and data_parallel_group is not None:
         # Megatron-FSDP does not need to all-reduce the gradient across DP,

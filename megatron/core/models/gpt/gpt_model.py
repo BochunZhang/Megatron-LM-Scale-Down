@@ -69,6 +69,17 @@ class _GPTLayerByLayerSchedulePlan:
         """Return the FSDP unit executed at this decoder stage."""
         return self.model.decoder.layers[index]
 
+    def output_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+        """Parameters whose gradients are complete after output backward."""
+        embedding = set(self.model.embedding.parameters())
+        return tuple(
+            param
+            for module in (self.model.decoder.final_layernorm, self.model.output_layer)
+            if module is not None
+            for param in module.parameters()
+            if param not in embedding
+        )
+
     def preprocess(self) -> Tensor:
         hidden_states, self.rotary_pos_emb, *_ = self.model._preprocess(
             input_ids=self.input_ids,

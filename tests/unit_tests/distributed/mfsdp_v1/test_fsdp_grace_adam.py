@@ -1,11 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
 
+from megatron.core.optimizer import clip_grads
 from megatron.core.optimizer.cpu_offloading import fsdp_adam
 
 
@@ -86,7 +87,7 @@ def test_grace_adam_updates_restored_fsdp_state(monkeypatch):
     torch.testing.assert_close(state["exp_avg_sq"], 1.0 + gradient.square())
 
 
-def test_layer_by_layer_mixes_gpu_adam_and_staged_grace_adam(monkeypatch):
+def test_layer_by_layer_mixes_gpu_adam_and_accumulated_grace_adam(monkeypatch):
     params, buckets = [], []
     for index in range(4):
         weight = torch.tensor([2.0])
@@ -94,8 +95,11 @@ def test_layer_by_layer_mixes_gpu_adam_and_staged_grace_adam(monkeypatch):
         param = torch.nn.Parameter(weight)
         param._local_tensor = param.detach()
         param.orig_param = object()
-        gradient._local_tensor = gradient
-        param.grad = gradient
+        if index == 0:
+            gradient._local_tensor = gradient
+            param.grad = gradient
+        else:
+            param._fsdp_cpu_grad = gradient
         param_idx = {param.orig_param: 0}
 
         def make_buffer(tensor, *, cpu_offload=False):
@@ -133,26 +137,14 @@ def test_layer_by_layer_mixes_gpu_adam_and_staged_grace_adam(monkeypatch):
             events.append(label.split(".")[-1])
         yield
 
-    stream = Mock()
-    stream.record_event.side_effect = [
-        Mock(synchronize=lambda: events.append("ready 1")),
-        Mock(synchronize=lambda: events.append("ready 2")),
-        Mock(synchronize=lambda: events.append("ready 3")),
-    ]
-    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda _: Mock())
-    empty = torch.empty
-    def empty_host(*args, pin_memory=False, **kwargs):
-        return empty(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "empty", empty_host)
     monkeypatch.setattr(fsdp_adam, "nvtx_range", nvtx_range)
 
     grace_adam = SimpleNamespace(param_groups=[{"params": []}], state={})
+    expected_cpu_grads = iter(param._fsdp_cpu_grad for param in params[1:])
 
     def grace_step():
         (weight,) = grace_adam.param_groups[0]["params"]
-        assert weight.grad.dtype == torch.float32
+        assert weight.grad.data_ptr() == next(expected_cpu_grads).data_ptr()
         weight.sub_(weight.grad)
         grace_adam.state[weight]["step"] += 1
 
@@ -162,7 +154,6 @@ def test_layer_by_layer_mixes_gpu_adam_and_staged_grace_adam(monkeypatch):
         optimizer_named_parameters=[(str(index), param) for index, param in enumerate(params)],
         param_to_param_group={param.orig_param: index for index, param in enumerate(params)},
         parameter_groups=buckets,
-        cpu_offload_d2h_stream=stream,
         commit_cpu_optimizer_bucket=Mock(),
     )
     chunk = SimpleNamespace(
@@ -170,18 +161,13 @@ def test_layer_by_layer_mixes_gpu_adam_and_staged_grace_adam(monkeypatch):
         ddp_config=SimpleNamespace(fsdp_layer_by_layer_cpu_optimizer=True),
     )
     optimizer = fsdp_adam.FSDPCPUAdam([{"params": params}], [chunk], backend="grace_adam", lr=0.1)
+    clip_grads.clip_grad_by_total_norm_fp32(params[1:], max_norm=0.5, total_norm=1.0)
     optimizer.step()
 
     assert events == [
         "GPUAdamW bucket=0",
-        "gradient_d2h bucket=1",
-        "gradient_d2h bucket=2",
-        "ready 1",
         "GraceAdam bucket=1",
-        "gradient_d2h bucket=3",
-        "ready 2",
         "GraceAdam bucket=2",
-        "ready 3",
         "GraceAdam bucket=3",
     ]
     reference = torch.nn.Parameter(torch.tensor([2.0]))
@@ -191,5 +177,32 @@ def test_layer_by_layer_mixes_gpu_adam_and_staged_grace_adam(monkeypatch):
     torch.testing.assert_close(buckets[0].model_weight_buffer.data, reference.to(torch.bfloat16))
     assert buffers.commit_cpu_optimizer_bucket.call_count == 3
     for index, param in enumerate(params[1:], start=1):
-        torch.testing.assert_close(param, torch.tensor([2.0 - 0.25 * (index + 1)]))
+        grad = 0.25 * (index + 1) * (0.5 / (1.0 + 1.0e-6))
+        torch.testing.assert_close(param, torch.tensor([2.0 - grad]))
         assert optimizer.state[param]["step"].item() == 1
+
+
+def test_fsdp_gradient_norm_combines_cpu_and_gpu_before_collective(monkeypatch):
+    cpu_grad = torch.tensor([4.0])
+    gpu_grad = SimpleNamespace(device=torch.device("cuda"))
+    group = object()
+    zeros = torch.zeros
+
+    def cuda_scalar_on_cpu(size, *, dtype, device):
+        assert device == "cuda"
+        return zeros(size, dtype=dtype)
+
+    fused_norm = Mock(return_value=(torch.tensor([3.0]), None))
+    all_reduce = Mock()
+    monkeypatch.setattr(torch, "zeros", cuda_scalar_on_cpu)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    monkeypatch.setattr(clip_grads, "multi_tensor_applier", fused_norm)
+    monkeypatch.setattr(clip_grads, "multi_tensor_scale_tensor_impl", None)
+
+    grad_norm = clip_grads.get_grad_norm_fp32([cpu_grad, gpu_grad], grad_stats_parallel_group=group)
+
+    assert grad_norm == 5.0
+    assert fused_norm.call_args.args[2] == [[gpu_grad]]
+    all_reduce.assert_called_once_with(
+        torch.tensor([25.0]), op=torch.distributed.ReduceOp.SUM, group=group
+    )

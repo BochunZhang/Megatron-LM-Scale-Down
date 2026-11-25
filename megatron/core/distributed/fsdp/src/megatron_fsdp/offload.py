@@ -85,13 +85,14 @@ class NVMeOffload:
 class CPUGradientAccumulator:
     """Reuse a pinned MaxPool double buffer sized for the largest shard of each dtype."""
 
-    def __init__(self, sizes: dict[torch.dtype, int]):
+    def __init__(self, sizes: dict[torch.dtype, int], *, zero_then_add: bool = False):
         self.slots = {
             dtype: [torch.empty(size, dtype=dtype, device="cpu", pin_memory=True) for _ in range(2)]
             for dtype, size in sizes.items()
         }
         self.next_slot = defaultdict(int)
         self.pending = {}
+        self.zero_then_add = zero_then_add
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fsdp-cpu-grad")
 
     def submit(
@@ -119,17 +120,20 @@ class CPUGradientAccumulator:
         self.pending[key] = self.worker.submit(self._accumulate, slot, buffer, event, valid)
         return event
 
-    @staticmethod
     @torch.no_grad()
-    def _accumulate(slot, buffer, event, valid):
+    def _accumulate(self, slot, buffer, event, valid):
         with nvtx_range(lambda: f"fsdp.cpu_grad.wait_d2h bucket={buffer.bucket_id}"):
             event.synchronize()
         with nvtx_range(lambda: f"fsdp.cpu_grad.accumulate bucket={buffer.bucket_id}"):
             if valid:
                 main_grad = buffer.read_cpu_data()
-                main_grad.add_(slot)
             else:
                 main_grad = buffer.new_cpu_data()
+                if self.zero_then_add:
+                    main_grad.zero_()
+            if valid or self.zero_then_add:
+                main_grad.add_(slot)
+            else:
                 main_grad.copy_(slot)
             buffer.store_cpu_data(main_grad)
 
