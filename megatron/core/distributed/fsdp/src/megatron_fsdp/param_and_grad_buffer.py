@@ -2308,6 +2308,7 @@ class ParamAndGradBuffer:
         self.cpu_offload_d2h_stream = cpu_offload_d2h_stream
         self.nvme = NVMeOffload(ddp_config.fsdp_nvme_path) if ddp_config.fsdp_nvme_path else None
         self.cpu_grad_accumulator = None
+        self.submit_cpu_optimizer_bucket = None
         self.ubr_groups = None
         self.already_registered = False
         # User buffer registration related settings
@@ -4970,6 +4971,8 @@ class GradReducePipeline:
                 if layer_by_layer_cpu_optimizer:
                     with nvtx_range(lambda: f"fsdp.cpu_grad.d2h bucket={gbuf.bucket_id}"):
                         offload_event = gbuf.offload_to_cpu(grad, d2h_stream)
+                    if self.buffer.submit_cpu_optimizer_bucket is not None:
+                        self.buffer.submit_cpu_optimizer_bucket(gbuf.bucket_id, offload_event)
                 elif self.buffer.cpu_grad_accumulator is not None:
                     offload_event = self.buffer.cpu_grad_accumulator.submit(grad, gbuf, d2h_stream)
                 else:

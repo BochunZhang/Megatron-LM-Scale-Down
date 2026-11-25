@@ -410,6 +410,12 @@ class MegatronFSDP(torch.nn.Module):
                 "FSDP layer-by-layer CPU AdamW requires TP=1 and eager gradient reduction "
                 "with BF16 communication and direct FP32 gradient offload."
             )
+        if config.fsdp_layer_by_layer_overlap_cpu_optimizer and (
+            not self.layer_by_layer_cpu_optimizer or not self.cpu_offload_weight
+        ):
+            raise ValueError(
+                "Overlapped layer-by-layer GraceAdam requires CPU weight and gradient offload."
+            )
         if config.fsdp_nvme_path is not None and (
             not config.fsdp_nvme_path or not config.fsdp_cpu_optimizer or not self.cpu_offload_weight
         ):

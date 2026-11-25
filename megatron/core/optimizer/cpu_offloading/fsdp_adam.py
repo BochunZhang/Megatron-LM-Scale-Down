@@ -2,8 +2,10 @@
 
 """CPU AdamW with optional GPU layer-zero updates for Megatron-FSDP shards."""
 
+import logging
 import platform
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -13,6 +15,7 @@ from torch.optim._functional import adamw
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import nvtx_range
 
 _MOMENTS = ("exp_avg", "exp_avg_sq")
+logger = logging.getLogger(__name__)
 
 
 def _create_grace_adam() -> torch.optim.Optimizer:
@@ -62,6 +65,29 @@ class FSDPCPUAdam(torch.optim.AdamW):
         )
         if self._layer_by_layer and backend != "grace_adam":
             raise ValueError("The layer-by-layer hybrid optimizer requires GraceAdam.")
+        overlap = any(
+            getattr(
+                getattr(chunk, "ddp_config", None),
+                "fsdp_layer_by_layer_overlap_cpu_optimizer",
+                False,
+            )
+            for chunk in model_chunks
+        )
+        self._worker = None
+        self._overlap_buckets = {}
+        self._pending_cpu_buckets = {}
+        if overlap:
+            native = getattr(self._grace_adam, "ds_opt_adam", None)
+            if not getattr(native, "adam_update_releases_gil", False):
+                raise RuntimeError(
+                    "Overlapped GraceAdam requires a DeepSpeed CPUAdam build that releases "
+                    "the GIL. Apply src/optimizer/deepspeed-cpu-adam-release-gil.patch."
+                )
+            logger.info(
+                "Overlapped GraceAdam using CPUAdam with GIL release from %s",
+                getattr(native, "__file__", None),
+            )
+            self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fsdp-grace-adam")
         self.buckets = []
         for chunk in model_chunks:
             buffers = chunk.param_and_grad_buffer
@@ -71,7 +97,16 @@ class FSDPCPUAdam(torch.optim.AdamW):
                 params_by_bucket[bucket][param] = param.orig_param
             for bucket_id, bucket in enumerate(buffers.parameter_groups):
                 if bucket_id in params_by_bucket:
-                    self.buckets.append((buffers, bucket, params_by_bucket[bucket_id]))
+                    entry = (buffers, bucket, params_by_bucket[bucket_id])
+                    self.buckets.append(entry)
+                    if (
+                        overlap
+                        and bucket.main_weight_buffer is not None
+                        and bucket.main_weight_buffer.cpu_offload
+                    ):
+                        self._overlap_buckets[bucket_id] = entry
+            if overlap:
+                buffers.submit_cpu_optimizer_bucket = self._submit_cpu_bucket
 
     def _moments(self, master, *, load):
         if master.nvme is None:
@@ -133,20 +168,64 @@ class FSDPCPUAdam(torch.optim.AdamW):
 
     def _active_bucket_groups(self, groups):
         for buffers, bucket, params in self.buckets:
-            by_group = defaultdict(list)
-            for param in params:
-                if param in groups:
-                    if not param._local_tensor.numel():
-                        state = self.state[param]
-                        state.setdefault("step", torch.zeros((), device="cpu")).add_(1)
-                    elif (
-                        param.grad is not None or getattr(param, "_fsdp_cpu_grad", None) is not None
-                    ):
-                        by_group[id(groups[param])].append(param)
+            if id(bucket) in self._pending_cpu_buckets:
+                continue
+            by_group = self._group_bucket_params(params, groups)
             if by_group:
                 yield buffers, bucket, params, by_group
 
-    def _update_bucket(self, groups, buffers, bucket, params, by_group, weight_data, cpu_grad):
+    def _group_bucket_params(self, params, groups, *, offloaded_grad_ready=False):
+        by_group = defaultdict(list)
+        for param in params:
+            if param not in groups:
+                continue
+            if not param._local_tensor.numel():
+                state = self.state[param]
+                state.setdefault("step", torch.zeros((), device="cpu")).add_(1)
+            elif (
+                offloaded_grad_ready
+                or param.grad is not None
+                or getattr(param, "_fsdp_cpu_grad", None) is not None
+            ):
+                by_group[id(groups[param])].append(param)
+        return by_group
+
+    def _submit_cpu_bucket(self, bucket_id: int, ready_event: torch.cuda.Event) -> None:
+        entry = self._overlap_buckets.get(bucket_id)
+        if entry is None:
+            return
+        buffers, bucket, params = entry
+        key = id(bucket)
+        if key in self._pending_cpu_buckets:
+            raise RuntimeError(f"FSDP CPU optimizer bucket {bucket_id} was submitted twice.")
+        self._pending_cpu_buckets[key] = self._worker.submit(
+            self._step_offloaded_bucket, ready_event, buffers, bucket, params
+        )
+
+    @torch.no_grad()
+    def _step_offloaded_bucket(self, ready_event, buffers, bucket, params):
+        master = bucket.main_weight_buffer
+        with nvtx_range(lambda: f"fsdp.cpu_optimizer.wait_d2h bucket={master.bucket_id}"):
+            ready_event.synchronize()
+        groups = {param: group for group in self.param_groups for param in group["params"]}
+        by_group = self._group_bucket_params(params, groups, offloaded_grad_ready=True)
+        if by_group:
+            self._update_bucket(
+                groups,
+                buffers,
+                bucket,
+                params,
+                by_group,
+                master.read_cpu_data(),
+                bucket.main_grad_buffer.read_cpu_data(),
+                publish=False,
+            )
+            return buffers, bucket
+        return None
+
+    def _update_bucket(
+        self, groups, buffers, bucket, params, by_group, weight_data, cpu_grad, *, publish=True
+    ):
         master = bucket.main_weight_buffer
         gbuf = bucket.main_grad_buffer
         on_gpu = self._layer_by_layer and not master.cpu_offload
@@ -170,7 +249,7 @@ class FSDPCPUAdam(torch.optim.AdamW):
                     weight = master.get_item(item, only_shard=True, data=weight_data)
                     if on_gpu:
                         grad = param.grad._local_tensor.view_as(weight)
-                    elif self._layer_by_layer:
+                    elif cpu_grad is None:
                         grad = param._fsdp_cpu_grad.view_as(weight)
                     else:
                         grad = gbuf.get_item(
@@ -220,6 +299,8 @@ class FSDPCPUAdam(torch.optim.AdamW):
                     grace_updates,
                     label=lambda: f"GraceAdam bucket={master.bucket_id} {bucket.nvtx_label}",
                 )
+        if not publish:
+            return
         if on_gpu:
             wbuf = bucket.model_weight_buffer
             for param in bucket.params:
@@ -246,7 +327,18 @@ class FSDPCPUAdam(torch.optim.AdamW):
                 groups, buffers, bucket, params, by_group, bucket.main_weight_buffer.data, None
             )
 
-        # The CPU grad views already reference the finalized and clipped FP32 shards.
+        # Early workers only touched CPU master weights and moments. Publish the BF16
+        # shards now that backward and its parameter gathers have finished.
+        for task in self._pending_cpu_buckets.values():
+            completed = task.result()
+            if completed is not None:
+                buffers, bucket = completed
+                buffers.commit_cpu_optimizer_bucket(
+                    bucket, bucket.main_weight_buffer.read_cpu_data()
+                )
+        self._pending_cpu_buckets.clear()
+
+        # Remaining CPU grad views reference the finalized FP32 shards.
         for active in cpu_buckets:
             _, bucket, _, _ = active
             self._update_bucket(groups, *active, bucket.main_weight_buffer.read_cpu_data(), None)

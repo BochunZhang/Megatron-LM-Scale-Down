@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from megatron.core.optimizer import clip_grads
@@ -256,3 +258,140 @@ def test_fsdp_gradient_norm_combines_cpu_and_gpu_before_collective(monkeypatch):
     all_reduce.assert_called_once_with(
         torch.tensor([25.0]), op=torch.distributed.ReduceOp.SUM, group=group
     )
+
+
+def test_layer_by_layer_grace_adam_waits_for_bucket_offload(monkeypatch):
+    weights = [torch.tensor([2.0]), torch.tensor([3.0])]
+    gradients = [torch.tensor([0.5]), torch.tensor([1.0])]
+    compute_weights = [weight.to(torch.bfloat16) for weight in weights]
+    params = [torch.nn.Parameter(weight) for weight in weights]
+    buckets = []
+
+    for bucket_id, param in enumerate(params):
+        param.orig_param = object()
+        param._local_tensor = param.detach()
+        grad = gradients[bucket_id]
+        weight = weights[bucket_id]
+        param_idx = {param.orig_param: 0}
+
+        def get_item(item_id, *, only_shard, data):
+            assert item_id == 0 and only_shard
+            return data
+
+        master = SimpleNamespace(
+            bucket_id=bucket_id,
+            cpu_offload=True,
+            nvme=None,
+            param_idx=param_idx,
+            get_item=get_item,
+            read_cpu_data=Mock(return_value=weight),
+        )
+        grad_buffer = SimpleNamespace(
+            bucket_id=bucket_id,
+            cpu_offload=True,
+            cpu_data_valid=True,
+            param_idx=param_idx,
+            get_item=get_item,
+            read_cpu_data=Mock(return_value=grad),
+        )
+        buckets.append(
+            SimpleNamespace(
+                params=[param.orig_param],
+                main_weight_buffer=master,
+                main_grad_buffer=grad_buffer,
+                nvtx_label=f"transformer.{bucket_id}.dense.0.0M",
+            )
+        )
+
+    def publish(bucket, master):
+        compute_weights[bucket.main_weight_buffer.bucket_id].copy_(master)
+
+    buffers = SimpleNamespace(
+        optimizer_named_parameters=list(zip(("early", "tail"), params)),
+        param_to_param_group={param.orig_param: index for index, param in enumerate(params)},
+        parameter_groups=buckets,
+        submit_cpu_optimizer_bucket=None,
+        commit_cpu_optimizer_bucket=Mock(side_effect=publish),
+    )
+    chunk = SimpleNamespace(
+        param_and_grad_buffer=buffers,
+        ddp_config=SimpleNamespace(
+            fsdp_layer_by_layer_cpu_optimizer=True, fsdp_layer_by_layer_overlap_cpu_optimizer=True
+        ),
+    )
+    early_updated = Event()
+    grace_adam = SimpleNamespace(
+        ds_opt_adam=SimpleNamespace(adam_update_releases_gil=True),
+        param_groups=[{"params": []}],
+        state={},
+    )
+
+    def grace_step():
+        (group,) = grace_adam.param_groups
+        (weight,) = group["params"]
+        state = grace_adam.state[weight]
+        state["step"] += 1
+        state["exp_avg"].add_(weight.grad)
+        weight.sub_(weight.grad, alpha=group["lr"])
+        if weight.grad.data_ptr() == gradients[0].data_ptr():
+            early_updated.set()
+
+    grace_adam.step = Mock(side_effect=grace_step)
+    monkeypatch.setattr(fsdp_adam, "_create_grace_adam", lambda: grace_adam)
+    optimizer = fsdp_adam.FSDPCPUAdam([{"params": params}], [chunk], lr=0.25, backend="grace_adam")
+
+    for iteration in range(2):
+        offload_waiting = Event()
+        offload_ready = Event()
+        early_updated.clear()
+        early_gradient = buckets[0].main_grad_buffer.read_cpu_data
+        early_gradient.reset_mock()
+
+        def synchronize_offload():
+            offload_waiting.set()
+            assert offload_ready.wait(timeout=5)
+
+        offload_event = SimpleNamespace(synchronize=synchronize_offload)
+        buffers.submit_cpu_optimizer_bucket(0, offload_event)
+        try:
+            assert offload_waiting.wait(timeout=5)
+            early_gradient.assert_not_called()
+            assert grace_adam.step.call_count == iteration * 2
+        finally:
+            offload_ready.set()
+
+        assert early_updated.wait(timeout=5)
+        torch.testing.assert_close(weights[0], torch.tensor([2.0 - 0.125 * (iteration + 1)]))
+        torch.testing.assert_close(
+            compute_weights[0], torch.tensor([2.0 - 0.125 * iteration], dtype=torch.bfloat16)
+        )
+        assert buffers.commit_cpu_optimizer_bucket.call_count == iteration * 2
+
+        # Finalization attaches both gradient views, including the late bucket.
+        for param, grad in zip(params, gradients):
+            param._fsdp_cpu_grad = grad
+        optimizer.step()
+
+        assert grace_adam.step.call_count == (iteration + 1) * 2
+        assert buffers.commit_cpu_optimizer_bucket.call_count == (iteration + 1) * 2
+        torch.testing.assert_close(compute_weights[0], weights[0].to(torch.bfloat16))
+        torch.testing.assert_close(weights[1], torch.tensor([3.0 - 0.25 * (iteration + 1)]))
+        torch.testing.assert_close(compute_weights[1], weights[1].to(torch.bfloat16))
+        for param, grad in zip(params, gradients):
+            assert optimizer.state[param]["step"].item() == iteration + 1
+            torch.testing.assert_close(optimizer.state[param]["exp_avg"], grad * (iteration + 1))
+
+
+def test_layer_by_layer_grace_adam_overlap_requires_gil_release(monkeypatch):
+    monkeypatch.setattr(
+        fsdp_adam, "_create_grace_adam", lambda: SimpleNamespace(ds_opt_adam=SimpleNamespace())
+    )
+    chunk = SimpleNamespace(
+        param_and_grad_buffer=SimpleNamespace(optimizer_named_parameters=[], parameter_groups=[]),
+        ddp_config=SimpleNamespace(
+            fsdp_layer_by_layer_cpu_optimizer=True, fsdp_layer_by_layer_overlap_cpu_optimizer=True
+        ),
+    )
+    param = torch.nn.Parameter(torch.ones(1))
+    with pytest.raises(RuntimeError, match="GIL"):
+        fsdp_adam.FSDPCPUAdam([{"params": [param]}], [chunk], backend="grace_adam")

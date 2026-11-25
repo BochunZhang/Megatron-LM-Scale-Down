@@ -970,6 +970,13 @@ def layer_by_layer_forward_backward_no_pipelining(
 
     fsdp = find_megatron_fsdp(model)
     if fsdp is not None:
+        if fsdp.ddp_config.fsdp_layer_by_layer_overlap_cpu_optimizer and not forward_only:
+            from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
+
+            if get_rerun_state_machine().get_mode() != RerunMode.DISABLED:
+                raise ValueError("Overlapped layer-by-layer GraceAdam requires reruns disabled.")
+            if force_all_reduce:
+                raise ValueError("Overlapped layer-by-layer GraceAdam requires reduce-scatter.")
         # The layer plans call inner modules directly, bypassing MegatronFSDP.forward.
         fsdp._replace_param_with_raw_if_needed()
     cuda_nvtx = torch.cuda.nvtx if torch.cuda.is_available() else None

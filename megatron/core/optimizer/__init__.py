@@ -506,6 +506,24 @@ def _get_megatron_optimizer_based_on_param_groups(
     )
     if config.fsdp_cpu_optimizer_backend == "grace_adam" and not fsdp_cpu_optimizer:
         raise ValueError("GraceAdam requires ddp.fsdp_cpu_optimizer.")
+    if any(
+        getattr(getattr(chunk, "ddp_config", None), "fsdp_layer_by_layer_overlap_cpu_optimizer", False)
+        for chunk in model_chunks
+    ):
+        if (
+            len(model_chunks) != 1
+            or config.fsdp_cpu_optimizer_backend != "grace_adam"
+            or not config.bf16
+            or config.fp16
+            or config.loss_scale is not None
+            or config.clip_grad != 0
+            or config.log_num_zeros_in_grad
+            or config.grad_norm_skip_threshold != float("inf")
+        ):
+            raise ValueError(
+                "Overlapped layer-by-layer GraceAdam requires one BF16 model chunk without "
+                "loss scaling, clipping, gradient zero counts, or skipping by gradient norm."
+            )
     if fsdp_cpu_optimizer and (
         config.optimizer != "adam"
         or not config.decoupled_weight_decay

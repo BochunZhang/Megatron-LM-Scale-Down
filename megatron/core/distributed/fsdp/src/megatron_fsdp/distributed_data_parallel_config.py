@@ -201,6 +201,9 @@ class DistributedDataParallelConfig:
     """Reduce gradients at layer-by-layer stage boundaries, keeping decoder layer 0
     gradients and optimizer on the GPU and offloading other reduced shards to CPU as FP32."""
 
+    fsdp_layer_by_layer_overlap_cpu_optimizer: bool = False
+    """Start GraceAdam on each CPU bucket after its FP32 gradient shard arrives."""
+
     fsdp_nvme_path: str | None = None
     """Local NVMe directory for spilling the CPU-offloaded FSDP buffers."""
 
