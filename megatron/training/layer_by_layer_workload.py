@@ -4,6 +4,8 @@
 
 import hashlib
 from collections.abc import Iterator
+from copy import deepcopy
+from dataclasses import fields
 
 import torch
 from torch import Tensor, nn
@@ -19,6 +21,68 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _recipe_config(source: TransformerConfig, num_layers: int) -> TransformerConfig:
+    """Copy architecture fields and apply the layer-by-layer runtime settings."""
+    if source.num_moe_experts:
+        raise ValueError("The layer-by-layer workload requires a dense model")
+    if getattr(source, "share_embeddings_and_output_weights", False):
+        raise ValueError(
+            "The layer-by-layer workload requires untied embeddings and output weights"
+        )
+    if source.attention_dropout or source.hidden_dropout:
+        raise ValueError("Layer-by-layer recomputation requires zero model dropout")
+    values = {
+        item.name: deepcopy(getattr(source, item.name))
+        for item in fields(TransformerConfig)
+        if item.init
+    }
+    if isinstance(values["linear_attention_freq"], list):
+        if len(values["linear_attention_freq"]) < num_layers:
+            raise ValueError("The recipe's attention pattern is shorter than num_layers")
+        values["linear_attention_freq"] = values["linear_attention_freq"][:num_layers]
+
+    values.update(
+        num_layers=num_layers,
+        mtp_num_layers=None,
+        tensor_model_parallel_size=1,
+        tensor_parallel_num_weight_shards=1,
+        gtp_weight_remat_size=1,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        num_layers_in_first_pipeline_stage=None,
+        num_layers_in_last_pipeline_stage=None,
+        context_parallel_size=1,
+        hierarchical_context_parallel_sizes=None,
+        sequence_parallel=False,
+        fp16=False,
+        bf16=True,
+        fp8=None,
+        fp8_param=False,
+        fp4=None,
+        fp4_param=False,
+        params_dtype=torch.bfloat16,
+        perform_initialization=True,
+        use_cpu_initialization=False,
+        gradient_accumulation_fusion=False,
+        disable_parameter_transpose_cache=True,
+        enable_cuda_graph=False,
+        external_cuda_graph=False,
+        cuda_graph_impl="none",
+        cuda_graph_modules=[],
+        cuda_graph_scope=None,
+        cpu_offloading=False,
+        cpu_offloading_num_layers=0,
+        fine_grained_activation_offloading=False,
+        offload_modules=None,
+        recompute_granularity=None,
+        recompute_method=None,
+        recompute_num_layers=None,
+        recompute_modules=None,
+    )
+    return TransformerConfig(**values)
 
 
 class _EmbeddingUnit(nn.Module):
@@ -91,6 +155,10 @@ class Qwen35DenseWorkload:
         device: torch.device,
         pg_collection: ProcessGroupCollection,
         tiny: bool = False,
+        model_config: TransformerConfig | None = None,
+        vocab_size: int | None = None,
+        rotary_base: float | None = None,
+        rotary_percent: float | None = None,
     ) -> None:
         if min(num_layers, seq_length, micro_batch_size) < 1:
             raise ValueError("Layer count, sequence length and micro-batch size must be positive")
@@ -107,7 +175,20 @@ class Qwen35DenseWorkload:
         self.seq_length = seq_length
         self.micro_batch_size = micro_batch_size
         self.pg_collection = pg_collection
-        self.vocab_size = 1024 if tiny else 248320
+        if model_config is not None:
+            if vocab_size is None:
+                vocab_size = getattr(model_config, "vocab_size", None)
+            if rotary_base is None:
+                rotary_base = getattr(model_config, "rotary_base", None)
+            if rotary_percent is None:
+                rotary_percent = getattr(model_config, "rotary_percent", None)
+        self.vocab_size = (1024 if tiny else 248320) if vocab_size is None else vocab_size
+        self.rotary_base = 10_000_000 if rotary_base is None else rotary_base
+        self.rotary_percent = 0.25 if rotary_percent is None else rotary_percent
+        if model_config is not None:
+            self.config = _recipe_config(model_config, num_layers)
+            return
+
         self.config = TransformerConfig(
             num_layers=num_layers,
             hidden_size=256 if tiny else 5120,
@@ -150,12 +231,18 @@ class Qwen35DenseWorkload:
         groups = self.pg_collection
         with torch.cuda.device(self.device):
             torch.random.default_generator.manual_seed(self.seed)
-            tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
+            tensor_parallel.model_parallel_cuda_manual_seed(
+                self.seed, te_rng_tracker=config.use_te_rng_tracker
+            )
             block_spec = get_transformer_block_with_experimental_attention_variant_spec(
                 config, pp_rank=0
             )
             rotary_pos_emb = RotaryEmbedding(
-                config.kv_channels, rotary_percent=0.25, rotary_base=10_000_000, cp_group=groups.cp
+                config.kv_channels,
+                rotary_percent=self.rotary_percent,
+                rotary_interleaved=config.rotary_interleaved,
+                rotary_base=self.rotary_base,
+                cp_group=groups.cp,
             )(self.seq_length)
 
             yield _EmbeddingUnit(

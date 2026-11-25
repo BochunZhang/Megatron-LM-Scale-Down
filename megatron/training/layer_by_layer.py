@@ -7,9 +7,11 @@ import json
 import logging
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
+from typing import Literal
 
 import torch
 from torch import distributed as dist
@@ -17,9 +19,94 @@ from torch import distributed as dist
 from megatron.core import parallel_state
 from megatron.core.distributed.layer_by_layer import LayerByLayerTrainer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.layer_by_layer_workload import Qwen35DenseWorkload
 
 _LOG = logging.getLogger(__name__)
+
+
+@dataclass(kw_only=True, frozen=True)
+class LayerByLayerConfig:
+    """Configure the single-node layer-by-layer mock training runtime.
+
+    A resolved TransformerConfig may supply the Qwen decoder architecture.
+    Without one, the runtime uses its built-in Qwen3.5 or tiny geometry.
+    """
+
+    nvme_dir: Path
+    num_layers: int = 64
+    seq_length: int = 4096
+    micro_batch_size: int = 1
+    microbatches: int = 4
+    steps: int = 3
+    parameter_tier: Literal["cpu_param", "nvme_param"] = "nvme_param"
+    activation_tier: Literal["gpu_act", "cpu_act", "nvme_act"] = "nvme_act"
+    learning_rate: float = 1e-4
+    cpu_threads: int = 8
+    seed: int = 1234
+    tiny: bool = False
+    profile_start: int | None = None
+    profile_end: int | None = None
+    betas: tuple[float, float] = (0.9, 0.95)
+    eps: float = 1e-8
+    weight_decay: float = 0.1
+    model_config: TransformerConfig | None = None
+    vocab_size: int | None = None
+    rotary_base: float | None = None
+    rotary_percent: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "num_layers",
+            "seq_length",
+            "micro_batch_size",
+            "microbatches",
+            "steps",
+            "cpu_threads",
+            "seed",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"--{name.replace('_', '-')} must be a positive integer")
+        if not Path(self.nvme_dir).is_dir():
+            raise ValueError("--nvme-dir must be an existing directory")
+        if self.parameter_tier not in ("cpu_param", "nvme_param"):
+            raise ValueError("--parameter-tier must be cpu_param or nvme_param")
+        if self.activation_tier not in ("gpu_act", "cpu_act", "nvme_act"):
+            raise ValueError("--activation-tier must be gpu_act, cpu_act or nvme_act")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
+            raise ValueError("--learning-rate must be finite and positive")
+        if len(self.betas) != 2 or any(not 0 <= beta < 1 for beta in self.betas):
+            raise ValueError("AdamW betas must contain two values in [0, 1)")
+        if not math.isfinite(self.eps) or self.eps < 0:
+            raise ValueError("AdamW epsilon must be finite and nonnegative")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("AdamW weight decay must be finite and nonnegative")
+        if (self.profile_start is None) != (self.profile_end is None):
+            raise ValueError("--profile-start and --profile-end must be supplied together")
+        if self.profile_start is not None and (
+            type(self.profile_start) is not int
+            or type(self.profile_end) is not int
+            or not 0 <= self.profile_start < self.profile_end <= self.steps
+        ):
+            raise ValueError("profiling requires 0 <= --profile-start < --profile-end <= --steps")
+        if self.model_config is not None and not isinstance(self.model_config, TransformerConfig):
+            raise TypeError("model_config must be a TransformerConfig")
+        if self.tiny and any(
+            value is not None
+            for value in (self.model_config, self.vocab_size, self.rotary_base, self.rotary_percent)
+        ):
+            raise ValueError("--tiny cannot be combined with recipe model geometry")
+        if self.vocab_size is not None and (
+            type(self.vocab_size) is not int or self.vocab_size < 1
+        ):
+            raise ValueError("vocab_size must be a positive integer")
+        if self.rotary_base is not None and (
+            not math.isfinite(self.rotary_base) or self.rotary_base <= 0
+        ):
+            raise ValueError("rotary_base must be finite and positive")
+        if self.rotary_percent is not None and not 0 < self.rotary_percent <= 1:
+            raise ValueError("rotary_percent must be in (0, 1]")
 
 
 def _positive(value: str) -> int:
@@ -29,42 +116,29 @@ def _positive(value: str) -> int:
     return number
 
 
-def _args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--num-layers", type=_positive, default=64)
-    parser.add_argument("--seq-length", type=_positive, default=4096)
-    parser.add_argument("--micro-batch-size", type=_positive, default=1)
-    parser.add_argument("--microbatches", type=_positive, default=4)
-    parser.add_argument("--steps", type=_positive, default=3)
-    parser.add_argument(
-        "--parameter-tier", choices=("cpu_param", "nvme_param"), default="nvme_param"
-    )
-    parser.add_argument(
-        "--activation-tier", choices=("gpu_act", "cpu_act", "nvme_act"), default="nvme_act"
-    )
+def _args() -> LayerByLayerConfig:
+    parser = argparse.ArgumentParser(description=__doc__, argument_default=argparse.SUPPRESS)
+    parser.add_argument("--num-layers", type=_positive)
+    parser.add_argument("--seq-length", type=_positive)
+    parser.add_argument("--micro-batch-size", type=_positive)
+    parser.add_argument("--microbatches", type=_positive)
+    parser.add_argument("--steps", type=_positive)
+    parser.add_argument("--parameter-tier", choices=("cpu_param", "nvme_param"))
+    parser.add_argument("--activation-tier", choices=("gpu_act", "cpu_act", "nvme_act"))
     parser.add_argument("--nvme-dir", required=True, type=Path)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--cpu-threads", type=_positive, default=8)
-    parser.add_argument("--seed", type=_positive, default=1234)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--cpu-threads", type=_positive)
+    parser.add_argument("--seed", type=_positive)
     parser.add_argument("--tiny", action="store_true")
     parser.add_argument("--profile-start", type=int, help="first profiled step, starting at zero")
     parser.add_argument("--profile-end", type=int, help="first step after the profiled window")
-    args = parser.parse_args()
-    if not args.nvme_dir.is_dir():
-        parser.error("--nvme-dir must be an existing directory")
-    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
-        parser.error("--learning-rate must be finite and positive")
-    if (args.profile_start is None) != (args.profile_end is None):
-        parser.error("--profile-start and --profile-end must be supplied together")
-    if (
-        args.profile_start is not None
-        and not 0 <= args.profile_start < args.profile_end <= args.steps
-    ):
-        parser.error("profiling requires 0 <= --profile-start < --profile-end <= --steps")
-    return args
+    try:
+        return LayerByLayerConfig(**vars(parser.parse_args()))
+    except ValueError as error:
+        parser.error(str(error))
 
 
-def _train(args: argparse.Namespace, device: torch.device, group: dist.ProcessGroup) -> dict:
+def _train(args: LayerByLayerConfig, device: torch.device, group: dist.ProcessGroup) -> dict:
     workload = Qwen35DenseWorkload(
         num_layers=args.num_layers,
         seq_length=args.seq_length,
@@ -73,6 +147,10 @@ def _train(args: argparse.Namespace, device: torch.device, group: dist.ProcessGr
         device=device,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(["tp", "pp", "cp"]),
         tiny=args.tiny,
+        model_config=args.model_config,
+        vocab_size=args.vocab_size,
+        rotary_base=args.rotary_base,
+        rotary_percent=args.rotary_percent,
     )
     rank = group.rank()
     elapsed = []
@@ -93,9 +171,9 @@ def _train(args: argparse.Namespace, device: torch.device, group: dist.ProcessGr
             directory=Path(scratch),
             tier=args.parameter_tier,
             activation_tier=args.activation_tier,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-            weight_decay=0.1,
+            betas=args.betas,
+            eps=args.eps,
+            weight_decay=args.weight_decay,
         ) as trainer:
             for step in range(args.steps):
                 batches = [workload.make_batch(step, mb, rank) for mb in range(args.microbatches)]
@@ -159,9 +237,12 @@ def _train(args: argparse.Namespace, device: torch.device, group: dist.ProcessGr
     }
 
 
-def main() -> None:
-    """Launch the BF16 capacity workload on the torchrun CUDA ranks."""
-    args = _args()
+def run_layer_by_layer(config: LayerByLayerConfig) -> None:
+    """Initialize distributed CUDA and run the workload on each torchrun rank.
+
+    Args:
+        config: Layer-by-layer model, storage, optimizer, and profiling options.
+    """
     if not torch.cuda.is_available() or not dist.is_nccl_available():
         raise RuntimeError("Layer-by-layer training requires CUDA and NCCL")
     if (
@@ -170,7 +251,7 @@ def main() -> None:
     ):
         raise RuntimeError("Launch on one node using python -m torch.distributed.run")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    torch.set_num_threads(args.cpu_threads)
+    torch.set_num_threads(config.cpu_threads)
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     torch.cuda.reset_peak_memory_stats(device)
@@ -178,12 +259,17 @@ def main() -> None:
     try:
         parallel_state.initialize_model_parallel(create_gloo_process_groups=False)
         group = parallel_state.get_data_parallel_group()
-        result = _train(args, device, group)
+        result = _train(config, device, group)
         if dist.get_rank() == 0:
             _LOG.info("LAYER_BY_LAYER_RESULT %s", json.dumps(result, allow_nan=False))
     finally:
         parallel_state.destroy_model_parallel()
         dist.destroy_process_group()
+
+
+def main() -> None:
+    """Launch the BF16 capacity workload from the standalone CLI."""
+    run_layer_by_layer(_args())
 
 
 if __name__ == "__main__":
