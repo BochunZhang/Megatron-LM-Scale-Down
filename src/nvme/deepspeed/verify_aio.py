@@ -28,6 +28,34 @@ class NativeAioTest(unittest.TestCase):
             megatron_nvme_aio.transfer(worker, destination, path, False)
             self.assertEqual(source[:], destination[:])
 
+    def test_async_transfers_reuse_preallocated_region(self):
+        offset = 4096
+        size = 128 * 1024 * 18 + 4096
+        reader = megatron_nvme_aio.create_worker(16)
+        writer = megatron_nvme_aio.create_worker(16)
+        with (
+            tempfile.TemporaryDirectory(dir=os.environ.get("MEGATRON_FSDP_TEST_NVME_PATH")) as root,
+            mmap.mmap(-1, size) as source,
+            mmap.mmap(-1, size) as destination,
+        ):
+            path = Path(root) / "activations.bin"
+            with path.open("wb") as file:
+                os.posix_fallocate(file.fileno(), 0, offset + size)
+            inode = path.stat().st_ino
+            for step in range(2):
+                source[:] = b"".join(
+                    (i + step).to_bytes(4, "little") * 1024 for i in range(size // 4096)
+                )
+                write = megatron_nvme_aio.submit(writer, source, str(path), True, offset)
+                megatron_nvme_aio.wait(write)
+                read = megatron_nvme_aio.submit(reader, destination, str(path), False, offset)
+                megatron_nvme_aio.wait(read)
+                self.assertEqual(source[:], destination[:])
+            with path.open("rb") as file:
+                self.assertEqual(file.read(offset), b"\0" * offset)
+            self.assertEqual(path.stat().st_size, offset + size)
+            self.assertEqual(path.stat().st_ino, inode)
+
     def test_worker_recovers_after_failed_io(self):
         worker = megatron_nvme_aio.create_worker()
         with (

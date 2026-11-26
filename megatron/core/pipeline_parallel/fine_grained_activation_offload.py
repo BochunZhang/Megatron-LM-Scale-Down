@@ -856,30 +856,46 @@ class _NVMeActivation(NamedTuple):
     device: torch.device
     shape: torch.Size
     dtype: torch.dtype
-    offset: int = 0
+    offset: int
 
 
-class _DeepSpeedActivationAIOResources(NamedTuple):
-    directory: TemporaryDirectory
-    reader: Any
-    writer: Any
+class _NativeActivationAIOHandle:
+    """Expose the activation scheduler's async I/O interface on a native worker."""
+
+    def __init__(self) -> None:
+        try:
+            from megatron_nvme_aio import create_worker, submit, wait
+        except ImportError as error:
+            raise RuntimeError(
+                "Native layer-by-layer NVMe activations require the updated megatron_nvme_aio "
+                "extension. Rebuild and install Megatron-LM's src/nvme/deepspeed."
+            ) from error
+        self._worker = create_worker(16)
+        self._submit = submit
+        self._wait = wait
+        self._request = None
+
+    def async_pwrite(self, buffer: torch.Tensor, filename: str, offset: int) -> int:
+        self._request = self._submit(self._worker, buffer.numpy(), filename, True, offset)
+        return 0
+
+    def async_pread(self, buffer: torch.Tensor, filename: str, offset: int) -> int:
+        self._request = self._submit(self._worker, buffer.numpy(), filename, False, offset)
+        return 0
+
+    def wait(self) -> int:
+        request, self._request = self._request, None
+        self._wait(request)
+        return 1
 
 
-class _DeepSpeedActivationAIO:
+class _ActivationAIO:
     """Swap activations into aligned regions of a reusable file."""
 
-    # Active schedules own their file and handles exclusively. Cache only drained resources.
-    _idle_resources: WeakKeyDictionary[torch.nn.Module, _DeepSpeedActivationAIOResources] = (
-        WeakKeyDictionary()
-    )
-
-    def __init__(self, path: str, *, model: torch.nn.Module | None = None) -> None:
-        root = Path(path).absolute()
-        resources = self._idle_resources.pop(model, None) if model is not None else None
-        if resources is not None and Path(resources.directory.name).parent != root:
-            resources.directory.cleanup()
-            resources = None
-        if resources is None:
+    def __init__(self, root: Path, *, backend: Literal["native", "deepspeed"]) -> None:
+        self._backend = backend
+        self._label = "DeepSpeed" if backend == "deepspeed" else "native"
+        if backend == "deepspeed":
             from deepspeed.ops.op_builder import AsyncIOBuilder
 
             aio_handle = AsyncIOBuilder().load().aio_handle
@@ -890,22 +906,17 @@ class _DeepSpeedActivationAIO:
                 overlap_events=True,
                 intra_op_parallelism=1,
             )
-            root.mkdir(parents=True, exist_ok=True)
-            directory = TemporaryDirectory(
-                dir=root, prefix=f"mfsdp-rank{torch.distributed.get_rank()}-"
-            )
-            resources = _DeepSpeedActivationAIOResources(
-                directory, aio_handle(**options), aio_handle(**options)
-            )
-        self._reader = resources.reader
-        self._writer = resources.writer
-        self._directory: TemporaryDirectory | None = resources.directory
-        self._model = model
-        self._filename = str(Path(resources.directory.name) / "activations.bin")
-        try:
-            self._capacity = os.stat(self._filename).st_size
-        except FileNotFoundError:
-            self._capacity = 0
+            self._reader = aio_handle(**options)
+            self._writer = aio_handle(**options)
+        else:
+            self._reader = _NativeActivationAIOHandle()
+            self._writer = _NativeActivationAIOHandle()
+        root.mkdir(parents=True, exist_ok=True)
+        self._directory = TemporaryDirectory(
+            dir=root, prefix=f"mfsdp-rank{torch.distributed.get_rank()}-"
+        )
+        self._filename = str(Path(self._directory.name) / "activations.bin")
+        self._capacity = 0
         self._next_offset = 0
         self.pending_write: str | None = None
         self._pending_read: str | None = None
@@ -913,7 +924,7 @@ class _DeepSpeedActivationAIO:
     def reserve(self, size: int) -> None:
         if size <= self._capacity:
             return
-        with torch.cuda.nvtx.range(f"activation DeepSpeed AIO preallocate bytes={size}"):
+        with torch.cuda.nvtx.range(f"activation {self._label} AIO preallocate bytes={size}"):
             fd = os.open(self._filename, os.O_CREAT | os.O_RDWR, 0o600)
             try:
                 os.posix_fallocate(fd, self._capacity, size - self._capacity)
@@ -925,29 +936,40 @@ class _DeepSpeedActivationAIO:
         key = self.pending_write
         if key is not None:
             self.pending_write = None
-            _, group_id, microbatch, index = key.removesuffix(".bin").split("-")
-            with torch.cuda.nvtx.range(
-                f"DeepSpeed AIO wait activation write micro-batch {microbatch} "
-                f"transformer {group_id} tensor {index}"
-            ):
+            label = f"activation native AIO wait write {key}"
+            if self._backend == "deepspeed":
+                _, group_id, microbatch, index = key.removesuffix(".bin").split("-")
+                label = (
+                    f"DeepSpeed AIO wait activation write micro-batch {microbatch} "
+                    f"transformer {group_id} tensor {index}"
+                )
+            with torch.cuda.nvtx.range(label):
                 if self._writer.wait() != 1:
-                    raise RuntimeError(f"DeepSpeed AIO did not complete the write for {key}")
+                    raise RuntimeError(f"{self._label} AIO did not complete the write for {key}")
 
     def wait_read(self) -> None:
         key = self._pending_read
         if key is not None:
             self._pending_read = None
-            with torch.cuda.nvtx.range(f"activation DeepSpeed AIO wait read {key}"):
+            with torch.cuda.nvtx.range(f"activation {self._label} AIO wait read {key}"):
                 if self._reader.wait() != 1:
-                    raise RuntimeError(f"DeepSpeed AIO did not complete the read for {key}")
+                    raise RuntimeError(f"{self._label} AIO did not complete the read for {key}")
 
     def submit_write(self, key: str, buffer: torch.Tensor) -> int:
         offset = self._next_offset
         end = offset + buffer.numel()
-        self.reserve(end)
-        with torch.cuda.nvtx.range(f"activation DeepSpeed AIO submit write {key} bytes={buffer.numel()}"):
+        if end > self._capacity:
+            if self._backend == "native":
+                raise RuntimeError(
+                    f"Native activation swap needs {end} bytes for {key}, "
+                    f"but only {self._capacity} bytes were reserved for the step."
+                )
+            self.reserve(end)
+        with torch.cuda.nvtx.range(
+            f"activation {self._label} AIO submit write {key} bytes={buffer.numel()}"
+        ):
             if self._writer.async_pwrite(buffer, self._filename, offset) != 0:
-                raise RuntimeError(f"DeepSpeed AIO could not submit a write for {key}")
+                raise RuntimeError(f"{self._label} AIO could not submit a write for {key}")
             self.pending_write = key
         self._next_offset = end
         return offset
@@ -956,67 +978,58 @@ class _DeepSpeedActivationAIO:
         key = saved.key
         if self.pending_write == key:
             self.wait_write()
-        with torch.cuda.nvtx.range(f"activation DeepSpeed AIO submit read {key} bytes={buffer.numel()}"):
+        with torch.cuda.nvtx.range(
+            f"activation {self._label} AIO submit read {key} bytes={buffer.numel()}"
+        ):
             if self._reader.async_pread(buffer, self._filename, saved.offset) != 0:
-                raise RuntimeError(f"DeepSpeed AIO could not submit a read for {key}")
+                raise RuntimeError(f"{self._label} AIO could not submit a read for {key}")
             self._pending_read = key
 
-    def close(self) -> None:
-        directory = self._directory
-        if directory is None:
-            return
-        self._directory = None
-        model = self._model
-        self._model = None
+    def drain(self) -> None:
         try:
-            try:
-                self.wait_write()
-            finally:
-                self.wait_read()
-        except BaseException:
-            directory.cleanup()
-            raise
-        else:
-            if model is None:
-                directory.cleanup()
-            else:
-                self._idle_resources[model] = _DeepSpeedActivationAIOResources(
-                    directory, self._reader, self._writer
-                )
+            self.wait_write()
         finally:
-            del self._reader, self._writer
+            self.wait_read()
+        self._next_offset = 0
 
-
-def release_layer_by_layer_activation_aio(model: torch.nn.Module) -> None:
-    """Release a model's drained activation swap file and AIO handles after training.
-
-    Args:
-        model: The model chunk passed to the layer-by-layer schedule on this rank.
-    """
-    resources = _DeepSpeedActivationAIO._idle_resources.pop(model, None)
-    if resources is not None:
-        resources.directory.cleanup()
+    def close(self) -> None:
+        try:
+            self.drain()
+        finally:
+            self._reader = self._writer = None
+            self._directory.cleanup()
 
 
 class _LayerByLayerNVMeActivations:
     """Swap saved boundaries through reusable pinned buffers."""
 
-    def __init__(
-        self,
-        path: str,
-        *,
-        backend: Literal["native", "deepspeed"] = "native",
-        model: torch.nn.Module | None = None,
-    ):
+    # A running schedule owns its swap exclusively. Only drained swaps are cached.
+    _idle_swaps: WeakKeyDictionary[torch.nn.Module, "_LayerByLayerNVMeActivations"] = (
+        WeakKeyDictionary()
+    )
+
+    def __init__(self, path: str | Path, *, backend: Literal["native", "deepspeed"] = "native"):
         from megatron.core.distributed.fsdp.src.megatron_fsdp.offload import NVMeOffload
 
-        self.swap = (
-            _DeepSpeedActivationAIO(path, model=model) if backend == "deepspeed" else NVMeOffload(path)
-        )
+        self._root = Path(path).absolute()
+        self._backend = backend
+        self.swap = _ActivationAIO(self._root, backend=backend)
         self._io_alignment = NVMeOffload.io_alignment
         self._buffer_alignment = NVMeOffload.buffer_alignment
         self._slots: dict[str, torch.Tensor] = {}
         self._prefetched: tuple[str, torch.Tensor] | None = None
+
+    @classmethod
+    def for_step(
+        cls, path: str, *, backend: Literal["native", "deepspeed"], model: torch.nn.Module | None
+    ) -> "_LayerByLayerNVMeActivations":
+        root = Path(path).absolute()
+        swap = cls._idle_swaps.pop(model, None) if model is not None else None
+        if swap is not None:
+            if swap._root == root and swap._backend == backend:
+                return swap
+            swap.close()
+        return cls(root, backend=backend)
 
     def _aligned_size(self, size: int) -> int:
         alignment = self._io_alignment
@@ -1025,10 +1038,8 @@ class _LayerByLayerNVMeActivations:
     def _stage(
         self, size: int, *, direction: Literal["forward", "backward", "prefetch"]
     ) -> torch.Tensor:
-        alignment = 1
-        if direction != "forward" or isinstance(self.swap, _DeepSpeedActivationAIO):
-            alignment = self._buffer_alignment
-            size = self._aligned_size(size)
+        alignment = self._buffer_alignment
+        size = self._aligned_size(size)
         slot = self._slots.get(direction)
         if slot is None or slot.numel() < size:
             allocation = torch.empty(
@@ -1044,23 +1055,18 @@ class _LayerByLayerNVMeActivations:
         microbatch, group_id, index = tag
         key = f"activation-{group_id}-{microbatch}-{index}.bin"
         size = tensor.shape.numel() * tensor.dtype.itemsize
-        if isinstance(self.swap, _DeepSpeedActivationAIO):
-            # The preceding write owns the pinned slot until this reuse.
-            self.swap.wait_write()
+        # The preceding write owns the pinned slot until this reuse.
+        self.swap.wait_write()
         staging = self._stage(size, direction="forward")
         host = staging[:size].view(tensor.dtype).view(tensor.shape)
         host.copy_(tensor, non_blocking=False)
-        offset = 0
-        if isinstance(self.swap, _DeepSpeedActivationAIO):
-            staging[size:].zero_()
-            offset = self.swap.submit_write(key, staging)
-        else:
-            self.swap.write(key, host.view(-1))
+        staging[size:].zero_()
+        offset = self.swap.submit_write(key, staging)
         return _NVMeActivation(key, tensor.device, tensor.shape, tensor.dtype, offset)
 
     def prefetch(self, stage: dict[int, OffloadTensorGroup]) -> None:
         """Read ahead by one saved activation during layer backward."""
-        if not isinstance(self.swap, _DeepSpeedActivationAIO) or self._prefetched is not None:
+        if self._prefetched is not None:
             return
         for microbatch in sorted(stage, reverse=True):
             group = stage[microbatch]
@@ -1076,30 +1082,50 @@ class _LayerByLayerNVMeActivations:
     def reload(self, saved: _NVMeActivation) -> torch.Tensor:
         """Wait for disk read and H2D before returning to backward."""
         size = saved.shape.numel() * saved.dtype.itemsize
-        if isinstance(self.swap, _DeepSpeedActivationAIO):
-            self.swap.wait_read()
-            if self._prefetched is not None and self._prefetched[0] == saved.key:
-                _, staging = self._prefetched
-                self._prefetched = None
-            else:
-                # Autograd may ask for a different microbatch. Keep the ready
-                # prefetch in its own slot while serving that demand read.
-                staging = self._stage(size, direction="backward")
-                self.swap.submit_read(saved, staging)
-                self.swap.wait_read()
+        self.swap.wait_read()
+        if self._prefetched is not None and self._prefetched[0] == saved.key:
+            _, staging = self._prefetched
+            self._prefetched = None
         else:
+            # Autograd may ask for a different microbatch. Keep the ready
+            # prefetch in its own slot while serving that demand read.
             staging = self._stage(size, direction="backward")
-            self.swap.read_aligned(saved.key, staging)
+            self.swap.submit_read(saved, staging)
+            self.swap.wait_read()
         host = staging[:size].view(saved.dtype).view(saved.shape)
         # The blocking copy runs on the requesting autograd stream. Backward
         # can use the result and the host slot can be reused once it returns.
         return _copy_tensor_to_device(saved.device, host, non_blocking=False)
 
     def close(self) -> None:
-        if isinstance(self.swap, _DeepSpeedActivationAIO):
+        try:
             self.swap.close()
-        else:
-            self.swap.directory.cleanup()
+        finally:
+            self._prefetched = None
+            self._slots.clear()
+
+    def finish_step(self, model: torch.nn.Module | None) -> None:
+        if model is None:
+            self.close()
+            return
+        try:
+            self.swap.drain()
+        except BaseException:
+            self.close()
+            raise
+        self._prefetched = None
+        self._idle_swaps[model] = self
+
+
+def release_layer_by_layer_activation_aio(model: torch.nn.Module) -> None:
+    """Release a model's drained activation swap file and AIO handles after training.
+
+    Args:
+        model: The model chunk passed to the layer-by-layer schedule on this rank.
+    """
+    swap = _LayerByLayerNVMeActivations._idle_swaps.pop(model, None)
+    if swap is not None:
+        swap.close()
 
 
 class LayerByLayerActivationOffload:
@@ -1113,10 +1139,11 @@ class LayerByLayerActivationOffload:
         model: torch.nn.Module | None = None,
     ) -> None:
         self._nvme = (
-            _LayerByLayerNVMeActivations(nvme_path, backend=nvme_backend, model=model)
+            _LayerByLayerNVMeActivations.for_step(nvme_path, backend=nvme_backend, model=model)
             if nvme_path is not None
             else None
         )
+        self._model = model if self._nvme is not None else None
         if self._nvme is None:
             manager = PipelineOffloadManager.get_instance()
             self.d2h_stream = manager.d2h_stream
@@ -1128,9 +1155,11 @@ class LayerByLayerActivationOffload:
     def reserve_nvme(self, inputs: tuple[torch.Tensor, ...], *, num_groups: int) -> None:
         """Preallocate space for the layer-major checkpoint inputs on NVMe."""
         nvme = self._nvme
-        if nvme is not None and isinstance(nvme.swap, _DeepSpeedActivationAIO):
+        if nvme is not None:
             bytes_per_group = sum(
-                nvme._aligned_size(tensor.shape.numel() * tensor.dtype.itemsize) for tensor in inputs
+                nvme._aligned_size(tensor.shape.numel() * tensor.dtype.itemsize)
+                for tensor in inputs
+                if tensor.is_cuda
             )
             nvme.swap.reserve(num_groups * bytes_per_group)
 
@@ -1242,10 +1271,11 @@ class LayerByLayerActivationOffload:
         return tensor
 
     def close(self) -> None:
-        """Drain activation I/O and release the step's staging."""
-        if self._nvme is not None:
-            self._nvme.close()
-            self._nvme = None
+        """Drain activation I/O and return the swap for the next training step."""
+        nvme, self._nvme = self._nvme, None
+        model, self._model = self._model, None
+        if nvme is not None:
+            nvme.finish_step(model)
 
 
 class ChunkOffloadHandler:

@@ -68,6 +68,22 @@ class _Plan:
         return self.model.head(hidden_states).square()
 
 
+class _CudaTensor:
+    is_cuda = True
+    device = torch.device("cuda")
+
+    def __init__(self, data):
+        self.data = data
+        self.shape = data.shape
+        self.dtype = data.dtype
+
+    def numel(self):
+        return self.data.numel()
+
+    def detach(self):
+        return self
+
+
 def _forward_step(data_iterator, model, *, return_schedule_plan=False):
     microbatch, tokens = next(data_iterator)
     plan = _Plan(model, microbatch, tokens)
@@ -278,28 +294,7 @@ def test_layer_by_layer_checkpoint_reloads_only_the_current_group(monkeypatch):
 
 
 @pytest.fixture
-def mock_nvme_aio(monkeypatch):
-    operations = []
-
-    def transfer(_worker, buffer, path, write):
-        path = Path(path)
-        operations.append(("write" if write else "read", path))
-        if write:
-            path.write_bytes(buffer)
-        else:
-            buffer[:] = path.read_bytes()
-
-    monkeypatch.setitem(
-        sys.modules,
-        "megatron_nvme_aio",
-        SimpleNamespace(create_worker=object, transfer=transfer),
-    )
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    return operations
-
-
-@pytest.fixture
-def mock_deepspeed_aio(monkeypatch):
+def nvme_operations(monkeypatch):
     operations = []
 
     def allocate_file(fd, offset, size):
@@ -307,6 +302,47 @@ def mock_deepspeed_aio(monkeypatch):
         os.ftruncate(fd, offset + size)
         operations.append(("reserve", (offset, size)))
 
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(os, "posix_fallocate", allocate_file, raising=False)
+    return operations
+
+
+@pytest.fixture
+def mock_nvme_aio(monkeypatch, nvme_operations):
+    def create_worker(queue_depth):
+        assert queue_depth == 16
+        return object()
+
+    def submit(_worker, array, filename, write, offset):
+        buffer = memoryview(array)
+        assert offset % 4096 == 0 and buffer.nbytes % 4096 == 0
+        assert array.ctypes.data % os.sysconf("SC_PAGE_SIZE") == 0
+        path = Path(filename)
+        assert offset + buffer.nbytes <= path.stat().st_size
+        operation = "write" if write else "read"
+        nvme_operations.append((f"submit_{operation}", (path, offset)))
+        return operation, buffer, path, offset
+
+    def wait(request):
+        operation, buffer, path, offset = request
+        with path.open("r+b" if operation == "write" else "rb") as file:
+            file.seek(offset)
+            if operation == "write":
+                file.write(buffer)
+            else:
+                assert file.readinto(buffer) == buffer.nbytes
+        nvme_operations.append((operation, (path, offset)))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron_nvme_aio",
+        SimpleNamespace(create_worker=create_worker, submit=submit, wait=wait),
+    )
+    return nvme_operations
+
+
+@pytest.fixture
+def mock_deepspeed_aio(monkeypatch, nvme_operations):
     class AioHandle:
         def __init__(self, **kwargs):
             assert kwargs == {
@@ -324,7 +360,7 @@ def mock_deepspeed_aio(monkeypatch):
             assert buffer.numel() % 4096 == 0
             path = Path(filename)
             assert offset + buffer.numel() <= path.stat().st_size
-            operations.append((f"submit_{operation}", (path, offset)))
+            nvme_operations.append((f"submit_{operation}", (path, offset)))
             self.pending = (operation, buffer, path, offset)
             return 0
 
@@ -343,7 +379,7 @@ def mock_deepspeed_aio(monkeypatch):
                 else:
                     data = bytearray(file.read(buffer.numel()))
                     buffer.copy_(torch.frombuffer(data, dtype=torch.uint8))
-            operations.append((operation, (path, offset)))
+            nvme_operations.append((operation, (path, offset)))
             self.pending = None
             return 1
 
@@ -352,12 +388,14 @@ def mock_deepspeed_aio(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "deepspeed.ops.op_builder", SimpleNamespace(AsyncIOBuilder=lambda: builder)
     )
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
-    monkeypatch.setattr(os, "posix_fallocate", allocate_file, raising=False)
-    return operations
+    return nvme_operations
 
 
-def test_layer_by_layer_deepspeed_defers_write_wait(tmp_path, monkeypatch, mock_deepspeed_aio):
+@pytest.mark.parametrize("backend", ["native", "deepspeed"])
+def test_layer_by_layer_nvme_defers_write_wait(tmp_path, monkeypatch, request, backend):
+    operations = request.getfixturevalue(
+        "mock_nvme_aio" if backend == "native" else "mock_deepspeed_aio"
+    )
     allocate = torch.empty
     nvtx_ranges = []
 
@@ -372,50 +410,57 @@ def test_layer_by_layer_deepspeed_defers_write_wait(tmp_path, monkeypatch, mock_
     monkeypatch.setattr(torch, "empty", allocate_on_cpu)
     monkeypatch.setattr(torch.cuda.nvtx, "range", record_nvtx_range)
     offload = fine_grained_activation_offload._LayerByLayerNVMeActivations(
-        str(tmp_path), backend="deepspeed"
+        str(tmp_path), backend=backend
     )
     first = torch.arange(2050, dtype=torch.bfloat16).view(2, 1025).t()
     second = torch.tensor(17, dtype=torch.int64)
     try:
-        offload.swap.reserve(3 * 4096)
+        offload.swap.reserve((4 if backend == "native" else 3) * 4096)
         saved_first = offload.offload((0, 0, 0), first)
-        assert [name for name, _ in mock_deepspeed_aio] == ["reserve", "submit_write"]
+        assert [name for name, _ in operations] == ["reserve", "submit_write"]
         saved_second = offload.offload((1, 0, 0), second)
-        assert [name for name, _ in mock_deepspeed_aio[1:]] == ["submit_write", "write", "submit_write"]
+        assert [name for name, _ in operations[1:]] == ["submit_write", "write", "submit_write"]
         assert (saved_first.offset, saved_second.offset) == (0, 8192)
 
         # Prefetch an already written region while the second write is outstanding.
         stage = {0: SimpleNamespace(_tensors={(0, 0, 0): saved_first})}
         offload.prefetch(stage)
-        assert mock_deepspeed_aio[-1][0] == "submit_read"
+        assert operations[-1][0] == "submit_read"
 
         # A demand read of the other key waits for its own write, then leaves the
         # prefetched data available for the first activation without rereading it.
         torch.testing.assert_close(offload.reload(saved_second), second)
-        assert [name for name, _ in mock_deepspeed_aio[-4:]] == ["read", "write", "submit_read", "read"]
-        events = list(mock_deepspeed_aio)
+        assert [name for name, _ in operations[-4:]] == ["read", "write", "submit_read", "read"]
+        events = list(operations)
         torch.testing.assert_close(offload.reload(saved_first), first)
-        assert mock_deepspeed_aio == events
+        assert operations == events
 
         # A queued write still owns its pinned buffer when the step exits.
         offload.offload((2, 3, 4), second)
         offload.prefetch(stage)
     finally:
         offload.close()
-    assert ("reserve", (3 * 4096, 4096)) in mock_deepspeed_aio
-    assert [name for name, _ in mock_deepspeed_aio[-4:]] == ["submit_write", "submit_read", "write", "read"]
-    write_wait_ranges = [
-        name for name in nvtx_ranges if name.startswith("DeepSpeed AIO wait activation write ")
-    ]
-    assert write_wait_ranges == [
-        "DeepSpeed AIO wait activation write micro-batch 0 transformer 0 tensor 0",
-        "DeepSpeed AIO wait activation write micro-batch 1 transformer 0 tensor 0",
-        "DeepSpeed AIO wait activation write micro-batch 2 transformer 3 tensor 4",
-    ]
+    assert [name for name, _ in operations[-4:]] == ["submit_write", "submit_read", "write", "read"]
+    reservations = [region for name, region in operations if name == "reserve"]
+    if backend == "native":
+        assert reservations == [(0, 4 * 4096)]
+    else:
+        assert reservations == [(0, 3 * 4096), (3 * 4096, 4096)]
+        assert [
+            name for name in nvtx_ranges if name.startswith("DeepSpeed AIO wait activation write ")
+        ] == [
+            "DeepSpeed AIO wait activation write micro-batch 0 transformer 0 tensor 0",
+            "DeepSpeed AIO wait activation write micro-batch 1 transformer 0 tensor 0",
+            "DeepSpeed AIO wait activation write micro-batch 2 transformer 3 tensor 4",
+        ]
     assert not list(tmp_path.iterdir())
 
 
-def test_layer_by_layer_deepspeed_reuses_file_and_handles(tmp_path, monkeypatch, mock_deepspeed_aio):
+@pytest.mark.parametrize("backend", ["native", "deepspeed"])
+def test_layer_by_layer_nvme_reuses_file_and_handles(tmp_path, monkeypatch, request, backend):
+    operations = request.getfixturevalue(
+        "mock_nvme_aio" if backend == "native" else "mock_deepspeed_aio"
+    )
     allocate = torch.empty
 
     def allocate_on_cpu(*args, **kwargs):
@@ -426,52 +471,84 @@ def test_layer_by_layer_deepspeed_reuses_file_and_handles(tmp_path, monkeypatch,
     monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
     model = nn.Module()
     handles = None
+    inode = None
+    slots = None
     for value in (11, 29):
         first = torch.tensor(value)
         second = torch.tensor(-value)
         with closing(
             fine_grained_activation_offload.LayerByLayerActivationOffload(
-                nvme_path=str(tmp_path), nvme_backend="deepspeed", model=model
+                nvme_path=str(tmp_path), nvme_backend=backend, model=model
             )
         ) as step:
             current_handles = (ref(step._nvme.swap._reader), ref(step._nvme.swap._writer))
             if handles is None:
                 handles = current_handles
             assert current_handles == handles
-            step.reserve_nvme((first,), num_groups=2)
+            step.reserve_nvme((_CudaTensor(first),), num_groups=2)
             (file,) = tmp_path.glob("*/activations.bin")
+            if inode is None:
+                inode = file.stat().st_ino
+            assert file.stat().st_ino == inode
             assert file.stat().st_size == 8192
             saved_first = step._nvme.offload((0, 0, 0), first)
             saved_second = step._nvme.offload((0, 1, 0), second)
             assert (saved_first.offset, saved_second.offset) == (0, 4096)
             torch.testing.assert_close(step._nvme.reload(saved_second), second)
             torch.testing.assert_close(step._nvme.reload(saved_first), first)
+            current_slots = {name: ref(slot) for name, slot in step._nvme._slots.items()}
+            if slots is None:
+                slots = current_slots
+            assert current_slots == slots
         assert file.stat().st_size == 8192
         assert all(handle() is not None for handle in handles)
 
-    reservations = [region for name, region in mock_deepspeed_aio if name == "reserve"]
+    reservations = [region for name, region in operations if name == "reserve"]
     assert reservations == [(0, 8192)]
     fine_grained_activation_offload.release_layer_by_layer_activation_aio(model)
     assert all(handle() is None for handle in handles)
+    assert all(slot() is None for slot in slots.values())
+    assert not list(tmp_path.iterdir())
+
+
+def test_layer_by_layer_native_drains_read_when_write_fails(tmp_path, monkeypatch, mock_nvme_aio):
+    allocate = torch.empty
+
+    def allocate_on_cpu(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return allocate(*args, **kwargs)
+
+    extension = sys.modules["megatron_nvme_aio"]
+    wait = extension.wait
+
+    def fail_second_write(request):
+        operation, _, _, offset = request
+        if operation == "write" and offset == 4096:
+            raise OSError("failed NVMe write")
+        wait(request)
+
+    monkeypatch.setattr(torch, "empty", allocate_on_cpu)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
+    monkeypatch.setattr(extension, "wait", fail_second_write)
+    model = nn.Module()
+    value = torch.tensor(7)
+    with (
+        pytest.raises(OSError, match="failed NVMe write"),
+        closing(
+            fine_grained_activation_offload.LayerByLayerActivationOffload(
+                nvme_path=str(tmp_path), model=model
+            )
+        ) as step,
+    ):
+        step.reserve_nvme((_CudaTensor(value),), num_groups=2)
+        saved = step._nvme.offload((0, 0, 0), value)
+        step._nvme.offload((0, 1, 0), value)
+        step._nvme.prefetch({0: SimpleNamespace(_tensors={(0, 0, 0): saved})})
+    assert [name for name, _ in mock_nvme_aio[-2:]] == ["submit_read", "read"]
     assert not list(tmp_path.iterdir())
 
 
 def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch, mock_nvme_aio):
-    class CudaTensor:
-        is_cuda = True
-        device = torch.device("cuda")
-
-        def __init__(self, data):
-            self.data = data
-            self.shape = data.shape
-            self.dtype = data.dtype
-
-        def numel(self):
-            return self.data.numel()
-
-        def detach(self):
-            return self
-
     values = [
         torch.arange(2050, dtype=torch.bfloat16).view(2, 1025).t(),
         torch.tensor(17, dtype=torch.int64),
@@ -481,14 +558,12 @@ def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch,
     read_buffers = []
     allocate = torch.empty
     copy = torch.Tensor.copy_
-    transfer = sys.modules["megatron_nvme_aio"].transfer
+    submit = sys.modules["megatron_nvme_aio"].submit
 
-    def track_transfer(worker, buffer, path, write):
+    def track_submit(worker, buffer, path, write, offset):
         if not write:
-            read_buffers.append(
-                (torch.frombuffer(buffer, dtype=torch.uint8).data_ptr(), buffer.nbytes)
-            )
-        transfer(worker, buffer, path, write)
+            read_buffers.append((buffer.ctypes.data, buffer.nbytes))
+        return submit(worker, buffer, path, write, offset)
 
     def allocate_on_cpu(*args, pin_memory=False, **kwargs):
         # Exercise the byte views without requiring a CUDA allocator.
@@ -499,7 +574,7 @@ def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch,
         return tensor
 
     def copy_to_host(host, tensor, *, non_blocking=False):
-        if isinstance(tensor, CudaTensor):
+        if isinstance(tensor, _CudaTensor):
             assert not non_blocking
             observed_slots["d2h"].append(host.data_ptr())
             mock_nvme_aio.append(("d2h", host.shape))
@@ -520,33 +595,41 @@ def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch,
 
     monkeypatch.setattr(torch, "empty", allocate_on_cpu)
     monkeypatch.setattr(torch.Tensor, "copy_", copy_to_host)
-    monkeypatch.setattr(sys.modules["megatron_nvme_aio"], "transfer", track_transfer)
+    monkeypatch.setattr(sys.modules["megatron_nvme_aio"], "submit", track_submit)
     monkeypatch.setattr(torch.cuda, "Event", object)
     monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
     monkeypatch.setattr(fine_grained_activation_offload, "saved_tensors_hooks", capture_hooks)
     monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_device", copy_to_device)
 
     offload = fine_grained_activation_offload.LayerByLayerActivationOffload(nvme_path=str(tmp_path))
+    offload.reserve_nvme(tuple(map(_CudaTensor, values)), num_groups=1)
     tags = []
     for mb, tensor in enumerate(values):
         with offload.checkpoint(0, "transformer.0", microbatch=mb):
             pack, unpack = hooks[-1]
-            tags.append(pack(CudaTensor(tensor)))
-            empty = CudaTensor(torch.empty(0))
+            tags.append(pack(_CudaTensor(tensor)))
+            empty = _CudaTensor(torch.empty(0))
             assert pack(empty) is empty
-    assert [name for name, _ in mock_nvme_aio] == ["d2h", "write"] * 2
+    assert [name for name, _ in mock_nvme_aio] == [
+        "reserve",
+        "d2h",
+        "submit_write",
+        "write",
+        "d2h",
+        "submit_write",
+    ]
     with offload.backward_group(0):
-        assert len(mock_nvme_aio) == 4
         for tag, expected in zip(tags, values, strict=True):
             torch.testing.assert_close(unpack(tag), expected)
-    assert [name for name, _ in mock_nvme_aio] == ["d2h", "write"] * 2 + ["read", "h2d"] * 2
-    written = [path for name, path in mock_nvme_aio if name == "write"]
-    assert written == [path for name, path in mock_nvme_aio if name == "read"]
-    assert written[0] != written[1] and written[0].parent.parent == tmp_path
-    assert written[0].parent.name.startswith("mfsdp-rank0-")
+    written = [region for name, region in mock_nvme_aio if name == "write"]
+    assert written == [region for name, region in mock_nvme_aio if name == "read"]
+    (file,) = tmp_path.glob("mfsdp-rank0-*/activations.bin")
+    assert written == [(file, 0), (file, 8192)]
     assert len(set(observed_slots["d2h"])) == len(set(observed_slots["h2d"])) == 1
     forward, backward = pinned_slots
-    assert forward[0] == observed_slots["d2h"][0]
+    write_ptr = observed_slots["d2h"][0]
+    assert write_ptr % os.sysconf("SC_PAGE_SIZE") == 0
+    assert forward[0] <= write_ptr <= forward[0] + forward[1] - 8192
     read_ptr = observed_slots["h2d"][0]
     assert read_ptr % os.sysconf("SC_PAGE_SIZE") == 0
     assert backward[0] <= read_ptr <= backward[0] + backward[1] - 8192
@@ -668,14 +751,14 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
         expected_boundaries -= 1
     assert len(original_boundaries) == restored_boundaries == expected_boundaries
     if activation_tier.startswith("nvme"):
-        assert Counter(name for name, _ in nvme_operations if name in ("write", "read")) == dict.fromkeys(
-            ("write", "read"), expected_boundaries
-        )
-        if activation_tier == "nvme_deepspeed":
-            (file,) = tmp_path.glob("*/activations.bin")
-            assert file.stat().st_size == expected_boundaries * 4096
-        else:
-            assert not list(tmp_path.iterdir())
+        assert Counter(
+            name for name, _ in nvme_operations if name in ("write", "read")
+        ) == dict.fromkeys(("write", "read"), expected_boundaries)
+        (file,) = tmp_path.glob("*/activations.bin")
+        assert file.stat().st_size == expected_boundaries * 4096
+        assert nvme_operations[0] == ("reserve", (0, expected_boundaries * 4096))
+        fine_grained_activation_offload.release_layer_by_layer_activation_aio(model)
+        assert not list(tmp_path.iterdir())
     assert finalized == [(model, num_tokens, pg_collection), (baseline, num_tokens, pg_collection)]
     assert model.layer_calls == [
         (layer, mb, activation_offload) for layer in layer_indices for mb in microbatches
