@@ -2,7 +2,7 @@
 
 from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Literal, NamedTuple, Optional, Tuple
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
@@ -847,13 +847,59 @@ def _copy_tensor_to_device(
     return gpu_tensor
 
 
+class _NVMeActivation(NamedTuple):
+    key: str
+    device: torch.device
+    shape: torch.Size
+    dtype: torch.dtype
+
+
+class _LayerByLayerNVMeActivations:
+    """Swap saved boundaries through one reusable pinned slot per direction."""
+
+    def __init__(self, path: str):
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.offload import NVMeOffload
+
+        self.swap = NVMeOffload(path)
+        self._slots: dict[str, torch.Tensor] = {}
+
+    def _stage(
+        self, shape: torch.Size, dtype: torch.dtype, *, direction: Literal["forward", "backward"]
+    ) -> torch.Tensor:
+        size = shape.numel() * dtype.itemsize
+        slot = self._slots.get(direction)
+        if slot is None or slot.numel() < size:
+            slot = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
+            self._slots[direction] = slot
+        return slot[:size].view(dtype).view(shape)
+
+    def offload(self, tag: tuple[int, int, int], tensor: torch.Tensor) -> _NVMeActivation:
+        """Wait for D2H before writing the checkpoint boundary to disk."""
+        microbatch, group_id, index = tag
+        key = f"activation-{group_id}-{microbatch}-{index}.bin"
+        host = self._stage(tensor.shape, tensor.dtype, direction="forward")
+        host.copy_(tensor, non_blocking=False)
+        self.swap.write(key, host.view(-1))
+        return _NVMeActivation(key, tensor.device, tensor.shape, tensor.dtype)
+
+    def reload(self, saved: _NVMeActivation) -> torch.Tensor:
+        """Wait for disk read and H2D before returning to backward."""
+        host = self._stage(saved.shape, saved.dtype, direction="backward")
+        self.swap.read(saved.key, host.view(-1))
+        # The blocking copy runs on the requesting autograd stream. Backward
+        # can use the result and the host slot can be reused once it returns.
+        return _copy_tensor_to_device(saved.device, host, non_blocking=False)
+
+
 class LayerByLayerActivationOffload:
     """Manage saved checkpoint boundaries for one eager layer-major schedule."""
 
-    def __init__(self) -> None:
-        manager = PipelineOffloadManager.get_instance()
-        self.d2h_stream = manager.d2h_stream
-        self.h2d_stream = manager.h2d_stream
+    def __init__(self, *, nvme_path: str | None = None) -> None:
+        self._nvme = _LayerByLayerNVMeActivations(nvme_path) if nvme_path is not None else None
+        if self._nvme is None:
+            manager = PipelineOffloadManager.get_instance()
+            self.d2h_stream = manager.d2h_stream
+            self.h2d_stream = manager.h2d_stream
         self._groups: dict[int, dict[int, OffloadTensorGroup]] = {}
         self._active_group: int | None = None
         self._pending: deque[int] = deque()
@@ -883,6 +929,13 @@ class LayerByLayerActivationOffload:
         stage = self._groups.setdefault(group_id, {})
         if microbatch in stage:
             raise RuntimeError(f"Activation checkpoints for group {group_id} overlap.")
+        if self._nvme is not None:
+            with torch.cuda.nvtx.range(f"activation offloading {group._name}"):
+                for tag, tensor in group._tensors.items():
+                    group.push_tensor(tag, self._nvme.offload(tag, tensor))
+            stage[microbatch] = group
+            return
+
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
         with (
             torch.cuda.nvtx.range(f"activation offloading {group._name}"),
@@ -902,9 +955,9 @@ class LayerByLayerActivationOffload:
             raise RuntimeError("Activation backward groups cannot overlap.")
         stage = self._groups.get(group_id, {})
         self._active_group = group_id
-        self._pending = deque(sorted(stage, reverse=True))
         try:
-            if self._pending:
+            if self._nvme is None and stage:
+                self._pending = deque(sorted(stage, reverse=True))
                 # The preceding layer's backward must complete before this
                 # layer starts staging inputs, even on a separate CUDA stream.
                 self.h2d_stream.wait_stream(torch.cuda.current_stream())
@@ -940,15 +993,25 @@ class LayerByLayerActivationOffload:
             raise RuntimeError(
                 f"Attempted to reload activation group {group_id} outside its backward."
             )
+        group = self._groups[group_id][mb]
+        if self._nvme is not None:
+            with torch.cuda.nvtx.range(f"activation reloading {group._name}"):
+                return self._nvme.reload(group.pop_tensor(saved))
+
         # Stage the preceding microbatch while this one runs. An out-of-order
         # request also stages the intervening microbatches in descending order.
         self._reload_through(mb - 1)
-        group = self._groups[group_id][mb]
         compute_stream = torch.cuda.current_stream()
         group.wait_reload_event(compute_stream)
         tensor = group.pop_tensor(saved)
         tensor.record_stream(compute_stream)
         return tensor
+
+    def close(self) -> None:
+        """Release the rank-local activation scratch and staging after the schedule."""
+        if self._nvme is not None:
+            self._nvme.swap.directory.cleanup()
+            self._nvme = None
 
 
 class ChunkOffloadHandler:

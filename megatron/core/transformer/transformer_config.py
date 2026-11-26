@@ -521,6 +521,9 @@ class TransformerConfig(ModelParallelConfig):
     layer_by_layer_activation_offload: bool = False
     """Save layer-by-layer checkpoint boundary activations in pinned CPU memory."""
 
+    layer_by_layer_activation_nvme_path: str | None = None
+    """Save layer-by-layer checkpoint boundary activations in NVMe scratch via pinned CPU memory."""
+
     recompute_granularity: Optional[Literal['full', 'selective']] = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where the submodules set in --recompute-modules is checkpointed.

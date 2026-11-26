@@ -953,10 +953,14 @@ def layer_by_layer_forward_backward_no_pipelining(
     if pg_collection.pp.size() != 1 or pg_collection.cp.size() != 1:
         raise ValueError("Layer-by-layer scheduling requires PP=CP=1.")
     config = get_model_config(model)
-    offload_activations = not forward_only and getattr(
-        config, "layer_by_layer_activation_offload", False
+    activation_nvme_path = getattr(config, "layer_by_layer_activation_nvme_path", None)
+    offload_activations = not forward_only and (
+        getattr(config, "layer_by_layer_activation_offload", False)
+        or activation_nvme_path is not None
     )
-    activation_offload = LayerByLayerActivationOffload() if offload_activations else None
+    activation_offload = (
+        LayerByLayerActivationOffload(nvme_path=activation_nvme_path) if offload_activations else None
+    )
 
     def activation_checkpoint(group_id: int, name: str, *, microbatch: int):
         if activation_offload is not None:
@@ -1058,7 +1062,7 @@ def layer_by_layer_forward_backward_no_pipelining(
             return inputs, lambda: tuple(value.grad for value in inputs)
 
         # AccumulateGrad holds its leaf tensor and therefore its GPU storage.
-        # Use a storage-free gradient edge for checkpoint inputs offloaded to CPU.
+        # Use a storage-free gradient edge for checkpoints offloaded to CPU or NVMe.
         grad_slots: list[torch.Tensor | None] = [None] * len(outputs)
         inputs = tuple(
             _LayerByLayerBoundary.apply(anchor, value.detach(), grad_slots, mb)
@@ -1149,9 +1153,13 @@ def layer_by_layer_forward_backward_no_pipelining(
                 with autocast(), set_checkpoint_early_stop(False):
                     for mb, plan in enumerate(plans):
                         value = pending_inputs.popleft()
-                        # The first decoder microbatch in backward can replay
-                        # directly from its resident input.
-                        keep_input = layer_index == num_layers - 1 and mb == num_microbatches - 1
+                        # CPU offload overlaps reloads with the first decoder
+                        # microbatch's replay from its resident input.
+                        keep_input = (
+                            activation_nvme_path is None
+                            and layer_index == num_layers - 1
+                            and mb == num_microbatches - 1
+                        )
                         offload_scope = (
                             contextlib.nullcontext()
                             if keep_input
@@ -1242,10 +1250,12 @@ def layer_by_layer_forward_backward_no_pipelining(
                 if stage_index
                 else contextlib.nullcontext()
             )
-            # Queue the layer's first activation reload before waiting for its weights.
+            # The CPU activation path queues its first reload before waiting for weights.
             with activation_scope, weight_scope, backward_stage(stage):
                 torch.autograd.backward(outputs, grad_outputs)
             del outputs, grad_outputs
+        if activation_offload is not None:
+            activation_offload.close()
         if fsdp is not None:
             fsdp.post_backward()
         if config.timers is not None:

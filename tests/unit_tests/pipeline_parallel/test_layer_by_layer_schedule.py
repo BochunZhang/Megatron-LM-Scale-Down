@@ -1,8 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+import sys
 from collections import Counter
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -181,9 +183,115 @@ def test_layer_by_layer_checkpoint_reloads_only_the_current_group(monkeypatch):
         assert unpack(decoder_tags[0]).value == 0
 
 
-@pytest.mark.parametrize("activation_offload", [False, True], ids=["gpu-activations", "cpu-activations"])
+@pytest.fixture
+def mock_nvme_aio(monkeypatch):
+    operations = []
+
+    def transfer(_worker, buffer, path, write):
+        path = Path(path)
+        operations.append(("write" if write else "read", path))
+        if write:
+            path.write_bytes(buffer)
+        else:
+            buffer[:] = path.read_bytes()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron_nvme_aio",
+        SimpleNamespace(create_worker=object, transfer=transfer),
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    return operations
+
+
+def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch, mock_nvme_aio):
+    class CudaTensor:
+        is_cuda = True
+        device = torch.device("cuda")
+
+        def __init__(self, data):
+            self.data = data
+            self.shape = data.shape
+            self.dtype = data.dtype
+
+        def numel(self):
+            return self.data.numel()
+
+        def detach(self):
+            return self
+
+    values = [
+        torch.arange(8, dtype=torch.bfloat16).view(2, 4).t(),
+        torch.tensor(17, dtype=torch.int64),
+    ]
+    observed_slots = {"d2h": [], "h2d": []}
+    pinned_slots = []
+    allocate = torch.empty
+    copy = torch.Tensor.copy_
+
+    def allocate_on_cpu(*args, pin_memory=False, **kwargs):
+        # Exercise the byte views without requiring a CUDA allocator.
+        tensor = allocate(*args, **kwargs)
+        if pin_memory:
+            assert tensor.device.type == "cpu" and tensor.dtype == torch.uint8
+            pinned_slots.append(tensor.data_ptr())
+        return tensor
+
+    def copy_to_host(host, tensor, *, non_blocking=False):
+        if isinstance(tensor, CudaTensor):
+            assert not non_blocking
+            observed_slots["d2h"].append(host.data_ptr())
+            mock_nvme_aio.append(("d2h", host.shape))
+            tensor = tensor.data
+        return copy(host, tensor, non_blocking=non_blocking)
+
+    def copy_to_device(device, host, *, non_blocking):
+        assert device.type == "cuda" and not non_blocking
+        observed_slots["h2d"].append(host.data_ptr())
+        mock_nvme_aio.append(("h2d", host.shape))
+        return host.clone()
+
+    hooks = []
+
+    def capture_hooks(pack, unpack):
+        hooks.append((pack, unpack))
+        return nullcontext()
+
+    monkeypatch.setattr(torch, "empty", allocate_on_cpu)
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_to_host)
+    monkeypatch.setattr(torch.cuda, "Event", object)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
+    monkeypatch.setattr(fine_grained_activation_offload, "saved_tensors_hooks", capture_hooks)
+    monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_device", copy_to_device)
+
+    offload = fine_grained_activation_offload.LayerByLayerActivationOffload(nvme_path=str(tmp_path))
+    tags = []
+    for mb, tensor in enumerate(values):
+        with offload.checkpoint(0, "transformer.0", microbatch=mb):
+            pack, unpack = hooks[-1]
+            tags.append(pack(CudaTensor(tensor)))
+            empty = CudaTensor(torch.empty(0))
+            assert pack(empty) is empty
+    assert [name for name, _ in mock_nvme_aio] == ["d2h", "write"] * 2
+    with offload.backward_group(0):
+        assert len(mock_nvme_aio) == 4
+        for tag, expected in zip(tags, values, strict=True):
+            torch.testing.assert_close(unpack(tag), expected)
+    assert [name for name, _ in mock_nvme_aio] == ["d2h", "write"] * 2 + ["read", "h2d"] * 2
+    written = [path for name, path in mock_nvme_aio if name == "write"]
+    assert written == [path for name, path in mock_nvme_aio if name == "read"]
+    assert written[0] != written[1] and written[0].parent.parent == tmp_path
+    assert written[0].parent.name.startswith("mfsdp-rank0-")
+    assert len(set(observed_slots["d2h"])) == len(set(observed_slots["h2d"])) == 1
+    assert observed_slots["d2h"][0] != observed_slots["h2d"][0]
+    assert pinned_slots == [observed_slots["d2h"][0], observed_slots["h2d"][0]]
+    offload.close()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("activation_tier", ["gpu", "cpu", "nvme"])
 def test_layer_by_layer_schedule_matches_no_pipeline_update(
-    cuda_device, monkeypatch, activation_offload
+    cuda_device, monkeypatch, tmp_path, request, activation_tier
 ):
     layer_major = get_forward_backward_func(pp_size=1, layer_by_layer=True)
     microbatch_major = get_forward_backward_func(pp_size=1)
@@ -191,7 +299,11 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
     assert microbatch_major is forward_backward_no_pipelining
 
     model = _Model().to(cuda_device)
-    model.config.layer_by_layer_activation_offload = activation_offload
+    activation_offload = activation_tier != "gpu"
+    model.config.layer_by_layer_activation_offload = activation_tier == "cpu"
+    if activation_tier == "nvme":
+        mock_nvme_aio = request.getfixturevalue("mock_nvme_aio")
+        model.config.layer_by_layer_activation_nvme_path = str(tmp_path)
     baseline = _Model().to(cuda_device)
     baseline.load_state_dict(model.state_dict())
     batches = [torch.tensor(ids, device=cuda_device) for ids in ((1, 2), (3, 4, 5), (6,))]
@@ -211,6 +323,7 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
 
     copy_to_cpu = fine_grained_activation_offload._copy_tensor_to_cpu
     copy_to_device = fine_grained_activation_offload._copy_tensor_to_device
+    nvme_offload = fine_grained_activation_offload._LayerByLayerNVMeActivations.offload
 
     def track_copy_to_cpu(tensor, *, pin_memory, cpu_tensor_pool=None):
         packed = copy_to_cpu(tensor, pin_memory=pin_memory, cpu_tensor_pool=cpu_tensor_pool)
@@ -227,8 +340,15 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
         restored_boundaries += 1
         return copy_to_device(device, packed, non_blocking=non_blocking)
 
+    def track_copy_to_nvme(offload, tag, tensor):
+        original_boundaries.append(StorageWeakRef(tensor.untyped_storage()))
+        return nvme_offload(offload, tag, tensor)
+
     monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_cpu", track_copy_to_cpu)
     monkeypatch.setattr(fine_grained_activation_offload, "_copy_tensor_to_device", track_copy_to_device)
+    monkeypatch.setattr(
+        fine_grained_activation_offload._LayerByLayerNVMeActivations, "offload", track_copy_to_nvme
+    )
 
     @contextmanager
     def capture_nvtx_range(name):
@@ -273,8 +393,15 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
 
     losses = run(layer_major, model)
     expected_losses = run(microbatch_major, baseline)
-    expected_boundaries = (len(model.layers) + 1) * len(batches) - 1 if activation_offload else 0
+    expected_boundaries = (len(model.layers) + 1) * len(batches) if activation_offload else 0
+    if activation_tier == "cpu":
+        expected_boundaries -= 1
     assert len(original_boundaries) == restored_boundaries == expected_boundaries
+    if activation_tier == "nvme":
+        assert Counter(name for name, _ in mock_nvme_aio) == dict.fromkeys(
+            ("write", "read"), expected_boundaries
+        )
+        assert not list(tmp_path.iterdir())
     assert finalized == [(model, num_tokens, pg_collection), (baseline, num_tokens, pg_collection)]
     assert model.layer_calls == [
         (layer, mb, activation_offload) for layer in layer_indices for mb in microbatches
@@ -328,7 +455,10 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
     expected_transfers = []
     if activation_offload:
         offloaded = [("transformer.0", mb) for mb in microbatches]
-        offloaded.extend(("transformer.1", mb) for mb in microbatches[:-1])
+        offloaded.extend(
+            ("transformer.1", mb)
+            for mb in (microbatches[:-1] if activation_tier == "cpu" else microbatches)
+        )
         offloaded.extend(("output", mb) for mb in microbatches)
         for direction, boundaries in (
             ("offloading", offloaded), ("reloading", reversed(offloaded))
