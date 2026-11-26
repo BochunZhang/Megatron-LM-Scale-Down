@@ -135,13 +135,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
             or config.context_parallel_size != 1
             or config.gtp_weight_remat_size != 1
             or config.expert_gtp_weight_remat_size != 1
-            or self.num_moe_experts is not None
+            or (self.num_moe_experts and config.tensor_model_parallel_size != 1)
             or getattr(config, "flextron", False)
             or ddp_config.check_for_nan_in_grad
             or ddp_config.check_for_large_grads
         ):
             raise ValueError(
-                "Overlapped layer-by-layer GraceAdam requires dense PP=CP=1 training "
+                "Overlapped layer-by-layer GraceAdam requires PP=CP=1 training (also TP=1 for MoE) "
                 "without gradient checks or post-backward gradient scaling or reductions."
             )
         log_single_rank(

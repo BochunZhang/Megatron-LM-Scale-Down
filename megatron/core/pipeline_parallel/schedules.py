@@ -31,7 +31,7 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
-from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler, router_checkpoint_contexts
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -930,7 +930,7 @@ def layer_by_layer_forward_backward_no_pipelining(
     pg_collection: ProcessGroupCollection | None = None,
     force_all_reduce: bool | None = False,
 ) -> list:
-    """Run a dense PP=CP=1 step with all microbatches grouped by model layer.
+    """Run a PP=CP=1 step with all microbatches grouped by model layer.
 
     The forward step supplies one plan and the ordinary loss callback per
     microbatch. Each plan executes preprocessing, decoder layers, and
@@ -953,6 +953,8 @@ def layer_by_layer_forward_backward_no_pipelining(
     if pg_collection.pp.size() != 1 or pg_collection.cp.size() != 1:
         raise ValueError("Layer-by-layer scheduling requires PP=CP=1.")
     config = get_model_config(model)
+    if getattr(config, "moe_enable_routing_replay", False) or getattr(config, "moe_paged_stash", False):
+        raise ValueError("Layer-by-layer scheduling does not support MoE routing replay or paged stash.")
     activation_nvme_path = getattr(config, "layer_by_layer_activation_nvme_path", None)
     offload_activations = not forward_only and (
         getattr(config, "layer_by_layer_activation_offload", False)
@@ -1112,18 +1114,28 @@ def layer_by_layer_forward_backward_no_pipelining(
         # tracker for model-parallel random operations inside the layer.
         tracker = tensor_parallel.get_cuda_rng_tracker()
         forward_states = tracker.get_states()
+        router_forward, router_recompute = (
+            router_checkpoint_contexts()
+            if getattr(config, "num_moe_experts", None)
+            else (contextlib.nullcontext(), contextlib.nullcontext())
+        )
+
+        @contextlib.contextmanager
+        def forward():
+            with router_forward, nvtx_range(f"fwd.microbatch.{microbatch}.{stage}"):
+                yield
 
         @contextlib.contextmanager
         def recompute():
             current_states = tracker.get_states()
             tracker.set_states(forward_states.copy())
             try:
-                with nvtx_range(f"recompute.microbatch.{microbatch}.{stage}"):
+                with router_recompute, nvtx_range(f"recompute.microbatch.{microbatch}.{stage}"):
                     yield
             finally:
                 tracker.set_states(current_states)
 
-        return nvtx_range(f"fwd.microbatch.{microbatch}.{stage}"), recompute()
+        return forward(), recompute()
 
     # Drain activation I/O before cleanup on normal and exceptional exits.
     offload_lifetime = (

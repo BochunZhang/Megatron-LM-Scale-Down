@@ -1,7 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from collections import deque
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
+from typing import NamedTuple, Optional, Union
 
 import torch
 
@@ -27,6 +30,40 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
+
+_GlobalAuxLossStats = tuple[torch.Tensor, int | torch.Tensor, int | torch.Tensor]
+
+
+class _RouterCheckpoint(NamedTuple):
+    recomputing: bool
+    global_aux_stats: deque[_GlobalAuxLossStats]
+
+
+_router_checkpoint: ContextVar[_RouterCheckpoint | None] = ContextVar(
+    "moe_router_checkpoint", default=None
+)
+
+
+def router_checkpoint_contexts() -> tuple[
+    AbstractContextManager[None], AbstractContextManager[None]
+]:
+    """Preserve router statistics across one non-reentrant activation checkpoint."""
+    global_aux_stats: deque[_GlobalAuxLossStats] = deque()
+
+    @contextmanager
+    def checkpoint_context(recomputing: bool):
+        token = _router_checkpoint.set(_RouterCheckpoint(recomputing, global_aux_stats))
+        try:
+            yield
+        finally:
+            _router_checkpoint.reset(token)
+
+    return checkpoint_context(False), checkpoint_context(True)
+
+
+def _is_router_recomputing() -> bool:
+    state = _router_checkpoint.get()
+    return state is not None and state.recomputing
 
 
 class Router(ABC, MegatronModule):
@@ -336,7 +373,7 @@ class TopKRouter(Router):
         gather_group = self.tp_cp_group
         gather_size = gather_group.size() if gather_group is not None else 1
 
-        should_update_beta = self.training and torch.is_grad_enabled()
+        should_update_beta = self.training and torch.is_grad_enabled() and not _is_router_recomputing()
 
         with torch.no_grad():
             logits_fp32 = logits.detach().to(dtype=torch.float32)
@@ -514,23 +551,33 @@ class TopKRouter(Router):
         if global_aux_loss_coeff == 0:
             return probs
 
-        # Use unified function to compute tokens_per_expert and num_tokens
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=self.tp_dp_cp_group,
-                with_padding_mask=with_padding_mask,
-                topk=self.topk,
+        checkpoint = _router_checkpoint.get()
+        if checkpoint is not None and checkpoint.recomputing:
+            # Backward visits microbatches in a different order. Use the running
+            # average that this microbatch saw during its original forward.
+            averaged_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                checkpoint.global_aux_stats.popleft()
             )
-        )
-
-        self.global_tokens_per_expert += global_tokens_per_expert
-        self.ga_steps += 1
-        averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
+        else:
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=self.tp_dp_cp_group,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk,
+                )
+            )
+            self.global_tokens_per_expert += global_tokens_per_expert
+            self.ga_steps += 1
+            averaged_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
+            if checkpoint is not None:
+                checkpoint.global_aux_stats.append(
+                    (averaged_tokens_per_expert, local_num_tokens, total_num_tokens)
+                )
 
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
-            tokens_per_expert=averated_tokens_per_expert,
+            tokens_per_expert=averaged_tokens_per_expert,
             total_num_tokens=total_num_tokens,
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
@@ -594,14 +641,15 @@ class TopKRouter(Router):
         else:
             layer_number = self.layer_number
 
-        get_moe_metrics_tracker().record(
-            aux_loss_name,
-            aux_loss / aux_loss_coeff,
-            layer_number,
-            num_layers,
-            reduce_group=reduce_group,
-            needs_dp_avg=needs_dp_avg,
-        )
+        if not _is_router_recomputing():
+            get_moe_metrics_tracker().record(
+                aux_loss_name,
+                aux_loss / aux_loss_coeff,
+                layer_number,
+                num_layers,
+                reduce_group=reduce_group,
+                needs_dp_avg=needs_dp_avg,
+            )
         if self.calculate_per_token_loss:
             # Target final scaling on aux_loss gradients: 1 / (num_micro_batches * dp_size),
             # matching the !calculate_per_token_loss path.
@@ -695,13 +743,14 @@ class TopKRouter(Router):
             else:
                 layer_number = self.layer_number
 
-            get_moe_metrics_tracker().record(
-                "z_loss",
-                z_loss / moe_z_loss_coeff,
-                layer_number,
-                num_layers,
-                avg_group=self.tp_dp_cp_group,
-            )
+            if not _is_router_recomputing():
+                get_moe_metrics_tracker().record(
+                    "z_loss",
+                    z_loss / moe_z_loss_coeff,
+                    layer_number,
+                    num_layers,
+                    avg_group=self.tp_dp_cp_group,
+                )
         return logits
 
     def apply_input_jitter(self, input: torch.Tensor):
@@ -827,8 +876,8 @@ class TopKRouter(Router):
                 with_padding_mask=padding_mask is not None,
             )
 
-        # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        if self.enable_expert_bias and not _is_router_recomputing():
+            self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
         return probs, routing_map
 

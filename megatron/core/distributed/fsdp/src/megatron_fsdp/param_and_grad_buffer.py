@@ -2942,7 +2942,7 @@ class ParamAndGradBuffer:
 
             # CPU offloading only applies to FSDP unit modules. Model weights are only
             # offloaded when the main weight buffer holds the optimizer copy of the weights.
-            # In the dense layer-by-layer schedule, decoder layer 0 is the first FSDP unit.
+            # In the layer-by-layer schedule, decoder layer 0 is the first FSDP unit.
             gpu_update = layer_by_layer_cpu_optimizer and group.fsdp_unit_id == 0
             offload_model_weight = (
                 self.ddp_config.fsdp_cpu_offload_weight

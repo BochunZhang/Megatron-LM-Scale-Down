@@ -4,6 +4,7 @@ import os
 import sys
 from collections import Counter
 from contextlib import closing, contextmanager, nullcontext
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,16 +17,20 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import fine_grained_activation_offload
 from megatron.core.pipeline_parallel.schedules import (
     forward_backward_no_pipelining,
+    forward_step_calc_loss,
     get_forward_backward_func,
     layer_by_layer_forward_backward_no_pipelining,
 )
+from megatron.core.tensor_parallel import mappings
+from megatron.core.transformer.moe import router as router_module
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class _Model(nn.Module):
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
-        self.config = TransformerConfig(
+        self.config = config or TransformerConfig(
             num_layers=2,
             hidden_size=4,
             num_attention_heads=1,
@@ -77,6 +82,94 @@ def _forward_step(data_iterator, model, *, return_schedule_plan=False):
     for layer in range(plan.num_layers()):
         hidden_states = plan.forward_layer(layer, hidden_states)
     return plan.postprocess(hidden_states), loss_func
+
+
+@pytest.mark.parametrize("balancing", ["global_aux_loss", "quantile_balancing"])
+def test_layer_by_layer_moe_recompute_preserves_router_state(
+    balancing, monkeypatch, tmp_path, mock_nvme_aio
+):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(mappings, "get_tensor_model_parallel_group_if_none", lambda group: group)
+    group = SimpleNamespace(size=lambda: 1)
+    pg_collection = SimpleNamespace(tp=group, pp=group, cp=group, tp_cp=group, tp_dp_cp=group)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=4,
+        num_attention_heads=1,
+        num_moe_experts=4,
+        moe_ffn_hidden_size=8,
+        moe_router_topk=2,
+        moe_router_score_function="sigmoid",
+        moe_router_load_balancing_type=balancing,
+        moe_router_enable_expert_bias=balancing == "global_aux_loss",
+        moe_aux_loss_coeff=0.2 if balancing == "global_aux_loss" else 0.0,
+        moe_z_loss_coeff=0.1,
+        calculate_per_token_loss=False,
+        cuda_graph_scope=None,
+        layer_by_layer_activation_nvme_path=str(tmp_path),
+    )
+
+    class ExpertLayer(nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router = router_module.TopKRouter(config, pg_collection)
+            self.router.set_layer_number(layer_number)
+            self.experts = nn.ModuleList(nn.Linear(4, 4) for _ in range(4))
+
+        def forward(self, hidden_states):
+            probs, _ = self.router(hidden_states.unsqueeze(1))
+            expert_outputs = torch.stack([expert(hidden_states) for expert in self.experts], dim=1)
+            return (probs.unsqueeze(-1) * expert_outputs).sum(dim=1)
+
+    torch.manual_seed(1234)
+    model = _Model(config)
+    model.layers = nn.ModuleList(ExpertLayer(i + 1) for i in range(config.num_layers))
+    baseline = deepcopy(model)
+    batches = [torch.tensor(ids) for ids in ((1, 2), (3, 4, 5, 6), (5, 7))]
+    tracker = MoEMetricsTracker()
+    monkeypatch.setattr(router_module, "get_moe_metrics_tracker", lambda: tracker)
+    monkeypatch.setattr(router_module.MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+
+    baseline_losses = []
+    data = iter(enumerate(batches))
+    for _ in batches:
+        output, loss_func = _forward_step(data, baseline)
+        loss, _ = forward_step_calc_loss(
+            baseline,
+            output,
+            loss_func,
+            baseline.config,
+            None,
+            False,
+            len(batches),
+            baseline_losses,
+            cp_group_size=1,
+            is_last_stage=True,
+        )
+        loss.backward()
+    expected_metrics = {name: metric.values.clone() for name, metric in tracker.metrics.items()}
+    tracker = MoEMetricsTracker()
+    losses = layer_by_layer_forward_backward_no_pipelining(
+        forward_step_func=_forward_step,
+        data_iterator=iter(enumerate(batches)),
+        model=model,
+        num_microbatches=len(batches),
+        seq_length=4,
+        micro_batch_size=1,
+        pg_collection=pg_collection,
+    )
+
+    torch.testing.assert_close(losses, baseline_losses)
+    torch.testing.assert_close(
+        {name: metric.values for name, metric in tracker.metrics.items()}, expected_metrics
+    )
+    torch.testing.assert_close(dict(model.named_buffers()), dict(baseline.named_buffers()))
+    for actual, expected in zip(model.parameters(), baseline.parameters(), strict=True):
+        torch.testing.assert_close(actual.grad, expected.grad, atol=1e-7, rtol=1e-5)
+    for module in (model, baseline):
+        torch.optim.SGD(module.parameters(), lr=0.1).step()
+    torch.testing.assert_close(model.state_dict(), baseline.state_dict())
 
 
 @pytest.fixture
