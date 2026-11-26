@@ -962,6 +962,7 @@ def layer_by_layer_forward_backward_no_pipelining(
         LayerByLayerActivationOffload(
             nvme_path=activation_nvme_path,
             nvme_backend=getattr(config, "layer_by_layer_activation_nvme_backend", "native"),
+            model=model,
         )
         if offload_activations
         else None
@@ -1138,6 +1139,9 @@ def layer_by_layer_forward_backward_no_pipelining(
         input_gradients: Callable[[], tuple[torch.Tensor | None, ...]] = tuple
         unit = None
         num_layers = plans[0].num_layers()
+        if activation_offload is not None:
+            # Each decoder layer and the output group save their input boundary.
+            activation_offload.reserve_nvme(hidden_states, num_groups=num_layers + 1)
         for layer_index in range(num_layers):
             if not forward_only:
                 stages.append((layer_index, unit, input_gradients, backward_roots(hidden_states)))

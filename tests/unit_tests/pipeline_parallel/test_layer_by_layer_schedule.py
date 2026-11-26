@@ -3,7 +3,7 @@
 import os
 import sys
 from collections import Counter
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -208,11 +208,16 @@ def mock_nvme_aio(monkeypatch):
 def mock_deepspeed_aio(monkeypatch):
     operations = []
 
+    def allocate_file(fd, offset, size):
+        assert os.fstat(fd).st_size == offset
+        os.ftruncate(fd, offset + size)
+        operations.append(("reserve", (offset, size)))
+
     class AioHandle:
         def __init__(self, **kwargs):
             assert kwargs == {
                 "block_size": 128 * 1024,
-                "queue_depth": 8,
+                "queue_depth": 64,
                 "single_submit": False,
                 "overlap_events": True,
                 "intra_op_parallelism": 1,
@@ -220,28 +225,31 @@ def mock_deepspeed_aio(monkeypatch):
             self.pending = None
 
         def _submit(self, operation, buffer, filename, offset):
-            assert self.pending is None and offset == 0
+            assert self.pending is None and offset % 4096 == 0
             assert buffer.data_ptr() % os.sysconf("SC_PAGE_SIZE") == 0
             assert buffer.numel() % 4096 == 0
             path = Path(filename)
-            operations.append((f"submit_{operation}", path))
-            self.pending = (operation, buffer, path)
+            assert offset + buffer.numel() <= path.stat().st_size
+            operations.append((f"submit_{operation}", (path, offset)))
+            self.pending = (operation, buffer, path, offset)
             return 0
 
         def async_pwrite(self, buffer, filename, offset):
             return self._submit("write", buffer, filename, offset)
 
         def async_pread(self, buffer, filename, offset):
-            assert Path(filename).is_file()
             return self._submit("read", buffer, filename, offset)
 
         def wait(self):
-            operation, buffer, path = self.pending
-            if operation == "write":
-                path.write_bytes(memoryview(buffer.numpy()))
-            else:
-                buffer.copy_(torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8))
-            operations.append((operation, path))
+            operation, buffer, path, offset = self.pending
+            with path.open("r+b" if operation == "write" else "rb") as file:
+                file.seek(offset)
+                if operation == "write":
+                    file.write(memoryview(buffer.numpy()))
+                else:
+                    data = bytearray(file.read(buffer.numel()))
+                    buffer.copy_(torch.frombuffer(data, dtype=torch.uint8))
+            operations.append((operation, (path, offset)))
             self.pending = None
             return 1
 
@@ -251,30 +259,38 @@ def mock_deepspeed_aio(monkeypatch):
         sys.modules, "deepspeed.ops.op_builder", SimpleNamespace(AsyncIOBuilder=lambda: builder)
     )
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(os, "posix_fallocate", allocate_file, raising=False)
     return operations
 
 
 def test_layer_by_layer_deepspeed_defers_write_wait(tmp_path, monkeypatch, mock_deepspeed_aio):
     allocate = torch.empty
+    nvtx_ranges = []
 
     def allocate_on_cpu(*args, **kwargs):
         kwargs.pop("pin_memory", None)
         return allocate(*args, **kwargs)
 
+    def record_nvtx_range(label):
+        nvtx_ranges.append(label)
+        return nullcontext()
+
     monkeypatch.setattr(torch, "empty", allocate_on_cpu)
-    monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", record_nvtx_range)
     offload = fine_grained_activation_offload._LayerByLayerNVMeActivations(
         str(tmp_path), backend="deepspeed"
     )
     first = torch.arange(2050, dtype=torch.bfloat16).view(2, 1025).t()
     second = torch.tensor(17, dtype=torch.int64)
     try:
+        offload.swap.reserve(3 * 4096)
         saved_first = offload.offload((0, 0, 0), first)
-        assert [name for name, _ in mock_deepspeed_aio] == ["submit_write"]
+        assert [name for name, _ in mock_deepspeed_aio] == ["reserve", "submit_write"]
         saved_second = offload.offload((1, 0, 0), second)
-        assert [name for name, _ in mock_deepspeed_aio] == ["submit_write", "write", "submit_write"]
+        assert [name for name, _ in mock_deepspeed_aio[1:]] == ["submit_write", "write", "submit_write"]
+        assert (saved_first.offset, saved_second.offset) == (0, 8192)
 
-        # Prefetch an already written file while the second write is outstanding.
+        # Prefetch an already written region while the second write is outstanding.
         stage = {0: SimpleNamespace(_tensors={(0, 0, 0): saved_first})}
         offload.prefetch(stage)
         assert mock_deepspeed_aio[-1][0] == "submit_read"
@@ -288,11 +304,54 @@ def test_layer_by_layer_deepspeed_defers_write_wait(tmp_path, monkeypatch, mock_
         assert mock_deepspeed_aio == events
 
         # A queued write still owns its pinned buffer when the step exits.
-        offload.offload((2, 0, 0), second)
+        offload.offload((2, 3, 4), second)
         offload.prefetch(stage)
     finally:
         offload.close()
+    assert ("reserve", (3 * 4096, 4096)) in mock_deepspeed_aio
     assert [name for name, _ in mock_deepspeed_aio[-4:]] == ["submit_write", "submit_read", "write", "read"]
+    write_wait_ranges = [
+        name for name in nvtx_ranges if name.startswith("DeepSpeed AIO wait activation write ")
+    ]
+    assert write_wait_ranges == [
+        "DeepSpeed AIO wait activation write micro-batch 0 transformer 0 tensor 0",
+        "DeepSpeed AIO wait activation write micro-batch 1 transformer 0 tensor 0",
+        "DeepSpeed AIO wait activation write micro-batch 2 transformer 3 tensor 4",
+    ]
+    assert not list(tmp_path.iterdir())
+
+
+def test_layer_by_layer_deepspeed_reuses_preallocated_file(tmp_path, monkeypatch, mock_deepspeed_aio):
+    allocate = torch.empty
+
+    def allocate_on_cpu(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return allocate(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate_on_cpu)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
+    model = nn.Module()
+    for value in (11, 29):
+        first = torch.tensor(value)
+        second = torch.tensor(-value)
+        with closing(
+            fine_grained_activation_offload.LayerByLayerActivationOffload(
+                nvme_path=str(tmp_path), nvme_backend="deepspeed", model=model
+            )
+        ) as step:
+            step.reserve_nvme((first,), num_groups=2)
+            (file,) = tmp_path.glob("*/activations.bin")
+            assert file.stat().st_size == 8192
+            saved_first = step._nvme.offload((0, 0, 0), first)
+            saved_second = step._nvme.offload((0, 1, 0), second)
+            assert (saved_first.offset, saved_second.offset) == (0, 4096)
+            torch.testing.assert_close(step._nvme.reload(saved_second), second)
+            torch.testing.assert_close(step._nvme.reload(saved_first), first)
+        assert file.stat().st_size == 8192
+
+    reservations = [region for name, region in mock_deepspeed_aio if name == "reserve"]
+    assert reservations == [(0, 8192)]
+    del model
     assert not list(tmp_path.iterdir())
 
 
@@ -511,7 +570,11 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
         assert Counter(name for name, _ in nvme_operations if name in ("write", "read")) == dict.fromkeys(
             ("write", "read"), expected_boundaries
         )
-        assert not list(tmp_path.iterdir())
+        if activation_tier == "nvme_deepspeed":
+            (file,) = tmp_path.glob("*/activations.bin")
+            assert file.stat().st_size == expected_boundaries * 4096
+        else:
+            assert not list(tmp_path.iterdir())
     assert finalized == [(model, num_tokens, pg_collection), (baseline, num_tokens, pg_collection)]
     assert model.layer_calls == [
         (layer, mb, activation_offload) for layer in layer_indices for mb in microbatches
@@ -556,7 +619,8 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
     stage_events = [
         event
         for event in nvtx_events
-        if event[0] in ("enter", "exit") and not event[1].startswith("activation ")
+        if event[0] in ("enter", "exit")
+        and not event[1].startswith(("activation ", "DeepSpeed AIO wait activation write "))
     ]
     assert stage_events == expected_nvtx_events
     assert Counter(event for event in nvtx_events if event[0] in ("start", "end")) == Counter(
@@ -604,7 +668,11 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
             first_replay = ("enter", f"recompute.microbatch.{len(batches) - 1}.{stage}")
             last_reload = ("enter", f"activation reloading {stage} microbatch=0")
             assert nvtx_events.index(first_replay) < nvtx_events.index(last_reload)
-    assert [event for event in nvtx_events if event[1].startswith("activation ")] == expected_transfers
+    assert [
+        event
+        for event in nvtx_events
+        if event[1].startswith(("activation offloading ", "activation reloading "))
+    ] == expected_transfers
     torch.testing.assert_close(losses, expected_losses)
     for param, ref_param in zip(model.parameters(), baseline.parameters(), strict=True):
         torch.testing.assert_close(param.grad, ref_param.grad)
