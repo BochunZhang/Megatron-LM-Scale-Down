@@ -960,15 +960,6 @@ def layer_by_layer_forward_backward_no_pipelining(
         getattr(config, "layer_by_layer_activation_offload", False)
         or activation_nvme_path is not None
     )
-    activation_offload = (
-        LayerByLayerActivationOffload(
-            nvme_path=activation_nvme_path,
-            nvme_backend=getattr(config, "layer_by_layer_activation_nvme_backend", "native"),
-            model=model,
-        )
-        if offload_activations
-        else None
-    )
 
     def activation_checkpoint(group_id: int, name: str, *, microbatch: int):
         if activation_offload is not None:
@@ -1137,7 +1128,16 @@ def layer_by_layer_forward_backward_no_pipelining(
 
         return forward(), recompute()
 
-    # Drain activation I/O before cleanup on normal and exceptional exits.
+    # Acquire the swap immediately before the scope that drains it on exit.
+    activation_offload = (
+        LayerByLayerActivationOffload(
+            nvme_path=activation_nvme_path,
+            nvme_backend=getattr(config, "layer_by_layer_activation_nvme_backend", "native"),
+            model=model,
+        )
+        if offload_activations
+        else None
+    )
     offload_lifetime = (
         contextlib.closing(activation_offload)
         if activation_offload is not None

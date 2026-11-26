@@ -859,35 +859,49 @@ class _NVMeActivation(NamedTuple):
     offset: int = 0
 
 
+class _DeepSpeedActivationAIOResources(NamedTuple):
+    directory: TemporaryDirectory
+    reader: Any
+    writer: Any
+
+
 class _DeepSpeedActivationAIO:
     """Swap activations into aligned regions of a reusable file."""
 
-    # Active schedules own their directories exclusively. Only drained files are cached.
-    _idle_directories: WeakKeyDictionary[torch.nn.Module, TemporaryDirectory] = WeakKeyDictionary()
+    # Active schedules own their file and handles exclusively. Cache only drained resources.
+    _idle_resources: WeakKeyDictionary[torch.nn.Module, _DeepSpeedActivationAIOResources] = (
+        WeakKeyDictionary()
+    )
 
     def __init__(self, path: str, *, model: torch.nn.Module | None = None) -> None:
-        from deepspeed.ops.op_builder import AsyncIOBuilder
-
-        aio_handle = AsyncIOBuilder().load().aio_handle
-        options = dict(
-            block_size=128 * 1024,
-            queue_depth=64,
-            single_submit=False,
-            overlap_events=True,
-            intra_op_parallelism=1,
-        )
-        self._reader = aio_handle(**options)
-        self._writer = aio_handle(**options)
         root = Path(path).absolute()
-        directory = self._idle_directories.pop(model, None) if model is not None else None
-        if directory is None or Path(directory.name).parent != root:
+        resources = self._idle_resources.pop(model, None) if model is not None else None
+        if resources is not None and Path(resources.directory.name).parent != root:
+            resources.directory.cleanup()
+            resources = None
+        if resources is None:
+            from deepspeed.ops.op_builder import AsyncIOBuilder
+
+            aio_handle = AsyncIOBuilder().load().aio_handle
+            options = dict(
+                block_size=128 * 1024,
+                queue_depth=64,
+                single_submit=False,
+                overlap_events=True,
+                intra_op_parallelism=1,
+            )
             root.mkdir(parents=True, exist_ok=True)
             directory = TemporaryDirectory(
                 dir=root, prefix=f"mfsdp-rank{torch.distributed.get_rank()}-"
             )
-        self._directory: TemporaryDirectory | None = directory
+            resources = _DeepSpeedActivationAIOResources(
+                directory, aio_handle(**options), aio_handle(**options)
+            )
+        self._reader = resources.reader
+        self._writer = resources.writer
+        self._directory: TemporaryDirectory | None = resources.directory
         self._model = model
-        self._filename = str(Path(directory.name) / "activations.bin")
+        self._filename = str(Path(resources.directory.name) / "activations.bin")
         try:
             self._capacity = os.stat(self._filename).st_size
         except FileNotFoundError:
@@ -962,10 +976,26 @@ class _DeepSpeedActivationAIO:
         except BaseException:
             directory.cleanup()
             raise
-        if model is None:
-            directory.cleanup()
         else:
-            self._idle_directories[model] = directory
+            if model is None:
+                directory.cleanup()
+            else:
+                self._idle_resources[model] = _DeepSpeedActivationAIOResources(
+                    directory, self._reader, self._writer
+                )
+        finally:
+            del self._reader, self._writer
+
+
+def release_layer_by_layer_activation_aio(model: torch.nn.Module) -> None:
+    """Release a model's drained activation swap file and AIO handles after training.
+
+    Args:
+        model: The model chunk passed to the layer-by-layer schedule on this rank.
+    """
+    resources = _DeepSpeedActivationAIO._idle_resources.pop(model, None)
+    if resources is not None:
+        resources.directory.cleanup()
 
 
 class _LayerByLayerNVMeActivations:

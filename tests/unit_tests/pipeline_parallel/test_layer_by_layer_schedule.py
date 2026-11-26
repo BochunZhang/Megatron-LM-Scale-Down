@@ -7,6 +7,7 @@ from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from weakref import ref
 
 import pytest
 import torch
@@ -414,7 +415,7 @@ def test_layer_by_layer_deepspeed_defers_write_wait(tmp_path, monkeypatch, mock_
     assert not list(tmp_path.iterdir())
 
 
-def test_layer_by_layer_deepspeed_reuses_preallocated_file(tmp_path, monkeypatch, mock_deepspeed_aio):
+def test_layer_by_layer_deepspeed_reuses_file_and_handles(tmp_path, monkeypatch, mock_deepspeed_aio):
     allocate = torch.empty
 
     def allocate_on_cpu(*args, **kwargs):
@@ -424,6 +425,7 @@ def test_layer_by_layer_deepspeed_reuses_preallocated_file(tmp_path, monkeypatch
     monkeypatch.setattr(torch, "empty", allocate_on_cpu)
     monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
     model = nn.Module()
+    handles = None
     for value in (11, 29):
         first = torch.tensor(value)
         second = torch.tensor(-value)
@@ -432,6 +434,10 @@ def test_layer_by_layer_deepspeed_reuses_preallocated_file(tmp_path, monkeypatch
                 nvme_path=str(tmp_path), nvme_backend="deepspeed", model=model
             )
         ) as step:
+            current_handles = (ref(step._nvme.swap._reader), ref(step._nvme.swap._writer))
+            if handles is None:
+                handles = current_handles
+            assert current_handles == handles
             step.reserve_nvme((first,), num_groups=2)
             (file,) = tmp_path.glob("*/activations.bin")
             assert file.stat().st_size == 8192
@@ -441,10 +447,12 @@ def test_layer_by_layer_deepspeed_reuses_preallocated_file(tmp_path, monkeypatch
             torch.testing.assert_close(step._nvme.reload(saved_second), second)
             torch.testing.assert_close(step._nvme.reload(saved_first), first)
         assert file.stat().st_size == 8192
+        assert all(handle() is not None for handle in handles)
 
     reservations = [region for name, region in mock_deepspeed_aio if name == "reserve"]
     assert reservations == [(0, 8192)]
-    del model
+    fine_grained_activation_offload.release_layer_by_layer_activation_aio(model)
+    assert all(handle() is None for handle in handles)
     assert not list(tmp_path.iterdir())
 
 
