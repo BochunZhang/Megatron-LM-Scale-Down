@@ -863,29 +863,38 @@ class _LayerByLayerNVMeActivations:
         self.swap = NVMeOffload(path)
         self._slots: dict[str, torch.Tensor] = {}
 
-    def _stage(
-        self, shape: torch.Size, dtype: torch.dtype, *, direction: Literal["forward", "backward"]
-    ) -> torch.Tensor:
-        size = shape.numel() * dtype.itemsize
+    def _stage(self, size: int, *, direction: Literal["forward", "backward"]) -> torch.Tensor:
+        alignment = 1
+        if direction == "backward":
+            alignment = self.swap.buffer_alignment
+            io_alignment = self.swap.io_alignment
+            size = ((size + io_alignment - 1) // io_alignment) * io_alignment
         slot = self._slots.get(direction)
         if slot is None or slot.numel() < size:
-            slot = torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
+            allocation = torch.empty(
+                size + alignment - 1, dtype=torch.uint8, device="cpu", pin_memory=True
+            )
+            offset = -allocation.data_ptr() % alignment
+            slot = allocation[offset : offset + size]
             self._slots[direction] = slot
-        return slot[:size].view(dtype).view(shape)
+        return slot[:size]
 
     def offload(self, tag: tuple[int, int, int], tensor: torch.Tensor) -> _NVMeActivation:
         """Wait for D2H before writing the checkpoint boundary to disk."""
         microbatch, group_id, index = tag
         key = f"activation-{group_id}-{microbatch}-{index}.bin"
-        host = self._stage(tensor.shape, tensor.dtype, direction="forward")
+        size = tensor.shape.numel() * tensor.dtype.itemsize
+        host = self._stage(size, direction="forward").view(tensor.dtype).view(tensor.shape)
         host.copy_(tensor, non_blocking=False)
         self.swap.write(key, host.view(-1))
         return _NVMeActivation(key, tensor.device, tensor.shape, tensor.dtype)
 
     def reload(self, saved: _NVMeActivation) -> torch.Tensor:
         """Wait for disk read and H2D before returning to backward."""
-        host = self._stage(saved.shape, saved.dtype, direction="backward")
-        self.swap.read(saved.key, host.view(-1))
+        size = saved.shape.numel() * saved.dtype.itemsize
+        staging = self._stage(size, direction="backward")
+        self.swap.read_aligned(saved.key, staging)
+        host = staging[:size].view(saved.dtype).view(saved.shape)
         # The blocking copy runs on the requesting autograd stream. Backward
         # can use the result and the host slot can be reused once it returns.
         return _copy_tensor_to_device(saved.device, host, non_blocking=False)

@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 class NVMeOffload:
     """Store CPU tensor payloads in per-process direct-I/O swap files."""
 
+    # Keep the native transfer length and the address alignment of the mmap buffer.
+    io_alignment = 4096
+    buffer_alignment = max(io_alignment, mmap.PAGESIZE)
+
     def __init__(self, path: str):
         try:
             import megatron_nvme_aio
@@ -51,7 +55,8 @@ class NVMeOffload:
         filename = str(Path(self.directory.name) / key)
         payload = tensor.view(torch.uint8).flatten()
         # O_DIRECT needs an aligned address and transfer length.
-        size = ((payload.numel() + 4095) // 4096) * 4096
+        alignment = self.io_alignment
+        size = ((payload.numel() + alignment - 1) // alignment) * alignment
         with (
             self.lock,
             nvtx_range(lambda: f"fsdp.nvme.{'write' if write else 'read'} {key} bytes={size}"),
@@ -76,6 +81,17 @@ class NVMeOffload:
         """Read a swap file into a contiguous CPU tensor."""
         self._transfer(key, tensor, write=False)
         return tensor
+
+    def read_aligned(self, key: str, buffer: torch.Tensor) -> None:
+        """Read a swap file directly into an aligned, padded CPU byte buffer."""
+        filename = str(Path(self.directory.name) / key)
+        # A NumPy view exposes the tensor storage to the native Py_buffer API.
+        with (
+            self.lock,
+            nvtx_range(lambda: f"fsdp.nvme.read {key} bytes={buffer.numel()}"),
+            memoryview(buffer.numpy()) as view,
+        ):
+            self.transfer(self.worker, view, filename, False)
 
     def prefetch(self, key: str, tensor: torch.Tensor) -> Future[torch.Tensor]:
         """Start a CPU-side read while the caller works on the current bucket."""

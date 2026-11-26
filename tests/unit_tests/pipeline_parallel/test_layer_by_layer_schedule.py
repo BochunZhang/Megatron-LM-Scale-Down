@@ -221,20 +221,29 @@ def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch,
             return self
 
     values = [
-        torch.arange(8, dtype=torch.bfloat16).view(2, 4).t(),
+        torch.arange(2050, dtype=torch.bfloat16).view(2, 1025).t(),
         torch.tensor(17, dtype=torch.int64),
     ]
     observed_slots = {"d2h": [], "h2d": []}
     pinned_slots = []
+    read_buffers = []
     allocate = torch.empty
     copy = torch.Tensor.copy_
+    transfer = sys.modules["megatron_nvme_aio"].transfer
+
+    def track_transfer(worker, buffer, path, write):
+        if not write:
+            read_buffers.append(
+                (torch.frombuffer(buffer, dtype=torch.uint8).data_ptr(), buffer.nbytes)
+            )
+        transfer(worker, buffer, path, write)
 
     def allocate_on_cpu(*args, pin_memory=False, **kwargs):
         # Exercise the byte views without requiring a CUDA allocator.
         tensor = allocate(*args, **kwargs)
         if pin_memory:
             assert tensor.device.type == "cpu" and tensor.dtype == torch.uint8
-            pinned_slots.append(tensor.data_ptr())
+            pinned_slots.append((tensor.data_ptr(), tensor.numel()))
         return tensor
 
     def copy_to_host(host, tensor, *, non_blocking=False):
@@ -259,6 +268,7 @@ def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch,
 
     monkeypatch.setattr(torch, "empty", allocate_on_cpu)
     monkeypatch.setattr(torch.Tensor, "copy_", copy_to_host)
+    monkeypatch.setattr(sys.modules["megatron_nvme_aio"], "transfer", track_transfer)
     monkeypatch.setattr(torch.cuda, "Event", object)
     monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
     monkeypatch.setattr(fine_grained_activation_offload, "saved_tensors_hooks", capture_hooks)
@@ -283,8 +293,12 @@ def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch,
     assert written[0] != written[1] and written[0].parent.parent == tmp_path
     assert written[0].parent.name.startswith("mfsdp-rank0-")
     assert len(set(observed_slots["d2h"])) == len(set(observed_slots["h2d"])) == 1
-    assert observed_slots["d2h"][0] != observed_slots["h2d"][0]
-    assert pinned_slots == [observed_slots["d2h"][0], observed_slots["h2d"][0]]
+    forward, backward = pinned_slots
+    assert forward[0] == observed_slots["d2h"][0]
+    read_ptr = observed_slots["h2d"][0]
+    assert read_ptr % os.sysconf("SC_PAGE_SIZE") == 0
+    assert backward[0] <= read_ptr <= backward[0] + backward[1] - 8192
+    assert read_buffers == [(read_ptr, 8192), (read_ptr, 4096)]
     offload.close()
     assert not list(tmp_path.iterdir())
 
