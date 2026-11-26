@@ -32,9 +32,9 @@
 namespace {
 
 constexpr size_t kAlignment = 4096;
-constexpr size_t kBlockSize = 128 * 1024;
+constexpr size_t kDefaultBlockSize = 128 * 1024;
 constexpr int kDefaultQueueDepth = 8;
-constexpr int kMaxQueueDepth = 16;
+constexpr int kMaxQueueDepth = 64;
 constexpr char kWorkerCapsule[] = "megatron_nvme_aio.worker";
 constexpr char kTransferCapsule[] = "megatron_nvme_aio.transfer";
 
@@ -79,7 +79,9 @@ private:
 
 class AioWorker {
 public:
-    explicit AioWorker(int queue_depth) : queue_depth_(queue_depth), thread_([this] { run(); }) {}
+    AioWorker(int queue_depth, size_t block_size)
+        : queue_depth_(queue_depth), block_size_(block_size), thread_([this] { run(); })
+    {}
 
     ~AioWorker()
     {
@@ -147,13 +149,13 @@ private:
         try {
             while (offset < size || pending > 0) {
                 // Refill the queue while previously submitted blocks are still in flight.
-                std::array<iocb*, kMaxQueueDepth> batch{};
+                std::array<iocb*, kMaxQueueDepth> batch;
                 int count = 0;
                 size_t next_offset = offset;
                 for (int slot = 0; slot < queue_depth_ && next_offset < size; ++slot) {
                     if (in_flight[slot]) { continue; }
                     auto* request = &requests[slot];
-                    const size_t bytes = std::min(kBlockSize, size - next_offset);
+                    const size_t bytes = std::min(block_size_, size - next_offset);
                     const auto block_offset = file_offset + static_cast<off_t>(next_offset);
                     if (write) {
                         io_prep_pwrite(request, file.fd, buffer + next_offset, bytes, block_offset);
@@ -176,7 +178,7 @@ private:
                     }
                     if (submitted == 0 && pending == 0) { fail(EIO, "io_submit", path); }
                     for (int i = 0; i < submitted; ++i) {
-                        const size_t bytes = std::min(kBlockSize, size - offset);
+                        const size_t bytes = std::min(block_size_, size - offset);
                         in_flight[batch[i] - requests.data()] = bytes;
                         offset += bytes;
                         ++pending;
@@ -213,6 +215,7 @@ private:
     }
 
     const int queue_depth_;
+    const size_t block_size_;
     AioContext context_;
     std::mutex mutex_;
     std::condition_variable ready_;
@@ -267,13 +270,18 @@ void delete_worker(PyObject* capsule)
 PyObject* create_worker(PyObject*, PyObject* args)
 {
     int queue_depth = kDefaultQueueDepth;
-    if (!PyArg_ParseTuple(args, "|i", &queue_depth)) { return nullptr; }
+    Py_ssize_t block_size = kDefaultBlockSize;
+    if (!PyArg_ParseTuple(args, "|in:create_worker", &queue_depth, &block_size)) { return nullptr; }
     if (queue_depth < 1 || queue_depth > kMaxQueueDepth) {
-        PyErr_SetString(PyExc_ValueError, "AIO queue depth must be in [1, 16]");
+        PyErr_Format(PyExc_ValueError, "AIO queue depth must be in [1, %d]", kMaxQueueDepth);
+        return nullptr;
+    }
+    if (block_size <= 0 || static_cast<size_t>(block_size) % kAlignment != 0) {
+        PyErr_SetString(PyExc_ValueError, "AIO block size must be a positive multiple of 4096 bytes");
         return nullptr;
     }
     try {
-        auto worker = std::make_unique<AioWorker>(queue_depth);
+        auto worker = std::make_unique<AioWorker>(queue_depth, static_cast<size_t>(block_size));
         auto* capsule = PyCapsule_New(worker.get(), kWorkerCapsule, delete_worker);
         if (capsule) { worker.release(); }
         return capsule;
@@ -371,7 +379,9 @@ PyObject* wait(PyObject*, PyObject* capsule)
 }
 
 PyMethodDef methods[] = {
-    {"create_worker", create_worker, METH_VARARGS, "Start a native libaio worker with an optional queue depth."},
+    {"create_worker", create_worker, METH_VARARGS,
+     "Start a native libaio worker. Optional arguments are queue depth (1 to 64, default 8) "
+     "and block size in bytes (4 KiB aligned, default 128 KiB)."},
     {"transfer", transfer, METH_VARARGS, "Transfer an aligned buffer and wait for completion."},
     {"submit", submit, METH_VARARGS, "Enqueue an aligned transfer at an offset in an existing file."},
     {"wait", wait, METH_O, "Wait for an enqueued transfer and release its buffer."},

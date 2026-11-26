@@ -20,7 +20,7 @@ nvtx_include = Path(
 
 setup(
     name="megatron-nvme-aio",
-    version="0.1.0",
+    version="0.1.1",
     license_files=["LICENSE"],
     ext_modules=[
         Extension(
