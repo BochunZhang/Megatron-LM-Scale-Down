@@ -204,6 +204,98 @@ def mock_nvme_aio(monkeypatch):
     return operations
 
 
+@pytest.fixture
+def mock_deepspeed_aio(monkeypatch):
+    operations = []
+
+    class AioHandle:
+        def __init__(self, **kwargs):
+            assert kwargs == {
+                "block_size": 128 * 1024,
+                "queue_depth": 8,
+                "single_submit": False,
+                "overlap_events": True,
+                "intra_op_parallelism": 1,
+            }
+            self.pending = None
+
+        def _submit(self, operation, buffer, filename, offset):
+            assert self.pending is None and offset == 0
+            assert buffer.data_ptr() % os.sysconf("SC_PAGE_SIZE") == 0
+            assert buffer.numel() % 4096 == 0
+            path = Path(filename)
+            operations.append((f"submit_{operation}", path))
+            self.pending = (operation, buffer, path)
+            return 0
+
+        def async_pwrite(self, buffer, filename, offset):
+            return self._submit("write", buffer, filename, offset)
+
+        def async_pread(self, buffer, filename, offset):
+            assert Path(filename).is_file()
+            return self._submit("read", buffer, filename, offset)
+
+        def wait(self):
+            operation, buffer, path = self.pending
+            if operation == "write":
+                path.write_bytes(memoryview(buffer.numpy()))
+            else:
+                buffer.copy_(torch.frombuffer(bytearray(path.read_bytes()), dtype=torch.uint8))
+            operations.append((operation, path))
+            self.pending = None
+            return 1
+
+    module = SimpleNamespace(aio_handle=AioHandle)
+    builder = SimpleNamespace(load=lambda: module)
+    monkeypatch.setitem(
+        sys.modules, "deepspeed.ops.op_builder", SimpleNamespace(AsyncIOBuilder=lambda: builder)
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    return operations
+
+
+def test_layer_by_layer_deepspeed_defers_write_wait(tmp_path, monkeypatch, mock_deepspeed_aio):
+    allocate = torch.empty
+
+    def allocate_on_cpu(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return allocate(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate_on_cpu)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", nullcontext)
+    offload = fine_grained_activation_offload._LayerByLayerNVMeActivations(
+        str(tmp_path), backend="deepspeed"
+    )
+    first = torch.arange(2050, dtype=torch.bfloat16).view(2, 1025).t()
+    second = torch.tensor(17, dtype=torch.int64)
+    try:
+        saved_first = offload.offload((0, 0, 0), first)
+        assert [name for name, _ in mock_deepspeed_aio] == ["submit_write"]
+        saved_second = offload.offload((1, 0, 0), second)
+        assert [name for name, _ in mock_deepspeed_aio] == ["submit_write", "write", "submit_write"]
+
+        # Prefetch an already written file while the second write is outstanding.
+        stage = {0: SimpleNamespace(_tensors={(0, 0, 0): saved_first})}
+        offload.prefetch(stage)
+        assert mock_deepspeed_aio[-1][0] == "submit_read"
+
+        # A demand read of the other key waits for its own write, then leaves the
+        # prefetched data available for the first activation without rereading it.
+        torch.testing.assert_close(offload.reload(saved_second), second)
+        assert [name for name, _ in mock_deepspeed_aio[-4:]] == ["read", "write", "submit_read", "read"]
+        events = list(mock_deepspeed_aio)
+        torch.testing.assert_close(offload.reload(saved_first), first)
+        assert mock_deepspeed_aio == events
+
+        # A queued write still owns its pinned buffer when the step exits.
+        offload.offload((2, 0, 0), second)
+        offload.prefetch(stage)
+    finally:
+        offload.close()
+    assert [name for name, _ in mock_deepspeed_aio[-4:]] == ["submit_write", "submit_read", "write", "read"]
+    assert not list(tmp_path.iterdir())
+
+
 def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch, mock_nvme_aio):
     class CudaTensor:
         is_cuda = True
@@ -303,7 +395,7 @@ def test_layer_by_layer_nvme_uses_separate_reusable_slots(tmp_path, monkeypatch,
     assert not list(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("activation_tier", ["gpu", "cpu", "nvme"])
+@pytest.mark.parametrize("activation_tier", ["gpu", "cpu", "nvme", "nvme_deepspeed"])
 def test_layer_by_layer_schedule_matches_no_pipeline_update(
     cuda_device, monkeypatch, tmp_path, request, activation_tier
 ):
@@ -315,8 +407,12 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
     model = _Model().to(cuda_device)
     activation_offload = activation_tier != "gpu"
     model.config.layer_by_layer_activation_offload = activation_tier == "cpu"
-    if activation_tier == "nvme":
-        mock_nvme_aio = request.getfixturevalue("mock_nvme_aio")
+    if activation_tier.startswith("nvme"):
+        if activation_tier == "nvme_deepspeed":
+            nvme_operations = request.getfixturevalue("mock_deepspeed_aio")
+            model.config.layer_by_layer_activation_nvme_backend = "deepspeed"
+        else:
+            nvme_operations = request.getfixturevalue("mock_nvme_aio")
         model.config.layer_by_layer_activation_nvme_path = str(tmp_path)
     baseline = _Model().to(cuda_device)
     baseline.load_state_dict(model.state_dict())
@@ -411,8 +507,8 @@ def test_layer_by_layer_schedule_matches_no_pipeline_update(
     if activation_tier == "cpu":
         expected_boundaries -= 1
     assert len(original_boundaries) == restored_boundaries == expected_boundaries
-    if activation_tier == "nvme":
-        assert Counter(name for name, _ in mock_nvme_aio) == dict.fromkeys(
+    if activation_tier.startswith("nvme"):
+        assert Counter(name for name, _ in nvme_operations if name in ("write", "read")) == dict.fromkeys(
             ("write", "read"), expected_boundaries
         )
         assert not list(tmp_path.iterdir())

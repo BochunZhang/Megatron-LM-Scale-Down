@@ -959,7 +959,12 @@ def layer_by_layer_forward_backward_no_pipelining(
         or activation_nvme_path is not None
     )
     activation_offload = (
-        LayerByLayerActivationOffload(nvme_path=activation_nvme_path) if offload_activations else None
+        LayerByLayerActivationOffload(
+            nvme_path=activation_nvme_path,
+            nvme_backend=getattr(config, "layer_by_layer_activation_nvme_backend", "native"),
+        )
+        if offload_activations
+        else None
     )
 
     def activation_checkpoint(group_id: int, name: str, *, microbatch: int):
@@ -1119,143 +1124,149 @@ def layer_by_layer_forward_backward_no_pipelining(
 
         return nvtx_range(f"fwd.microbatch.{microbatch}.{stage}"), recompute()
 
-    # The layer still has one grouped backward, so AccumulateGrad sees the
-    # sum over microbatches. Non-reentrant checkpoints allow that backward to
-    # restore each offloaded input and recompute its microbatch on demand.
-    stages = []
-    input_gradients: Callable[[], tuple[torch.Tensor | None, ...]] = tuple
-    unit = None
-    num_layers = plans[0].num_layers()
-    for layer_index in range(num_layers):
-        if not forward_only:
-            stages.append((layer_index, unit, input_gradients, backward_roots(hidden_states)))
-        unit = plans[0].layer_module(layer_index) if fsdp is not None else None
-        weight_scope = (
-            fsdp.layer_by_layer_unit(unit, backward=False)
-            if fsdp is not None
-            else contextlib.nullcontext()
-        )
-        with weight_scope, nvtx_range(f"forward.transformer.{layer_index}"):
-            if forward_only:
-                hidden_states = forward_layer(layer_index, *hidden_states)
-            elif not offload_activations:
-                inputs, input_gradients = stage_inputs(hidden_states)
-                hidden_states = tensor_parallel.checkpoint(
-                    partial(forward_layer, layer_index), False, *inputs
-                )
-                del inputs
-            else:
-                inputs, input_gradients = stage_inputs(hidden_states)
-                pending_inputs = deque(inputs)
-                del inputs, hidden_states
-                outputs = []
-                stage = f"transformer.{layer_index}"
-                with autocast(), set_checkpoint_early_stop(False):
-                    for mb, plan in enumerate(plans):
-                        value = pending_inputs.popleft()
-                        # CPU offload overlaps reloads with the first decoder
-                        # microbatch's replay from its resident input.
-                        keep_input = (
-                            activation_nvme_path is None
-                            and layer_index == num_layers - 1
-                            and mb == num_microbatches - 1
-                        )
-                        offload_scope = (
-                            contextlib.nullcontext()
-                            if keep_input
-                            else activation_checkpoint(layer_index, stage, microbatch=mb)
-                        )
-                        with offload_scope:
-                            output = checkpoint(
-                                partial(plan.forward_layer, layer_index),
-                                value,
-                                use_reentrant=False,
-                                context_fn=partial(decoder_checkpoint_contexts, mb, stage),
-                            )
-                        trace_microbatch_backward(mb, stage, output, value)
-                        outputs.append(output)
-                        del value
-                hidden_states = tuple(outputs)
-                del outputs, output
-
-    if config.timers is not None:
-        config.timers('forward-compute').stop()
-
-    if forward_only:
-        head_inputs = hidden_states
-    else:
-        stages.append((num_layers, unit, input_gradients, backward_roots(hidden_states)))
-        head_inputs, input_gradients = stage_inputs(hidden_states)
-    del hidden_states
-
-    forward_data_store = []
-    losses = []
-    total_num_tokens = torch.zeros([], dtype=torch.int, device=head_inputs[0].device)
-    with nvtx_range("forward.output"):
-        for mb, (plan, loss_func, value) in enumerate(
-            zip(plans, loss_funcs, head_inputs, strict=True)
-        ):
-            if config.timers is not None:
-                config.timers('forward-compute', log_level=2).start()
-            with nvtx_range(f"fwd.microbatch.{mb}.output"), autocast():
-                if forward_only:
-                    output = plan.postprocess(value)
-                else:
-                    # Keep large vocabulary projections out of the retained graphs.
-                    with activation_checkpoint(num_layers, "output", microbatch=mb):
-                        output = checkpoint(plan.postprocess, value, use_reentrant=False)
-            loss, num_tokens = forward_step_calc_loss(
-                model,
-                output,
-                loss_func,
-                config,
-                None,
-                collect_non_loss_data,
-                num_microbatches,
-                forward_data_store,
-                pg_collection.cp.size(),
-                is_last_stage=True,
-            )
-            total_num_tokens += num_tokens
+    # Drain activation I/O before cleanup on normal and exceptional exits.
+    offload_lifetime = (
+        contextlib.closing(activation_offload)
+        if activation_offload is not None
+        else contextlib.nullcontext()
+    )
+    with offload_lifetime:
+        # The layer still has one grouped backward, so AccumulateGrad sees the
+        # sum over microbatches. Non-reentrant checkpoints allow that backward to
+        # restore each offloaded input and recompute its microbatch on demand.
+        stages = []
+        input_gradients: Callable[[], tuple[torch.Tensor | None, ...]] = tuple
+        unit = None
+        num_layers = plans[0].num_layers()
+        for layer_index in range(num_layers):
             if not forward_only:
-                if config.grad_scale_func is not None:
-                    loss = config.grad_scale_func(loss)
-                trace_microbatch_backward(mb, "output", loss, value)
-                losses.append(loss)
-    del head_inputs, value, output, loss
-
-    if not forward_only:
-        if config.timers is not None:
-            config.timers('backward-compute', log_level=2).start()
-        if fsdp is not None:
-            # Each stage builds its own autograd graph; there is one root
-            # FSDP backward lifecycle for the entire microbatch group.
-            fsdp.pre_backward()
-        with activation_backward_group(num_layers), backward_stage("output"):
-            torch.autograd.backward(losses)
-        if fsdp is not None and fsdp.layer_by_layer_cpu_optimizer:
-            fsdp.reduce_completed_stage_gradients(plans[0].output_parameters())
-        del losses
-        while stages:
-            grad_outputs = input_gradients()
-            stage_index, unit, input_gradients, outputs = stages.pop()
+                stages.append((layer_index, unit, input_gradients, backward_roots(hidden_states)))
+            unit = plans[0].layer_module(layer_index) if fsdp is not None else None
             weight_scope = (
-                fsdp.layer_by_layer_unit(unit, backward=True)
-                if fsdp is not None and unit is not None
+                fsdp.layer_by_layer_unit(unit, backward=False)
+                if fsdp is not None
                 else contextlib.nullcontext()
             )
-            stage = f"transformer.{stage_index - 1}" if stage_index else "embedding"
-            activation_scope = (
-                activation_backward_group(stage_index - 1)
-                if stage_index
-                else contextlib.nullcontext()
-            )
-            # The CPU activation path queues its first reload before waiting for weights.
-            with activation_scope, weight_scope, backward_stage(stage):
-                torch.autograd.backward(outputs, grad_outputs)
-            del outputs, grad_outputs
-        if activation_offload is not None:
-            activation_offload.close()
+            with weight_scope, nvtx_range(f"forward.transformer.{layer_index}"):
+                if forward_only:
+                    hidden_states = forward_layer(layer_index, *hidden_states)
+                elif not offload_activations:
+                    inputs, input_gradients = stage_inputs(hidden_states)
+                    hidden_states = tensor_parallel.checkpoint(
+                        partial(forward_layer, layer_index), False, *inputs
+                    )
+                    del inputs
+                else:
+                    inputs, input_gradients = stage_inputs(hidden_states)
+                    pending_inputs = deque(inputs)
+                    del inputs, hidden_states
+                    outputs = []
+                    stage = f"transformer.{layer_index}"
+                    with autocast(), set_checkpoint_early_stop(False):
+                        for mb, plan in enumerate(plans):
+                            value = pending_inputs.popleft()
+                            # CPU offload overlaps reloads with the first decoder
+                            # microbatch's replay from its resident input.
+                            keep_input = (
+                                activation_nvme_path is None
+                                and layer_index == num_layers - 1
+                                and mb == num_microbatches - 1
+                            )
+                            offload_scope = (
+                                contextlib.nullcontext()
+                                if keep_input
+                                else activation_checkpoint(layer_index, stage, microbatch=mb)
+                            )
+                            with offload_scope:
+                                output = checkpoint(
+                                    partial(plan.forward_layer, layer_index),
+                                    value,
+                                    use_reentrant=False,
+                                    context_fn=partial(decoder_checkpoint_contexts, mb, stage),
+                                )
+                            trace_microbatch_backward(mb, stage, output, value)
+                            outputs.append(output)
+                            del value
+                    hidden_states = tuple(outputs)
+                    del outputs, output
+
+        if config.timers is not None:
+            config.timers('forward-compute').stop()
+
+        if forward_only:
+            head_inputs = hidden_states
+        else:
+            stages.append((num_layers, unit, input_gradients, backward_roots(hidden_states)))
+            head_inputs, input_gradients = stage_inputs(hidden_states)
+        del hidden_states
+
+        forward_data_store = []
+        losses = []
+        total_num_tokens = torch.zeros([], dtype=torch.int, device=head_inputs[0].device)
+        with nvtx_range("forward.output"):
+            for mb, (plan, loss_func, value) in enumerate(
+                zip(plans, loss_funcs, head_inputs, strict=True)
+            ):
+                if config.timers is not None:
+                    config.timers('forward-compute', log_level=2).start()
+                with nvtx_range(f"fwd.microbatch.{mb}.output"), autocast():
+                    if forward_only:
+                        output = plan.postprocess(value)
+                    else:
+                        # Keep large vocabulary projections out of the retained graphs.
+                        with activation_checkpoint(num_layers, "output", microbatch=mb):
+                            output = checkpoint(plan.postprocess, value, use_reentrant=False)
+                loss, num_tokens = forward_step_calc_loss(
+                    model,
+                    output,
+                    loss_func,
+                    config,
+                    None,
+                    collect_non_loss_data,
+                    num_microbatches,
+                    forward_data_store,
+                    pg_collection.cp.size(),
+                    is_last_stage=True,
+                )
+                total_num_tokens += num_tokens
+                if not forward_only:
+                    if config.grad_scale_func is not None:
+                        loss = config.grad_scale_func(loss)
+                    trace_microbatch_backward(mb, "output", loss, value)
+                    losses.append(loss)
+        del head_inputs, value, output, loss
+
+        if not forward_only:
+            if config.timers is not None:
+                config.timers('backward-compute', log_level=2).start()
+            if fsdp is not None:
+                # Each stage builds its own autograd graph; there is one root
+                # FSDP backward lifecycle for the entire microbatch group.
+                fsdp.pre_backward()
+            with activation_backward_group(num_layers), backward_stage("output"):
+                torch.autograd.backward(losses)
+            if fsdp is not None and fsdp.layer_by_layer_cpu_optimizer:
+                fsdp.reduce_completed_stage_gradients(plans[0].output_parameters())
+            del losses
+            while stages:
+                grad_outputs = input_gradients()
+                stage_index, unit, input_gradients, outputs = stages.pop()
+                weight_scope = (
+                    fsdp.layer_by_layer_unit(unit, backward=True)
+                    if fsdp is not None and unit is not None
+                    else contextlib.nullcontext()
+                )
+                stage = f"transformer.{stage_index - 1}" if stage_index else "embedding"
+                activation_scope = (
+                    activation_backward_group(stage_index - 1)
+                    if stage_index
+                    else contextlib.nullcontext()
+                )
+                # The CPU activation path queues its first reload before waiting for weights.
+                with activation_scope, weight_scope, backward_stage(stage):
+                    torch.autograd.backward(outputs, grad_outputs)
+                del outputs, grad_outputs
+    if not forward_only:
         if fsdp is not None:
             fsdp.post_backward()
         if config.timers is not None:

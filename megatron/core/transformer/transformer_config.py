@@ -524,6 +524,9 @@ class TransformerConfig(ModelParallelConfig):
     layer_by_layer_activation_nvme_path: str | None = None
     """Save layer-by-layer checkpoint boundary activations in NVMe scratch via pinned CPU memory."""
 
+    layer_by_layer_activation_nvme_backend: Literal["native", "deepspeed"] = "native"
+    """File I/O backend for layer-by-layer NVMe activations."""
+
     recompute_granularity: Optional[Literal['full', 'selective']] = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where the submodules set in --recompute-modules is checkpointed.
